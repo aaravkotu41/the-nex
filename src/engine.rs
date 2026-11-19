@@ -25,6 +25,25 @@ const SCAN_RECV_TIMEOUT: Duration = Duration::from_millis(150);
 const MAX_PENDING_SCANS: usize = 50_000;
 const BINARY_EXTENSIONS: &[&str] = &["exe", "dll", "scr", "sys", "cpl", "ocx", "com", "efi"];
 
+/// Thin (32/64-bit, either byte order) and fat/universal Mach-O headers.
+#[cfg(target_os = "macos")]
+fn is_macho_magic(magic: &[u8; 4]) -> bool {
+    matches!(
+        magic,
+        [0xCF, 0xFA, 0xED, 0xFE]
+            | [0xCE, 0xFA, 0xED, 0xFE]
+            | [0xFE, 0xED, 0xFA, 0xCF]
+            | [0xFE, 0xED, 0xFA, 0xCE]
+            | [0xCA, 0xFE, 0xBA, 0xBE]
+            | [0xCA, 0xFE, 0xBA, 0xBF]
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_macho_magic(_magic: &[u8; 4]) -> bool {
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     Archive,
@@ -42,7 +61,7 @@ pub fn classify_file(path: &Path) -> FileKind {
     let read = File::open(path)
         .and_then(|mut f| f.read(&mut magic))
         .unwrap_or(0);
-    if read >= 2 && &magic[..2] == b"MZ" {
+    if (read >= 2 && &magic[..2] == b"MZ") || (read == 4 && is_macho_magic(&magic)) {
         return FileKind::Binary;
     }
     if (read == 4 && (&magic == b"PK\x03\x04" || &magic == b"PK\x05\x06")) || ext == "zip" {

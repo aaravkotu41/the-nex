@@ -2,7 +2,7 @@ use crate::config::{AppConfig, MAX_AI_SCAN_BYTES};
 use crate::logger::{self, lock_or_recover};
 use crate::platform;
 use crate::quarantine::{self, Severity, ThreatEvent};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -27,6 +27,9 @@ pub const SUSPICIOUS_IMPORTS: [&str; 9] = [
     "IsDebuggerPresent",
     "WinExec",
     "ShellExecute",
+];
+pub const SUSPICIOUS_MACHO_SYMBOLS: [&str; 7] = [
+    "dlopen", "ptrace", "NSTask", "system", "popen", "execve", "mprotect",
 ];
 /// log10(1 + size_kb) / 6 maps 0 B..1 GB onto 0..1.
 const SIZE_LOG_SCALE: f64 = 6.0;
@@ -184,6 +187,7 @@ pub fn feature_vector(
 pub fn extract_features(bytes: &[u8]) -> Option<FeatureVector> {
     panic::catch_unwind(AssertUnwindSafe(|| match goblin::Object::parse(bytes) {
         Ok(goblin::Object::PE(pe)) => Some(pe_features(bytes, &pe)),
+        Ok(goblin::Object::Mach(mach)) => mach_features(bytes, &mach),
         _ => None,
     }))
     .ok()
@@ -223,6 +227,74 @@ fn pe_features(bytes: &[u8], pe: &goblin::pe::PE<'_>) -> FeatureVector {
         hits,
         SUSPICIOUS_IMPORTS.len(),
     )
+}
+
+/// Mach-O symbols carry a leading underscore; Objective-C classes appear as `_OBJC_CLASS_$_Name`.
+fn is_suspicious_macho_symbol(symbol: &str, needle: &str) -> bool {
+    symbol.trim_start_matches('_') == needle || symbol.ends_with(&format!("$_{needle}"))
+}
+
+struct MachStats {
+    max_entropy: f64,
+    segments: usize,
+    hits: BTreeSet<&'static str>,
+}
+
+fn add_macho_slice(macho: &goblin::mach::MachO<'_>, stats: &mut MachStats) {
+    stats.segments = stats.segments.max(macho.segments.len());
+    for segment in macho.segments.iter() {
+        if let Ok(sections) = segment.sections() {
+            for (_, data) in sections {
+                if !data.is_empty() {
+                    stats.max_entropy = stats.max_entropy.max(shannon_entropy(data));
+                }
+            }
+        }
+    }
+    if let Ok(imports) = macho.imports() {
+        for needle in SUSPICIOUS_MACHO_SYMBOLS {
+            if imports
+                .iter()
+                .any(|imp| is_suspicious_macho_symbol(imp.name, needle))
+            {
+                stats.hits.insert(needle);
+            }
+        }
+    }
+}
+
+/// Same four features as PE. Fat (multi-arch) binaries combine their slices: max section
+/// entropy, max segment count and the union of suspicious symbols.
+fn mach_features(bytes: &[u8], mach: &goblin::mach::Mach<'_>) -> Option<FeatureVector> {
+    let mut stats = MachStats {
+        max_entropy: 0.0,
+        segments: 0,
+        hits: BTreeSet::new(),
+    };
+    let mut slices = 0;
+    match mach {
+        goblin::mach::Mach::Binary(macho) => {
+            add_macho_slice(macho, &mut stats);
+            slices = 1;
+        }
+        goblin::mach::Mach::Fat(fat) => {
+            for index in 0..fat.narches {
+                if let Ok(goblin::mach::SingleArch::MachO(macho)) = fat.get(index) {
+                    add_macho_slice(&macho, &mut stats);
+                    slices += 1;
+                }
+            }
+        }
+    }
+    (slices > 0).then(|| {
+        feature_vector(
+            bytes.len() as u64,
+            stats.max_entropy,
+            stats.segments,
+            stats.hits.len(),
+            SUSPICIOUS_MACHO_SYMBOLS.len(),
+        )
+    })
 }
 
 /// Deterministic logistic score over the same four features (used when the model is absent).
@@ -341,7 +413,7 @@ mod tests {
     fn own_executable_yields_bounded_features() {
         let exe = std::env::current_exe().unwrap();
         let bytes = fs::read(exe).unwrap();
-        let features = extract_features(&bytes).expect("test binary is a PE image");
+        let features = extract_features(&bytes).expect("test binary is a PE or Mach-O image");
         assert!(features.iter().all(|f| (0.0..=1.0).contains(f)));
     }
 

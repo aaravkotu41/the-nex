@@ -10,5 +10,11 @@ mod windows;
 #[cfg(windows)]
 pub use self::windows::*;
 
-#[cfg(not(windows))]
-compile_error!("this build of The Nex implements the platform layer for Windows only");
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(target_os = "macos")]
+pub use self::macos::*;
+
+#[cfg(not(any(windows, target_os = "macos")))]
+compile_error!("The Nex implements the platform layer for Windows and macOS only");

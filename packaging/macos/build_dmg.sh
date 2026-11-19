@@ -1,0 +1,54 @@
+#!/bin/bash
+# Builds target/macos/TheNex.app (ad-hoc signed) and the drag-to-Applications TheNex.dmg.
+set -euo pipefail
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "build_dmg.sh must run on macOS" >&2
+  exit 1
+fi
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PACKAGING="${ROOT}/packaging/macos"
+OUT="${ROOT}/target/macos"
+APP="${OUT}/TheNex.app"
+STAGE="${OUT}/dmg"
+DMG="${OUT}/TheNex.dmg"
+MODEL="${ROOT}/thenex_model.onnx"
+
+cd "${ROOT}"
+mkdir -p "${OUT}"
+
+if [[ ! -f "${MODEL}" ]]; then
+  echo "==> Training ${MODEL}"
+  VENV="${OUT}/venv"
+  python3 -m venv "${VENV}"
+  "${VENV}/bin/python" -m pip install --quiet --disable-pip-version-check numpy onnx
+  "${VENV}/bin/python" train_onnx.py --out "${MODEL}"
+fi
+
+echo "==> cargo build --release"
+cargo build --release --locked
+
+echo "==> Assembling ${APP}"
+rm -rf "${APP}" "${STAGE}" "${DMG}"
+mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
+cp "${PACKAGING}/Info.plist" "${APP}/Contents/Info.plist"
+cp "${ROOT}/target/release/the-nex" "${APP}/Contents/MacOS/the-nex"
+cp "${MODEL}" "${APP}/Contents/Resources/thenex_model.onnx"
+cp "${PACKAGING}/install_mac.sh" "${PACKAGING}/uninstall_mac.sh" "${APP}/Contents/Resources/"
+chmod 755 "${APP}/Contents/MacOS/the-nex" \
+  "${APP}/Contents/Resources/install_mac.sh" \
+  "${APP}/Contents/Resources/uninstall_mac.sh"
+chmod 644 "${APP}/Contents/Info.plist" "${APP}/Contents/Resources/thenex_model.onnx"
+
+echo "==> Ad-hoc signing"
+codesign --force --deep --sign - "${APP}"
+codesign --verify --deep --strict "${APP}"
+
+echo "==> Building ${DMG}"
+mkdir -p "${STAGE}"
+cp -R "${APP}" "${STAGE}/"
+ln -s /Applications "${STAGE}/Applications"
+hdiutil create -volname "The Nex" -srcfolder "${STAGE}" -ov -format UDZO "${DMG}"
+rm -rf "${STAGE}"
+echo "Built ${DMG}"
