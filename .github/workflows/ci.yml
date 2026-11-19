@@ -58,6 +58,9 @@ jobs:
           python -m pip install --disable-pip-version-check numpy onnx
           python train_onnx.py --out thenex_model.onnx
 
+      - name: Generate zip-bomb samples
+        run: python scripts/gen_test_zipbomb.py
+
       - name: cargo check
         run: cargo check --all-targets --locked
 
@@ -107,6 +110,9 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check numpy onnx
           python train_onnx.py --out thenex_model.onnx
+
+      - name: Generate zip-bomb samples
+        run: python scripts/gen_test_zipbomb.py
 
       - name: cargo check
         run: cargo check --all-targets --locked
