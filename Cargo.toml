@@ -1,0 +1,29 @@
+[package]
+name = "the-nex"
+version = "0.1.0"
+edition = "2021"
+description = "The Nex: always-on endpoint detection and response agent"
+publish = false
+
+[lib]
+name = "the_nex"
+path = "src/lib.rs"
+
+[[bin]]
+name = "the-nex"
+path = "src/main.rs"
+
+[dependencies]
+notify = "6"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+goblin = "0.9"
+tract-onnx = "0.21"
+sysinfo = "0.33"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+notify-rust = "4"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+winrt-notification = "0.5"
