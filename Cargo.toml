@@ -20,7 +20,6 @@ chrono = { version = "0.4", features = ["serde"] }
 notify-rust = "4"
 sha2 = "0.10"
 windows-service = "0.7"
-winrt-notification = "0.5"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

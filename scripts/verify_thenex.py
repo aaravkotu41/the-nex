@@ -374,6 +374,12 @@ def main():
     print(f"\n{passed}/{len(results)} checks passed")
     if passed != len(results):
         print(f"daemon output: {DAEMON_LOG}")
+        try:
+            tail = DAEMON_LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-60:]
+            print("---- last daemon output ----")
+            print("\n".join(tail))
+        except OSError as e:
+            print(f"(cannot read daemon output: {e})")
         args.keep_sandbox = True
     if not args.keep_sandbox:
         remove_sandbox()

@@ -109,7 +109,10 @@ jobs:
         if: always()
         with:
           name: verify-sandbox-windows
-          path: thenex_live_sandbox
+          # Quarantined samples are locked (unreadable) and are live bombs; leave them out.
+          path: |
+            thenex_live_sandbox
+            !thenex_live_sandbox/quarantine
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v7
@@ -181,7 +184,10 @@ jobs:
         if: always()
         with:
           name: verify-sandbox-macos
-          path: thenex_live_sandbox
+          # Quarantined samples are locked (unreadable) and are live bombs; leave them out.
+          path: |
+            thenex_live_sandbox
+            !thenex_live_sandbox/quarantine
           if-no-files-found: ignore
 
       - name: Verify bundle layout, plist and signature

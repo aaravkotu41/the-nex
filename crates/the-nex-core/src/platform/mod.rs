@@ -5,6 +5,8 @@
 //! run_service, run_tray, tray_is_running, run_elevated, install_ctrlc_handler, detach_console.
 
 use std::path::PathBuf;
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::OnceLock;
 
 #[cfg(windows)]
 mod windows;
@@ -61,6 +63,32 @@ pub fn is_protected_process(pid: u32, name: &str) -> bool {
     }
     let lower = name.to_lowercase();
     PROTECTED_PROCESS_NAMES.contains(&lower.as_str())
+}
+
+/// Queues a desktop notification and returns at once. Delivery can block for seconds
+/// (macOS notification centre, osascript fallback, WinRT activation), so detectors and the
+/// tray's message loop hand it to one background thread instead of waiting. When the queue
+/// is full the notification is dropped; the event log always has the record.
+pub fn send_desktop_notification_async(title: &str, body: &str) {
+    static QUEUE: OnceLock<Option<SyncSender<(String, String)>>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<(String, String)>(32);
+        std::thread::Builder::new()
+            .name("thenex-notify".into())
+            .spawn(move || {
+                for (title, body) in rx {
+                    send_desktop_notification(&title, &body);
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    match queue {
+        Some(tx) => {
+            let _ = tx.try_send((title.to_string(), body.to_string()));
+        }
+        None => send_desktop_notification(title, body),
+    }
 }
 
 /// Path of a sibling binary installed next to the running executable (the-nex / the-nex-gui).

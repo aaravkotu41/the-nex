@@ -41,7 +41,6 @@ use windows_sys::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
-use winrt_notification::{Duration as ToastDuration, Sound, Toast};
 
 pub const SELF_EXE_NAME: &str = "the-nex.exe";
 const SERVICE_DISPLAY_NAME: &str = "The Nex Endpoint Protection";
@@ -294,23 +293,18 @@ pub fn unlock_restored_file(path: &Path) {
     let _ = quarantine::set_readonly(path, false);
 }
 
+/// WinRT toast via notify-rust (tauri-winrt-notification), under the PowerShell app id.
+/// The older winrt-notification 0.5 crate is deliberately not used: its windows 0.24 import
+/// library maps WaitOnAddress/WakeByAddress* to vertdll.dll, which hijacked std's thread
+/// parking and crashed every binary with STATUS_ACCESS_VIOLATION.
 pub fn send_desktop_notification(title: &str, body: &str) {
-    let toast = Toast::new(Toast::POWERSHELL_APP_ID)
-        .title(title)
-        .text1(body)
-        .sound(Some(Sound::SMS))
-        .duration(ToastDuration::Short);
-    if let Err(primary) = toast.show() {
-        let fallback = notify_rust::Notification::new()
-            .summary(title)
-            .body(body)
-            .show()
-            .map(|_| ());
-        if let Err(secondary) = fallback {
-            logger::warn(format!(
-                "desktop notification failed (winrt: {primary:?}; notify-rust: {secondary})"
-            ));
-        }
+    let shown = notify_rust::Notification::new()
+        .summary(title)
+        .body(body)
+        .sound_name("SMS")
+        .show();
+    if let Err(e) = shown {
+        logger::warn(format!("desktop notification failed: {e}"));
     }
 }
 
@@ -1029,7 +1023,7 @@ mod tray {
             Shell_NotifyIconW(NIM_MODIFY, &data);
         }
         for event in alerts.iter().take(MAX_TOASTS_PER_POLL) {
-            platform::send_desktop_notification(
+            platform::send_desktop_notification_async(
                 &quarantine::notification_title(event),
                 &quarantine::notification_body(event),
             );
@@ -1054,14 +1048,14 @@ mod tray {
     unsafe fn open_gui(hwnd: HWND) {
         let gui = platform::sibling_executable(GUI_EXE_STEM);
         if !gui.is_file() {
-            platform::send_desktop_notification(
+            platform::send_desktop_notification_async(
                 "The Nex",
                 &format!("The desktop app was not found at {}", gui.display()),
             );
             return;
         }
         if !shell_open(hwnd, "open", &gui, "", SW_SHOWNORMAL) {
-            platform::send_desktop_notification("The Nex", "Could not open the desktop app.");
+            platform::send_desktop_notification_async("The Nex", "Could not open the desktop app.");
         }
     }
 
@@ -1070,12 +1064,12 @@ mod tray {
             return;
         };
         if shell_open(hwnd, "runas", &exe, "--quick-scan", SW_HIDE) {
-            platform::send_desktop_notification(
+            platform::send_desktop_notification_async(
                 "The Nex",
                 "Quick scan started. Findings appear in the activity log.",
             );
         } else {
-            platform::send_desktop_notification(
+            platform::send_desktop_notification_async(
                 "The Nex",
                 "Quick scan needs administrator approval and was not started.",
             );

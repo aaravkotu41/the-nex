@@ -180,7 +180,7 @@ pub fn record_event(cfg: &AppConfig, event: ThreatEvent) {
         ));
     }
     if cfg.interactive {
-        platform::send_desktop_notification(
+        platform::send_desktop_notification_async(
             &notification_title(&event),
             &notification_body(&event),
         );
