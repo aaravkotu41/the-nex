@@ -5,8 +5,24 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>The Nex</title>
   <link rel="stylesheet" href="styles.css">
+  <script>
+    // Instant paint: apply the last appearance (mirrored by app.js) before the first frame.
+    try {
+      var saved = JSON.parse(localStorage.getItem("thenex.appearance") || "null");
+      if (saved && typeof saved === "object") {
+        var root = document.documentElement.style;
+        var dim = Number(saved.bg_dim), blur = Number(saved.card_blur), alpha = Number(saved.card_alpha);
+        if (dim >= 0 && dim <= 0.9) root.setProperty("--bg-dim", String(dim));
+        if (blur >= 0 && blur <= 24) root.setProperty("--card-blur", blur + "px");
+        if (alpha >= 0.3 && alpha <= 0.95) root.setProperty("--card-alpha", String(alpha));
+        if (typeof saved.css === "string" && saved.css.length < 200000) root.setProperty("--wallpaper", saved.css);
+      }
+    } catch (error) { /* first launch or storage unavailable: defaults from styles.css */ }
+  </script>
 </head>
 <body>
+  <div id="bg-wallpaper" aria-hidden="true"></div>
+  <div id="bg-scrim" aria-hidden="true"></div>
   <div class="app">
     <aside class="sidebar">
       <div class="brand">
@@ -203,33 +219,77 @@
         </section>
 
         <section class="page" id="page-settings">
-          <div class="panel">
-            <div class="panel-head"><h2>Background Service</h2></div>
-            <div class="row">
-              <div>
-                <h3 id="service-state">Checking…</h3>
-                <p class="muted" id="service-detail"></p>
+          <div class="settings-grid">
+            <div class="panel">
+              <div class="panel-head"><h2>Background Service</h2></div>
+              <div class="row">
+                <div>
+                  <div class="row-title">
+                    <h3>Engine service</h3>
+                    <span class="pill status" id="service-state">Checking…</span>
+                  </div>
+                  <p class="muted mono" id="service-detail"></p>
+                </div>
+                <div class="button-group">
+                  <button class="btn" id="install-service">Install</button>
+                  <button class="btn btn-danger" id="uninstall-service">Uninstall</button>
+                </div>
               </div>
-              <div class="button-group">
-                <button class="btn" id="install-service">Install</button>
-                <button class="btn btn-danger" id="uninstall-service">Uninstall</button>
+              <div class="row">
+                <div>
+                  <h3>Dry run</h3>
+                  <p class="muted">Applies to every engine immediately; the service reloads settings within a second.</p>
+                </div>
+                <button class="switch" role="switch" aria-checked="false" data-engine="dry_run" aria-label="Dry run"></button>
               </div>
             </div>
-            <div class="row">
-              <div>
-                <h3>Dry run</h3>
-                <p class="muted">Applies to every engine immediately; the service reloads settings within a second.</p>
-              </div>
-              <button class="switch" role="switch" aria-checked="false" data-engine="dry_run" aria-label="Dry run"></button>
+
+            <div class="panel">
+              <div class="panel-head"><h2>Watched Directories</h2></div>
+              <ul class="paths" id="watched-dirs"></ul>
             </div>
-          </div>
-          <div class="panel">
-            <div class="panel-head"><h2>Watched Directories</h2></div>
-            <ul class="paths mono" id="watched-dirs"></ul>
-          </div>
-          <div class="panel">
-            <div class="panel-head"><h2>Data</h2></div>
-            <dl class="facts" id="data-facts"></dl>
+
+            <div class="panel" id="appearance-panel">
+              <div class="panel-head">
+                <h2>Appearance &amp; Wallpaper</h2>
+                <span class="pill" id="wallpaper-label">Default Matte Dark</span>
+              </div>
+              <div class="appearance">
+                <div>
+                  <label class="field-label" for="wallpaper-url">Paste image or page URL</label>
+                  <div class="input-row">
+                    <input class="text-input" id="wallpaper-url" type="url" placeholder="https://…/image.jpg or a wallpaper page" autocomplete="off" spellcheck="false">
+                    <button class="btn" id="apply-wallpaper-url">Apply URL</button>
+                  </div>
+                </div>
+                <div>
+                  <span class="field-label">Local image</span>
+                  <div class="input-row">
+                    <button class="btn" id="choose-wallpaper-file">Choose Local File</button>
+                    <span class="muted small">PNG, JPG, WEBP or GIF · up to 25 MB</span>
+                    <input id="wallpaper-file" type="file" accept=".png,.jpg,.jpeg,.webp,.gif,image/png,image/jpeg,image/webp,image/gif" hidden>
+                  </div>
+                </div>
+                <div>
+                  <span class="field-label">Presets</span>
+                  <div class="presets" id="wallpaper-presets"></div>
+                </div>
+                <div class="sliders">
+                  <label class="slider"><span>Background dim</span><input id="bg-dim" type="range" min="0" max="90" step="1" value="65"><output id="bg-dim-value" for="bg-dim">65%</output></label>
+                  <label class="slider"><span>Card blur</span><input id="card-blur" type="range" min="0" max="24" step="1" value="14"><output id="card-blur-value" for="card-blur">14px</output></label>
+                  <label class="slider"><span>Card opacity</span><input id="card-alpha" type="range" min="30" max="95" step="1" value="72"><output id="card-alpha-value" for="card-alpha">72%</output></label>
+                </div>
+                <div class="appearance-actions">
+                  <span class="small" id="appearance-status" role="status"></span>
+                  <button class="btn" id="reset-appearance">Reset to Default</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-head"><h2>Data</h2></div>
+              <dl class="facts" id="data-facts"></dl>
+            </div>
           </div>
         </section>
       </div>

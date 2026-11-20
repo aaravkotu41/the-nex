@@ -38,3 +38,8 @@ windows-sys = { version = "0.59", features = [
 tauri = "2"
 tauri-build = "2"
 embed-resource = "3"
+# Wallpaper page-URL resolver in the desktop app: OS TLS (Schannel / Security.framework),
+# no C toolchain needed.
+ureq = { version = "2.12", default-features = false, features = ["native-tls"] }
+native-tls = "0.2"
+url = "2"

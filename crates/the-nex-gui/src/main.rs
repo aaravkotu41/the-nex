@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod appearance;
+
 use chrono::Utc;
 use serde::Serialize;
 use std::fs;
@@ -423,6 +425,9 @@ async fn uninstall_service() -> Result<String, String> {
 
 fn main() {
     tauri::Builder::default()
+        .register_uri_scheme_protocol(appearance::WALLPAPER_SCHEME, |ctx, request| {
+            appearance::serve_wallpaper(ctx.app_handle(), &request)
+        })
         .invoke_handler(tauri::generate_handler![
             get_dashboard_state,
             get_events,
@@ -433,7 +438,12 @@ fn main() {
             delete_quarantine,
             verify_canaries,
             install_service,
-            uninstall_service
+            uninstall_service,
+            appearance::get_appearance,
+            appearance::save_appearance,
+            appearance::resolve_wallpaper_url,
+            appearance::download_wallpaper,
+            appearance::save_wallpaper_file
         ])
         .run(tauri::generate_context!())
         .expect("failed to start The Nex desktop app");
