@@ -234,11 +234,11 @@ pub fn set_readonly(path: &Path, readonly: bool) -> io::Result<()> {
 pub fn move_file(src: &Path, dst: &Path) -> io::Result<()> {
     let mut last_error = io::Error::other("move not attempted");
     for attempt in 0..MOVE_ATTEMPTS {
-        match fs::rename(src, dst) {
+        let rename_error = match fs::rename(src, dst) {
             Ok(()) => return Ok(()),
-            Err(e) => last_error = e,
-        }
-        match fs::copy(src, dst) {
+            Err(e) => e,
+        };
+        let fallback_error = match fs::copy(src, dst) {
             Ok(_) => {
                 let _ = set_readonly(src, false);
                 match fs::remove_file(src) {
@@ -246,7 +246,7 @@ pub fn move_file(src: &Path, dst: &Path) -> io::Result<()> {
                     Err(e) => {
                         let _ = set_readonly(dst, false);
                         let _ = fs::remove_file(dst);
-                        last_error = e;
+                        e
                     }
                 }
             }
@@ -254,9 +254,13 @@ pub fn move_file(src: &Path, dst: &Path) -> io::Result<()> {
                 if dst.exists() {
                     let _ = fs::remove_file(dst);
                 }
-                last_error = e;
+                e
             }
-        }
+        };
+        last_error = io::Error::new(
+            fallback_error.kind(),
+            format!("rename failed ({rename_error}); copy fallback failed ({fallback_error})"),
+        );
         if attempt + 1 < MOVE_ATTEMPTS {
             thread::sleep(MOVE_RETRY_DELAY);
         }
