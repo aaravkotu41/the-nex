@@ -1,0 +1,180 @@
+; The Nex - one-click Windows installer (NSIS 3, Unicode).
+;
+; Build (CI does this):
+;   makensis /DVERSION=0.2.0 /DSRCDIR=<folder> /DOUTFILE=<path>\TheNexSetup.exe installer.nsi
+; where <folder> holds the-nex.exe, the-nex-gui.exe, thenex_model.onnx and icon.ico.
+;
+; Double-click -> one administrator prompt -> files go to %ProgramData%\TheNex (the folder the
+; service reads its model and settings from), the service is registered and started, the tray
+; icon starts for the signed-in user, and Start menu / desktop shortcuts plus an Apps & Features
+; uninstaller are created. Silent: TheNexSetup.exe /S
+
+Unicode true
+ManifestDPIAware true
+RequestExecutionLevel admin
+SetCompressor /SOLID lzma
+
+!ifndef VERSION
+  !define VERSION "0.2.0"
+!endif
+!ifndef SRCDIR
+  !error "Pass /DSRCDIR=<folder with the-nex.exe, the-nex-gui.exe, thenex_model.onnx and icon.ico>"
+!endif
+!ifndef OUTFILE
+  !define OUTFILE "TheNexSetup.exe"
+!endif
+
+!define APPNAME "The Nex"
+!define SERVICE "TheNex"
+!define UNINSTALLER "Uninstall The Nex.exe"
+!define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\TheNex"
+!define RUNKEY "Software\Microsoft\Windows\CurrentVersion\Run"
+
+!include "MUI2.nsh"
+!include "LogicLib.nsh"
+!include "x64.nsh"
+
+Name "${APPNAME}"
+OutFile "${OUTFILE}"
+InstallDir "$PROGRAMFILES64\TheNex" ; replaced by %ProgramData%\TheNex in .onInit
+ShowInstDetails show
+ShowUninstDetails show
+BrandingText "${APPNAME} ${VERSION}"
+
+VIProductVersion "${VERSION}.0"
+VIAddVersionKey "ProductName" "${APPNAME}"
+VIAddVersionKey "ProductVersion" "${VERSION}"
+VIAddVersionKey "FileVersion" "${VERSION}"
+VIAddVersionKey "FileDescription" "${APPNAME} installer"
+VIAddVersionKey "LegalCopyright" "${APPNAME}"
+
+!define MUI_ICON "${SRCDIR}\icon.ico"
+!define MUI_UNICON "${SRCDIR}\icon.ico"
+!define MUI_ABORTWARNING
+!define MUI_FINISHPAGE_TITLE "The Nex is installed and protecting this PC"
+!define MUI_FINISHPAGE_TEXT "The background service is running and the tray icon has started.$\r$\n$\r$\nTip: switch on Dry run in Settings first if you want to see what The Nex would block before it acts."
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_TEXT "Open The Nex"
+!define MUI_FINISHPAGE_RUN_FUNCTION LaunchDashboard
+
+; One click: no welcome, licence or folder pages - straight to installing, then Finish.
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_LANGUAGE "English"
+
+Function .onInit
+  ${IfNot} ${RunningX64}
+    MessageBox MB_ICONSTOP "The Nex needs 64-bit Windows 10 or 11." /SD IDOK
+    Abort
+  ${EndIf}
+  SetRegView 64
+  SetShellVarContext all
+  ; Must match the service's data folder (%ProgramData%\TheNex).
+  ReadEnvStr $0 "ProgramData"
+  ${If} $0 == ""
+    StrCpy $0 "$WINDIR\..\ProgramData"
+  ${EndIf}
+  StrCpy $INSTDIR "$0\TheNex"
+FunctionEnd
+
+; Explorer starts the target as the signed-in user, without this installer's admin rights.
+Function LaunchDashboard
+  Exec '"$WINDIR\explorer.exe" "$INSTDIR\the-nex-gui.exe"'
+FunctionEnd
+
+!macro StopTheNex
+  nsExec::ExecToLog '"$SYSDIR\sc.exe" stop ${SERVICE}'
+  Pop $0
+  Sleep 1500
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /T /IM the-nex.exe'
+  Pop $0
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /T /IM the-nex-gui.exe'
+  Pop $0
+  Sleep 500
+!macroend
+
+Section "The Nex" SecMain
+  SetShellVarContext all
+
+  DetailPrint "Stopping any running copy of The Nex..."
+  !insertmacro StopTheNex
+
+  SetOutPath "$INSTDIR"
+  SetOverwrite on
+  File "${SRCDIR}\the-nex.exe"
+  File "${SRCDIR}\the-nex-gui.exe"
+  File "${SRCDIR}\thenex_model.onnx"
+  File "${SRCDIR}\icon.ico"
+  WriteUninstaller "$INSTDIR\${UNINSTALLER}"
+
+  DetailPrint "Registering the background service..."
+  nsExec::ExecToLog '"$INSTDIR\the-nex.exe" --install'
+  Pop $0
+  ${If} $0 != 0
+    MessageBox MB_ICONSTOP "Registering The Nex service failed (exit code $0). See the details list for the reason." /SD IDOK
+    SetErrorLevel 2
+    Abort
+  ${EndIf}
+
+  DetailPrint "Starting the background service..."
+  nsExec::ExecToLog '"$SYSDIR\sc.exe" start ${SERVICE}'
+  Pop $0
+
+  CreateDirectory "$SMPROGRAMS\The Nex"
+  CreateShortcut "$SMPROGRAMS\The Nex\The Nex.lnk" "$INSTDIR\the-nex-gui.exe" "" "$INSTDIR\icon.ico"
+  CreateShortcut "$SMPROGRAMS\The Nex\Uninstall The Nex.lnk" "$INSTDIR\${UNINSTALLER}"
+  CreateShortcut "$DESKTOP\The Nex.lnk" "$INSTDIR\the-nex-gui.exe" "" "$INSTDIR\icon.ico"
+  CreateShortcut "$INSTDIR\The Nex Tray.lnk" "$INSTDIR\the-nex.exe" "--tray" "$INSTDIR\icon.ico"
+
+  WriteRegStr HKLM "${UNINSTKEY}" "DisplayName" "${APPNAME}"
+  WriteRegStr HKLM "${UNINSTKEY}" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKLM "${UNINSTKEY}" "Publisher" "${APPNAME}"
+  WriteRegStr HKLM "${UNINSTKEY}" "DisplayIcon" "$INSTDIR\icon.ico"
+  WriteRegStr HKLM "${UNINSTKEY}" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKLM "${UNINSTKEY}" "UninstallString" '"$INSTDIR\${UNINSTALLER}"'
+  WriteRegStr HKLM "${UNINSTKEY}" "QuietUninstallString" '"$INSTDIR\${UNINSTALLER}" /S'
+  WriteRegDWORD HKLM "${UNINSTKEY}" "NoModify" 1
+  WriteRegDWORD HKLM "${UNINSTKEY}" "NoRepair" 1
+
+  ; Tray icon for the person installing (later sign-ins start it from the Run key).
+  ${IfNot} ${Silent}
+    Exec '"$WINDIR\explorer.exe" "$INSTDIR\The Nex Tray.lnk"'
+  ${EndIf}
+SectionEnd
+
+Function un.onInit
+  SetRegView 64
+  SetShellVarContext all
+FunctionEnd
+
+Section "Uninstall"
+  SetShellVarContext all
+
+  DetailPrint "Removing the background service..."
+  nsExec::ExecToLog '"$INSTDIR\the-nex.exe" --uninstall'
+  Pop $0
+  !insertmacro StopTheNex
+  nsExec::ExecToLog '"$SYSDIR\sc.exe" delete ${SERVICE}'
+  Pop $0
+  DeleteRegValue HKLM "${RUNKEY}" "TheNexNotifier"
+  DeleteRegValue HKCU "${RUNKEY}" "TheNexTray"
+
+  Delete "$INSTDIR\the-nex.exe"
+  Delete "$INSTDIR\the-nex-gui.exe"
+  Delete "$INSTDIR\thenex_model.onnx"
+  Delete "$INSTDIR\icon.ico"
+  Delete "$INSTDIR\The Nex Tray.lnk"
+  Delete "$INSTDIR\${UNINSTALLER}"
+  Delete "$SMPROGRAMS\The Nex\The Nex.lnk"
+  Delete "$SMPROGRAMS\The Nex\Uninstall The Nex.lnk"
+  RMDir "$SMPROGRAMS\The Nex"
+  Delete "$DESKTOP\The Nex.lnk"
+  DeleteRegKey HKLM "${UNINSTKEY}"
+
+  ; Removed only if empty: logs, settings and quarantined files are kept on purpose.
+  RMDir "$INSTDIR"
+  IfFileExists "$INSTDIR\*.*" 0 +2
+    DetailPrint "Kept $INSTDIR (logs, settings and quarantined files)."
+SectionEnd

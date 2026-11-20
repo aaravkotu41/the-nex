@@ -105,6 +105,55 @@ jobs:
         if: ${{ !cancelled() && steps.release.outcome == 'success' }}
         run: python scripts/verify_thenex.py --skip-build
 
+      - name: Build TheNexSetup.exe (one-click installer)
+        id: installer
+        if: ${{ !cancelled() && steps.release.outcome == 'success' }}
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $stage = New-Item -ItemType Directory -Force -Path target\installer-stage
+          Copy-Item target\release\the-nex.exe, target\release\the-nex-gui.exe, thenex_model.onnx, crates\the-nex-gui\icons\icon.ico -Destination $stage
+          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) { choco install nsis -y --no-progress | Out-Host }
+          & $makensis /V3 "/DVERSION=$version" "/DSRCDIR=$($stage.FullName)" "/DOUTFILE=$((Resolve-Path target).Path)\TheNexSetup.exe" packaging\windows\installer.nsi
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-Item target\TheNexSetup.exe | Format-List Name, Length
+
+      # Installs for real on the runner (silent), checks the service is up, then uninstalls.
+      - name: Installer smoke test (install, verify, uninstall)
+        if: ${{ !cancelled() && steps.installer.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          $dir = Join-Path $env:ProgramData 'TheNex'
+          $setup = Start-Process -FilePath target\TheNexSetup.exe -ArgumentList '/S' -Wait -PassThru
+          if ($setup.ExitCode -ne 0) {
+            Get-ChildItem $dir -ErrorAction SilentlyContinue | Format-Table Name, Length
+            if (Test-Path "$dir\the-nex.exe") { & "$dir\the-nex.exe" --install }
+            throw "TheNexSetup.exe /S exited with $($setup.ExitCode)"
+          }
+          foreach ($file in 'the-nex.exe', 'the-nex-gui.exe', 'thenex_model.onnx', 'Uninstall The Nex.exe') {
+            if (-not (Test-Path (Join-Path $dir $file))) { throw "installer did not place $file" }
+          }
+          if (-not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\The Nex\The Nex.lnk")) { throw 'Start menu shortcut missing' }
+          if (-not (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\TheNex' -ErrorAction SilentlyContinue)) { throw 'not listed in Apps & Features' }
+          $service = Get-Service -Name TheNex
+          $service.WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+          $status = Join-Path $dir 'logs\status.json'
+          $deadline = (Get-Date).AddSeconds(45)
+          while (-not (Test-Path $status) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+          if (-not (Test-Path $status)) { throw "the installed service never wrote $status" }
+          Get-Content $status -Raw | ConvertFrom-Json | Format-List version, pid, model_loaded, watched_dirs
+          "installed OK; uninstalling"
+
+          # _?= runs the uninstaller in place so -Wait really waits for it.
+          $remove = Start-Process -FilePath (Join-Path $dir 'Uninstall The Nex.exe') -ArgumentList '/S', "_?=$dir" -Wait -PassThru
+          if ($remove.ExitCode -ne 0) { throw "uninstaller exited with $($remove.ExitCode)" }
+          if (Get-Service -Name TheNex -ErrorAction SilentlyContinue) { throw 'service still registered after uninstall' }
+          foreach ($file in 'the-nex.exe', 'the-nex-gui.exe') {
+            if (Test-Path (Join-Path $dir $file)) { throw "uninstaller left $file behind" }
+          }
+          if (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\TheNex' -ErrorAction SilentlyContinue) { throw 'still listed in Apps & Features' }
+          "install + uninstall OK"
+
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -124,6 +173,13 @@ jobs:
             target/release/the-nex-gui.exe
             thenex_model.onnx
             crates/the-nex-gui/icons/icon.ico
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && steps.installer.outcome == 'success' }}
+        with:
+          name: TheNexSetup-windows-x64
+          path: target/TheNexSetup.exe
           if-no-files-found: error
 
   macos:
@@ -205,9 +261,74 @@ jobs:
           hdiutil imageinfo target/macos/TheNex.dmg > /dev/null
           "$APP/Contents/MacOS/the-nex" --help
 
+      - name: Build TheNex.pkg (one-click installer)
+        id: pkg
+        if: ${{ !cancelled() && steps.dmg.outcome == 'success' }}
+        run: |
+          bash packaging/macos/build_pkg.sh
+          ls -l target/macos/TheNex.pkg
+
+      # Installs for real on the runner, checks the LaunchDaemon is up, then uninstalls.
+      - name: Installer smoke test (install, verify, uninstall)
+        if: ${{ !cancelled() && steps.pkg.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          DATA="/Library/Application Support/TheNex"
+          sudo installer -pkg target/macos/TheNex.pkg -target /
+          test -x /Applications/TheNex.app/Contents/MacOS/the-nex
+          test -x /Applications/TheNex.app/Contents/MacOS/the-nex-gui
+          pkgutil --pkg-info com.thenex.pkg
+          sudo test -f "$DATA/thenex_model.onnx"
+          sudo launchctl print system/com.thenex.edr | grep -E '^[[:space:]]*(state|pid|program) =' || true
+          for _ in $(seq 1 45); do
+            sudo test -f "$DATA/logs/status.json" && break
+            sleep 1
+          done
+          sudo test -f "$DATA/logs/status.json" || { echo "the installed daemon never wrote status.json"; exit 1; }
+          sudo cat "$DATA/logs/status.json" | python3 -c 'import json,sys; s=json.load(sys.stdin); print({k: s[k] for k in ("version","pid","model_loaded")})'
+          echo "installed OK; uninstalling"
+
+          sudo /Applications/TheNex.app/Contents/Resources/uninstall_mac.sh --purge
+          if sudo launchctl print system/com.thenex.edr >/dev/null 2>&1; then
+            echo "daemon still loaded after uninstall"; exit 1
+          fi
+          test ! -e /Library/LaunchDaemons/com.thenex.edr.plist
+          sudo rm -rf /Applications/TheNex.app
+          sudo pkgutil --forget com.thenex.pkg
+          echo "install + uninstall OK"
+
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() && steps.dmg.outcome == 'success' }}
         with:
           name: the-nex-macos
-          path: target/macos/TheNex.dmg
-          if-no-files-found: error
+          path: |
+            target/macos/TheNex.dmg
+            target/macos/TheNex.pkg
+          if-no-files-found: warn
+
+  # Pushing a tag like v0.2.0 publishes a GitHub Release with the installers attached.
+  release:
+    name: Publish release
+    needs: [windows, macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -R dist
+          gh release create "$GITHUB_REF_NAME" \
+            dist/TheNexSetup-windows-x64/TheNexSetup.exe \
+            dist/the-nex-macos/TheNex.pkg \
+            dist/the-nex-macos/TheNex.dmg \
+            --title "The Nex $GITHUB_REF_NAME" \
+            --notes-file INSTALL.md
