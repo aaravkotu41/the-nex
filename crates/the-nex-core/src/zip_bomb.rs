@@ -311,7 +311,7 @@ fn inspect_zip_reader<R: Read + Seek>(
 pub fn scan_and_respond(path: &Path, cfg: &AppConfig) -> Option<ZipThreat> {
     let threat = inspect_zip_file(path, cfg)?;
     let details = threat.summary();
-    let action = if cfg.dry_run {
+    let action = if cfg.is_dry_run() {
         "DRY_RUN: would quarantine".to_string()
     } else {
         match quarantine::quarantine_file(path, cfg, "ZIP_BOMB", &details) {

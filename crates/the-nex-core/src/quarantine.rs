@@ -3,6 +3,7 @@ use crate::logger::{self, lock_or_recover};
 use crate::platform;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -20,8 +21,9 @@ const MAX_ID_LEN: usize = 64;
 
 static EVENT_LOG_LOCK: Mutex<()> = Mutex::new(());
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static THREAT_EVENTS: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Severity {
     Low,
@@ -69,6 +71,13 @@ impl ThreatEvent {
             action_taken: action_taken.into(),
             details: details.into(),
         }
+    }
+
+    /// Quarantine ID recorded in `action_taken` ("QUARANTINED id=<ID>"), if any.
+    pub fn quarantine_id(&self) -> Option<&str> {
+        let rest = self.action_taken.split("id=").nth(1)?;
+        let id = rest.split(|c: char| c.is_whitespace() || c == ';').next()?;
+        is_valid_id(id).then_some(id)
     }
 }
 
@@ -127,6 +136,11 @@ pub fn notification_body(event: &ThreatEvent) -> String {
     )
 }
 
+/// Threat events (severity above LOW) recorded by this process.
+pub fn threat_events_recorded() -> u64 {
+    THREAT_EVENTS.load(Ordering::Relaxed)
+}
+
 /// Appends one JSON line; a single write on an O_APPEND handle keeps lines whole.
 pub fn append_event(cfg: &AppConfig, event: &ThreatEvent) -> io::Result<()> {
     let _guard = lock_or_recover(&EVENT_LOG_LOCK);
@@ -156,6 +170,7 @@ pub fn record_event(cfg: &AppConfig, event: ThreatEvent) {
     if event.severity == Severity::Low {
         logger::info(summary);
     } else {
+        THREAT_EVENTS.fetch_add(1, Ordering::Relaxed);
         logger::warn(summary);
     }
     if let Err(e) = append_event(cfg, &event) {
@@ -181,6 +196,28 @@ fn rotate_events_if_needed(path: &Path) {
         let _ = fs::remove_file(&rotated);
         let _ = fs::rename(path, &rotated);
     }
+}
+
+/// Newest-first events from the log, reading at most the trailing `max_bytes`.
+pub fn read_recent_events(path: &Path, max_bytes: u64) -> io::Result<Vec<ThreatEvent>> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(max_bytes);
+    let mut buffer = Vec::with_capacity((len - start) as usize);
+    io::Seek::seek(&mut file, io::SeekFrom::Start(start))?;
+    file.read_to_end(&mut buffer)?;
+    let text = String::from_utf8_lossy(&buffer);
+    let mut lines = text.lines();
+    if start > 0 {
+        lines.next();
+    }
+    let mut events: Vec<ThreatEvent> = lines
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    events.reverse();
+    Ok(events)
 }
 
 pub fn set_readonly(path: &Path, readonly: bool) -> io::Result<()> {
@@ -250,7 +287,7 @@ fn sanitize_file_name(path: &Path) -> String {
     }
 }
 
-fn meta_path(cfg: &AppConfig, id: &str) -> PathBuf {
+pub fn meta_path(cfg: &AppConfig, id: &str) -> PathBuf {
     cfg.quarantine_dir.join(format!("{id}{META_SUFFIX}"))
 }
 
@@ -305,7 +342,8 @@ pub fn quarantine_file(
     Ok(meta)
 }
 
-pub fn restore_file(id: &str, cfg: &AppConfig) -> io::Result<QuarantineMeta> {
+/// Reads and validates a quarantine record; the stored path must stay inside the quarantine folder.
+pub fn load_meta(id: &str, cfg: &AppConfig) -> io::Result<QuarantineMeta> {
     if !is_valid_id(id) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -317,13 +355,34 @@ pub fn restore_file(id: &str, cfg: &AppConfig) -> io::Result<QuarantineMeta> {
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", meta_file.display())))?;
     let meta: QuarantineMeta =
         serde_json::from_slice(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
     if meta.id != id || !platform::path_is_within(&meta.quarantined_path, &cfg.quarantine_dir) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "quarantine metadata does not match its ID or location",
         ));
     }
+    Ok(meta)
+}
+
+/// Every quarantine record, newest first.
+pub fn list_quarantined(cfg: &AppConfig) -> io::Result<Vec<QuarantineMeta>> {
+    let mut records = Vec::new();
+    for entry in fs::read_dir(&cfg.quarantine_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_suffix(META_SUFFIX) else {
+            continue;
+        };
+        if let Ok(meta) = load_meta(id, cfg) {
+            records.push(meta);
+        }
+    }
+    records.sort_by(|a, b| b.quarantined_at.cmp(&a.quarantined_at));
+    Ok(records)
+}
+
+pub fn restore_file(id: &str, cfg: &AppConfig) -> io::Result<QuarantineMeta> {
+    let meta = load_meta(id, cfg)?;
     if meta.original_path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -356,7 +415,10 @@ pub fn restore_file(id: &str, cfg: &AppConfig) -> io::Result<QuarantineMeta> {
         ));
     }
     if let Some(parent) = meta.original_path.parent() {
-        fs::create_dir_all(parent)?;
+        if let Err(e) = fs::create_dir_all(parent) {
+            relock();
+            return Err(e);
+        }
     }
     if let Err(e) = move_file(&meta.quarantined_path, &meta.original_path) {
         relock();
@@ -364,7 +426,18 @@ pub fn restore_file(id: &str, cfg: &AppConfig) -> io::Result<QuarantineMeta> {
     }
     // A same-volume rename keeps the quarantine ACL; re-inherit from the destination folder.
     platform::unlock_restored_file(&meta.original_path);
-    fs::remove_file(&meta_file)?;
+    fs::remove_file(meta_path(cfg, id))?;
+    Ok(meta)
+}
+
+/// Permanently removes a quarantined file and its record.
+pub fn delete_quarantined_file(id: &str, cfg: &AppConfig) -> io::Result<QuarantineMeta> {
+    let meta = load_meta(id, cfg)?;
+    if meta.quarantined_path.exists() {
+        platform::unlock_restored_file(&meta.quarantined_path);
+        fs::remove_file(&meta.quarantined_path)?;
+    }
+    fs::remove_file(meta_path(cfg, id))?;
     Ok(meta)
 }
 
@@ -382,184 +455,59 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
     Ok(to_hex(&hasher.finalize()))
 }
 
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    to_hex(&Sha256::digest(bytes))
+}
+
 pub fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-const SHA256_K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
-
-const SHA256_H0: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-];
-
-/// FIPS 180-4 SHA-256 (kept in-tree to avoid an extra dependency).
-#[derive(Clone)]
-pub struct Sha256 {
-    state: [u32; 8],
-    buffer: [u8; 64],
-    buffer_len: usize,
-    total_len: u64,
-}
-
-impl Default for Sha256 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Sha256 {
-    pub fn new() -> Self {
-        Self {
-            state: SHA256_H0,
-            buffer: [0; 64],
-            buffer_len: 0,
-            total_len: 0,
-        }
-    }
-
-    pub fn update(&mut self, mut data: &[u8]) {
-        self.total_len = self.total_len.wrapping_add(data.len() as u64);
-        if self.buffer_len > 0 {
-            let take = (64 - self.buffer_len).min(data.len());
-            self.buffer[self.buffer_len..self.buffer_len + take].copy_from_slice(&data[..take]);
-            self.buffer_len += take;
-            data = &data[take..];
-            if self.buffer_len == 64 {
-                let block = self.buffer;
-                self.compress(&block);
-                self.buffer_len = 0;
-            }
-        }
-        let mut chunks = data.chunks_exact(64);
-        for chunk in &mut chunks {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(chunk);
-            self.compress(&block);
-        }
-        let rest = chunks.remainder();
-        if !rest.is_empty() {
-            self.buffer[..rest.len()].copy_from_slice(rest);
-            self.buffer_len = rest.len();
-        }
-    }
-
-    pub fn finalize(mut self) -> [u8; 32] {
-        let bit_len = self.total_len.wrapping_mul(8);
-        let zeros = if self.buffer_len < 56 {
-            55 - self.buffer_len
-        } else {
-            119 - self.buffer_len
-        };
-        let mut tail = Vec::with_capacity(1 + zeros + 8);
-        tail.push(0x80);
-        tail.resize(1 + zeros, 0);
-        tail.extend_from_slice(&bit_len.to_be_bytes());
-        self.update(&tail);
-        let mut out = [0u8; 32];
-        for (chunk, word) in out.chunks_exact_mut(4).zip(self.state) {
-            chunk.copy_from_slice(&word.to_be_bytes());
-        }
-        out
-    }
-
-    fn compress(&mut self, block: &[u8; 64]) {
-        let mut w = [0u32; 64];
-        for (i, word) in block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
-        for (k, wi) in SHA256_K.iter().zip(w.iter()) {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ (!e & g);
-            let t1 = h
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(*k)
-                .wrapping_add(*wi);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        for (slot, value) in self.state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-            *slot = slot.wrapping_add(value);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn hash(data: &[u8]) -> String {
-        let mut h = Sha256::new();
-        h.update(data);
-        to_hex(&h.finalize())
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("thenex-q-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        root
     }
 
     #[test]
     fn sha256_known_vectors() {
         assert_eq!(
-            hash(b""),
+            sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
         assert_eq!(
-            hash(b"abc"),
+            sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        assert_eq!(
-            hash(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
-            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
-        );
     }
 
     #[test]
-    fn sha256_streaming_matches_one_shot() {
-        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
-        let mut streaming = Sha256::new();
-        for chunk in data.chunks(97) {
-            streaming.update(chunk);
-        }
-        assert_eq!(to_hex(&streaming.finalize()), hash(&data));
-    }
-
-    #[test]
-    fn id_validation() {
+    fn id_validation_and_extraction() {
         assert!(is_valid_id(&new_id()));
         assert!(!is_valid_id("../evil"));
         assert!(!is_valid_id(""));
         assert!(!is_valid_id("a b"));
+        let event = ThreatEvent::new("ZIP_BOMB", Severity::High, "x", "QUARANTINED id=abc-12", "");
+        assert_eq!(event.quarantine_id(), Some("abc-12"));
+        let event = ThreatEvent::new(
+            "X",
+            Severity::High,
+            "x",
+            "TERMINATED 1; QUARANTINED id=z_9",
+            "",
+        );
+        assert_eq!(event.quarantine_id(), Some("z_9"));
+        let event = ThreatEvent::new("X", Severity::High, "x", "DRY_RUN", "");
+        assert_eq!(event.quarantine_id(), None);
     }
 
     #[test]
-    fn quarantine_and_restore_round_trip() {
-        let root =
-            std::env::temp_dir().join(format!("thenex-quarantine-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+    fn quarantine_list_restore_and_delete() {
+        let root = temp_root("roundtrip");
         let cfg = AppConfig::for_base_dir(&root.join("base"));
         cfg.ensure_dirs().unwrap();
         let victim = root.join("victim.exe");
@@ -571,17 +519,33 @@ mod tests {
         assert!(meta.quarantined_path.exists());
         assert!(meta_path(&cfg, &meta.id).exists());
         assert_eq!(meta.sha256, expected);
-        assert!(meta
-            .quarantined_path
-            .to_string_lossy()
-            .ends_with(".quarantined"));
+        assert_eq!(list_quarantined(&cfg).unwrap(), vec![meta.clone()]);
 
-        let restored = restore_file(&meta.id, &cfg).unwrap();
-        assert_eq!(restored.original_path, meta.original_path);
+        restore_file(&meta.id, &cfg).unwrap();
         assert_eq!(fs::read(&victim).unwrap(), b"MZ payload");
-        assert!(!meta.quarantined_path.exists());
-        assert!(!meta_path(&cfg, &meta.id).exists());
-        assert!(restore_file(&meta.id, &cfg).is_err());
+        assert!(list_quarantined(&cfg).unwrap().is_empty());
+
+        let again = quarantine_file(&victim, &cfg, "TEST", "unit test").unwrap();
+        delete_quarantined_file(&again.id, &cfg).unwrap();
+        assert!(!again.quarantined_path.exists());
+        assert!(!victim.exists());
+        assert!(list_quarantined(&cfg).unwrap().is_empty());
+        assert!(delete_quarantined_file(&again.id, &cfg).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recent_events_are_newest_first() {
+        let root = temp_root("events");
+        let cfg = AppConfig::for_base_dir(&root);
+        for kind in ["A", "B", "C"] {
+            append_event(&cfg, &ThreatEvent::new(kind, Severity::High, "t", "a", "d")).unwrap();
+        }
+        let events = read_recent_events(&cfg.events_log, 1 << 20).unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e.threat_type.as_str()).collect();
+        assert_eq!(kinds, ["C", "B", "A"]);
+        let tail = read_recent_events(&cfg.events_log, 400).unwrap();
+        assert!(tail.len() < 3 && tail[0].threat_type == "C");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -590,14 +554,5 @@ mod tests {
         let cfg = AppConfig::for_base_dir(&std::env::temp_dir().join("thenex-none"));
         let err = restore_file("..\\..\\x", &cfg).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn event_round_trips_through_json() {
-        let event = ThreatEvent::new("ZIP_BOMB", Severity::High, "x.zip", "QUARANTINED", "ratio");
-        let line = serde_json::to_string(&event).unwrap();
-        assert!(line.contains("\"severity\":\"HIGH\""));
-        let back: ThreatEvent = serde_json::from_str(&line).unwrap();
-        assert_eq!(back, event);
     }
 }

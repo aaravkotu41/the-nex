@@ -1,7 +1,8 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, Engine};
 use crate::logger;
 use crate::platform;
 use crate::quarantine::{self, Severity, ThreatEvent};
+use crate::status::{CanaryStatus, Telemetry};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
@@ -22,6 +23,7 @@ const CANARY_MAGIC: &[u8] = b"THENEX\x00CANARY\x00v1\x00";
 const CANARY_LEN: usize = 24 * 1024;
 const RECV_TIMEOUT: Duration = Duration::from_millis(500);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+const PUBLISH_INTERVAL: Duration = Duration::from_secs(5);
 const HUNT_COOLDOWN: Duration = Duration::from_secs(3);
 const HUNT_WINDOW: Duration = Duration::from_millis(300);
 const ACTIVE_WRITE_BYTES: u64 = 4096;
@@ -176,6 +178,53 @@ fn dedup_dirs(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
     dirs.into_iter()
         .filter(|d| seen.insert(platform::path_key(d)))
         .collect()
+}
+
+fn status_of(path: PathBuf, state: CanaryState) -> CanaryStatus {
+    CanaryStatus {
+        path,
+        state: format!("{state:?}"),
+    }
+}
+
+/// Read-only integrity check of every canary slot in `dirs`.
+pub fn canary_states(dirs: &[PathBuf]) -> Vec<CanaryStatus> {
+    dirs.iter()
+        .filter(|dir| dir.is_dir())
+        .flat_map(|dir| {
+            CANARY_FILE_NAMES
+                .iter()
+                .enumerate()
+                .map(move |(index, name)| {
+                    let path = dir.join(name);
+                    let state = check_canary(&path, index);
+                    status_of(path, state)
+                })
+        })
+        .collect()
+}
+
+/// Recreates missing or altered canaries (hidden) and reports the resulting state of each.
+pub fn rearm_canaries(dirs: &[PathBuf]) -> Vec<CanaryStatus> {
+    let mut report = Vec::new();
+    for dir in dirs.iter().filter(|dir| dir.is_dir()) {
+        for (index, name) in CANARY_FILE_NAMES.iter().enumerate() {
+            let path = dir.join(name);
+            if check_canary(&path, index) != CanaryState::Intact {
+                if path.exists() {
+                    let _ = quarantine::set_readonly(&path, false);
+                    let _ = fs::remove_file(&path);
+                }
+                if let Err(e) = fs::write(&path, canary_content(index)) {
+                    logger::warn(format!("cannot rearm canary {}: {e}", path.display()));
+                }
+            }
+            platform::set_hidden_file(&path);
+            let state = check_canary(&path, index);
+            report.push(status_of(path, state));
+        }
+    }
+    report
 }
 
 pub struct CanaryManager {
@@ -364,7 +413,7 @@ impl CanaryManager {
             ));
             return;
         };
-        let action = if self.cfg.dry_run {
+        let action = if self.cfg.is_dry_run() {
             "DRY_RUN: would terminate process".to_string()
         } else if sys.process(suspect.pid).is_some_and(|p| p.kill()) {
             "TERMINATED".to_string()
@@ -430,15 +479,22 @@ pub fn run(
     cfg: Arc<AppConfig>,
     dirs: Vec<PathBuf>,
     rx: Receiver<CanaryMsg>,
+    telemetry: Arc<Telemetry>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let mut manager = CanaryManager::new(cfg, dirs);
-    let placed = manager.deploy_all();
-    logger::info(format!(
-        "canaries active: {placed} file(s) across {} folder(s)",
-        manager.dirs().len()
-    ));
+    let enabled = cfg.engine_enabled(Engine::Canary);
+    let mut manager = CanaryManager::new(Arc::clone(&cfg), dirs);
+    if enabled {
+        let placed = manager.deploy_all();
+        logger::info(format!(
+            "canaries active: {placed} file(s) across {} folder(s)",
+            manager.dirs().len()
+        ));
+    }
+    telemetry.set_canaries(canary_states(manager.dirs()));
+    let mut was_enabled = enabled;
     let mut last_sweep = Instant::now();
+    let mut last_publish = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
         let message = match rx.recv_timeout(RECV_TIMEOUT) {
             Ok(message) => Some(message),
@@ -446,14 +502,31 @@ pub fn run(
             Err(RecvTimeoutError::Disconnected) => break,
         };
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-            match message {
-                Some(CanaryMsg::FsEvent(path)) => manager.handle_fs_event(&path),
-                Some(CanaryMsg::SetDirs(dirs)) => manager.set_dirs(dirs),
-                None => {}
+            let enabled = cfg.engine_enabled(Engine::Canary);
+            if enabled && !was_enabled {
+                manager.deploy_all();
             }
-            if last_sweep.elapsed() >= SWEEP_INTERVAL {
+            was_enabled = enabled;
+            let mut changed = false;
+            match message {
+                Some(CanaryMsg::FsEvent(path)) if enabled => {
+                    manager.handle_fs_event(&path);
+                    changed = true;
+                }
+                Some(CanaryMsg::SetDirs(dirs)) => {
+                    manager.set_dirs(dirs);
+                    changed = true;
+                }
+                _ => {}
+            }
+            if enabled && last_sweep.elapsed() >= SWEEP_INTERVAL {
                 last_sweep = Instant::now();
                 manager.sweep();
+                changed = true;
+            }
+            if changed || last_publish.elapsed() >= PUBLISH_INTERVAL {
+                last_publish = Instant::now();
+                telemetry.set_canaries(canary_states(manager.dirs()));
             }
         }));
         if outcome.is_err() {
@@ -522,6 +595,31 @@ mod tests {
     #[test]
     fn safe_writers_are_case_insensitive() {
         assert!(is_safe_writer("MsMpEng.exe"));
+        assert!(is_safe_writer("mds_stores"));
         assert!(!is_safe_writer("evil.exe"));
+    }
+
+    #[test]
+    fn rearm_restores_and_reports_every_slot() {
+        let dir = temp_dir();
+        let states = canary_states(&[dir.clone()]);
+        assert_eq!(states.len(), CANARY_FILE_NAMES.len());
+        assert!(states.iter().all(|s| s.state == "Missing"));
+
+        let report = rearm_canaries(&[dir.clone()]);
+        assert!(report.iter().all(CanaryStatus::is_intact), "{report:?}");
+
+        let tampered = dir.join(CANARY_FILE_NAMES[1]);
+        let _ = fs::remove_file(&tampered);
+        fs::write(&tampered, b"ransom note").unwrap();
+        let states = canary_states(&[dir.clone()]);
+        assert_eq!(states[1].state, "Modified");
+        assert!(rearm_canaries(&[dir.clone()])
+            .iter()
+            .all(CanaryStatus::is_intact));
+        assert!(canary_states(&[dir.join("missing-folder")]).is_empty());
+
+        remove_canaries(&[dir.clone()]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

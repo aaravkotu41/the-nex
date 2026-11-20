@@ -1,4 +1,5 @@
 /target
 /test_sandbox/
+/thenex_live_sandbox/
 __pycache__/
 *.pyc

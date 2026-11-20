@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The Nex</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M7 26V6h4.2L21 19.4V6h4v20h-4.2L11 12.6V26z" fill="currentColor"/>
+        </svg>
+        <span>The Nex</span>
+      </div>
+      <nav class="nav" aria-label="Sections">
+        <button class="nav-item active" data-page="overview">
+          <svg viewBox="0 0 24 24"><path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z"/></svg>
+          <span>Overview</span>
+        </button>
+        <button class="nav-item" data-page="engines">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>
+          <span>Engines</span>
+        </button>
+        <button class="nav-item" data-page="activity">
+          <svg viewBox="0 0 24 24"><path d="M2 12h4l3-8 6 16 3-8h4"/></svg>
+          <span>Activity</span>
+        </button>
+        <button class="nav-item" data-page="quarantine">
+          <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9M10 13h4"/></svg>
+          <span>Quarantine</span>
+          <span class="badge" id="quarantine-badge" hidden>0</span>
+        </button>
+        <button class="nav-item" data-page="canaries">
+          <svg viewBox="0 0 24 24"><path d="M14 4h5v5M19 4l-7 7M10 20H5v-5M5 20l7-7"/><circle cx="12" cy="12" r="2"/></svg>
+          <span>Canaries</span>
+        </button>
+        <button class="nav-item" data-page="settings">
+          <svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>
+          <span>Settings</span>
+        </button>
+      </nav>
+      <div class="sidebar-footer">
+        <span class="dot" id="service-dot"></span>
+        <span class="mono" id="service-text">Connecting…</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <h1 id="page-title">Overview</h1>
+        <div class="topbar-actions">
+          <label class="search">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <input id="search" type="search" placeholder="Search PID, path, or hash..." autocomplete="off" spellcheck="false">
+            <kbd id="search-hint">Ctrl K</kbd>
+          </label>
+          <button class="btn btn-primary" id="quick-scan">Quick Scan</button>
+        </div>
+      </header>
+
+      <div class="content">
+        <div class="notice" id="notice" hidden></div>
+
+        <section class="page active" id="page-overview">
+          <div class="strip">
+            <div class="strip-status">
+              <span class="dot" id="protection-dot"></span>
+              <span id="protection-text">Connecting…</span>
+            </div>
+            <div class="strip-stats mono">
+              <span><b id="stat-scanned">0</b> Scanned</span>
+              <span><b id="stat-quarantined">0</b> Quarantined</span>
+              <span><b id="stat-cpu">0.0%</b> CPU</span>
+            </div>
+          </div>
+
+          <div class="engine-grid">
+            <article class="card engine-card">
+              <div class="card-icon">
+                <svg viewBox="0 0 24 24"><path d="M8 3h8l1 3H7z"/><rect x="5" y="6" width="14" height="15" rx="1"/><path d="M12 10v6M9.5 13.5 12 16l2.5-2.5"/></svg>
+              </div>
+              <div class="card-body">
+                <h3>Zip Bomb Guard</h3>
+                <p class="mono" id="card-zip">Ratio &gt;100:1 · Depth ≤3 · Pre-extraction</p>
+              </div>
+              <button class="switch" role="switch" aria-checked="false" data-engine="zip_bomb" aria-label="Zip Bomb Guard"></button>
+            </article>
+            <article class="card engine-card">
+              <div class="card-icon">
+                <svg viewBox="0 0 24 24"><path d="M12 2 21 7v10l-9 5-9-5V7z"/><path d="M12 22V12M21 7l-9 5-9-5"/></svg>
+              </div>
+              <div class="card-body">
+                <h3>ONNX Binary AI</h3>
+                <p class="mono" id="card-ai">thenex_model.onnx · Offline · Local tract</p>
+              </div>
+              <button class="switch" role="switch" aria-checked="false" data-engine="bin_ai" aria-label="ONNX Binary AI"></button>
+            </article>
+            <article class="card engine-card">
+              <div class="card-icon">
+                <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M12 15h5"/></svg>
+              </div>
+              <div class="card-body">
+                <h3>LotL Process Guard</h3>
+                <p class="mono" id="card-lotl">0 processes watched · Shell &amp; Script Shield</p>
+              </div>
+              <button class="switch" role="switch" aria-checked="false" data-engine="process_guard" aria-label="LotL Process Guard"></button>
+            </article>
+            <article class="card engine-card">
+              <div class="card-icon">
+                <svg viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5z"/><path d="m3 13 9 5 9-5M3 18l9 5 9-5"/></svg>
+              </div>
+              <div class="card-body">
+                <h3>Canary Honeypots</h3>
+                <p class="mono" id="card-canary">0 decoy files intact · Desktop &amp; Docs</p>
+              </div>
+              <button class="switch" role="switch" aria-checked="false" data-engine="canary" aria-label="Canary Honeypots"></button>
+            </article>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Activity Log</h2>
+              <button class="link" data-goto="activity">View all</button>
+            </div>
+            <table class="table">
+              <thead><tr><th>Time</th><th>Type</th><th>Target</th><th>Detail</th><th>Action</th></tr></thead>
+              <tbody id="overview-events"></tbody>
+            </table>
+            <p class="empty" id="overview-empty">No threat events recorded yet.</p>
+          </div>
+        </section>
+
+        <section class="page" id="page-engines">
+          <div class="panel">
+            <div class="panel-head"><h2>Detection Engines</h2></div>
+            <div class="rows" id="engine-rows"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>Response Mode</h2></div>
+            <div class="row">
+              <div>
+                <h3>Dry run</h3>
+                <p class="muted">Detect and log only. Nothing is terminated or quarantined.</p>
+              </div>
+              <button class="switch" role="switch" aria-checked="false" data-engine="dry_run" aria-label="Dry run"></button>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>AI Model</h2></div>
+            <dl class="facts" id="model-facts"></dl>
+          </div>
+        </section>
+
+        <section class="page" id="page-activity">
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Event History</h2>
+              <div class="pills" id="severity-pills">
+                <button class="pill-filter active" data-severity="ALL">All</button>
+                <button class="pill-filter" data-severity="CRITICAL">Critical</button>
+                <button class="pill-filter" data-severity="HIGH">High</button>
+                <button class="pill-filter" data-severity="MEDIUM">Medium</button>
+                <button class="pill-filter" data-severity="LOW">Low</button>
+              </div>
+            </div>
+            <table class="table">
+              <thead><tr><th>Time</th><th>Type</th><th>Severity</th><th>Target</th><th>Detail</th><th>Action</th></tr></thead>
+              <tbody id="activity-events"></tbody>
+            </table>
+            <p class="empty" id="activity-empty">No events match.</p>
+          </div>
+        </section>
+
+        <section class="page" id="page-quarantine">
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Quarantined Files</h2>
+              <span class="muted mono" id="quarantine-count"></span>
+            </div>
+            <table class="table quarantine-table">
+              <thead><tr><th>Quarantined</th><th>File</th><th>Threat</th><th>SHA-256</th><th class="right">Actions</th></tr></thead>
+              <tbody id="quarantine-rows"></tbody>
+            </table>
+            <p class="empty" id="quarantine-empty">Nothing is in quarantine.</p>
+          </div>
+        </section>
+
+        <section class="page" id="page-canaries">
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Canary Files</h2>
+              <button class="btn" id="verify-canaries">Verify / Rearm Canaries</button>
+            </div>
+            <table class="table canary-table">
+              <thead><tr><th>Path</th><th>Integrity</th></tr></thead>
+              <tbody id="canary-rows"></tbody>
+            </table>
+            <p class="empty" id="canary-empty">No canary folders found.</p>
+          </div>
+        </section>
+
+        <section class="page" id="page-settings">
+          <div class="panel">
+            <div class="panel-head"><h2>Background Service</h2></div>
+            <div class="row">
+              <div>
+                <h3 id="service-state">Checking…</h3>
+                <p class="muted" id="service-detail"></p>
+              </div>
+              <div class="button-group">
+                <button class="btn" id="install-service">Install</button>
+                <button class="btn btn-danger" id="uninstall-service">Uninstall</button>
+              </div>
+            </div>
+            <div class="row">
+              <div>
+                <h3>Dry run</h3>
+                <p class="muted">Applies to every engine immediately; the service reloads settings within a second.</p>
+              </div>
+              <button class="switch" role="switch" aria-checked="false" data-engine="dry_run" aria-label="Dry run"></button>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>Watched Directories</h2></div>
+            <ul class="paths mono" id="watched-dirs"></ul>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>Data</h2></div>
+            <dl class="facts" id="data-facts"></dl>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

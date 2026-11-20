@@ -31,8 +31,8 @@ pub const SUSPICIOUS_IMPORTS: [&str; 9] = [
 pub const SUSPICIOUS_MACHO_SYMBOLS: [&str; 7] = [
     "dlopen", "ptrace", "NSTask", "system", "popen", "execve", "mprotect",
 ];
-/// log10(1 + size_kb) / 6 maps 0 B..1 GB onto 0..1.
-const SIZE_LOG_SCALE: f64 = 6.0;
+/// Feature 0 is log10 of the size in KiB (floored at 1 KiB): 10 KB -> 1.0, 3 MB -> 3.5, capped at 1 GiB.
+pub const MAX_LOG10_SIZE_KB: f32 = 6.0;
 const SECTION_COUNT_SCALE: f64 = 16.0;
 const MAX_CACHE_ENTRIES: usize = 4096;
 
@@ -167,7 +167,10 @@ pub fn feature_vector(
     suspicious_total: usize,
 ) -> FeatureVector {
     let size_kb = size_bytes as f64 / 1024.0;
-    let size = ((1.0 + size_kb).log10() / SIZE_LOG_SCALE).clamp(0.0, 1.0);
+    let size = size_kb
+        .max(1.0)
+        .log10()
+        .clamp(0.0, f64::from(MAX_LOG10_SIZE_KB));
     let entropy = (max_section_entropy / 8.0).clamp(0.0, 1.0);
     let sections = (section_count as f64 / SECTION_COUNT_SCALE).clamp(0.0, 1.0);
     let suspicious = if suspicious_total == 0 {
@@ -297,10 +300,16 @@ fn mach_features(bytes: &[u8], mach: &goblin::mach::Mach<'_>) -> Option<FeatureV
     })
 }
 
+/// Feature 0 within [0, MAX_LOG10_SIZE_KB]; the other three within [0, 1].
+pub fn features_in_range(features: &FeatureVector) -> bool {
+    (0.0..=MAX_LOG10_SIZE_KB).contains(&features[0])
+        && features[1..].iter().all(|f| (0.0..=1.0).contains(f))
+}
+
 /// Deterministic logistic score over the same four features (used when the model is absent).
 pub fn heuristic_score(features: &FeatureVector) -> f32 {
     let [size, entropy, sections, suspicious] = features.map(f64::from);
-    let z = -8.5 + 7.5 * entropy + 7.0 * suspicious - 1.5 * sections - 1.0 * size;
+    let z = -8.5 + 7.5 * entropy + 7.0 * suspicious - 1.5 * sections - 0.17 * size;
     (1.0 / (1.0 + (-z).exp())) as f32
 }
 
@@ -317,7 +326,7 @@ pub fn scan_and_respond(path: &Path, cfg: &AppConfig, scanner: &BinaryAiScanner)
         cfg.ai_threshold,
         scanner.engine_name()
     );
-    let action = if cfg.dry_run {
+    let action = if cfg.is_dry_run() {
         "DRY_RUN: would quarantine".to_string()
     } else {
         match quarantine::quarantine_file(path, cfg, "MALWARE_AI", &details) {
@@ -378,29 +387,32 @@ mod tests {
     }
 
     #[test]
-    fn feature_vector_is_normalized() {
+    fn feature_vector_is_bounded() {
         for features in [
             feature_vector(0, 0.0, 0, 0, 9),
             feature_vector(u64::MAX, 9.0, 1000, 50, 9),
             feature_vector(350 * 1024, 6.4, 6, 1, 9),
             feature_vector(10, 3.0, 2, 0, 0),
         ] {
-            assert!(
-                features.iter().all(|f| (0.0..=1.0).contains(f)),
-                "{features:?}"
-            );
+            assert!(features_in_range(&features), "{features:?}");
         }
+        assert!((feature_vector(10 * 1024, 0.0, 0, 0, 9)[0] - 1.0).abs() < 1e-6);
+        assert_eq!(feature_vector(u64::MAX, 0.0, 0, 0, 9)[0], MAX_LOG10_SIZE_KB);
     }
 
     #[test]
     fn heuristic_separates_prototypes() {
-        let benign = feature_vector(800 * 1024, 6.3, 6, 1, 9);
-        let malicious = feature_vector(120 * 1024, 7.9, 3, 5, 9);
-        let b = heuristic_score(&benign);
-        let m = heuristic_score(&malicious);
-        assert!((0.0..=1.0).contains(&b) && (0.0..=1.0).contains(&m));
-        assert!(b < crate::config::AI_MALWARE_THRESHOLD, "benign={b}");
-        assert!(m >= crate::config::AI_MALWARE_THRESHOLD, "malicious={m}");
+        let threshold = crate::config::AI_MALWARE_THRESHOLD;
+        for (features, malicious) in [
+            (feature_vector(800 * 1024, 6.3, 6, 1, 9), false),
+            (feature_vector(120 * 1024, 7.9, 3, 5, 9), true),
+            ([3.5, 0.55, 0.3, 0.0], false),
+            ([1.0, 0.98, 0.1, 0.9], true),
+        ] {
+            let score = heuristic_score(&features);
+            assert!((0.0..=1.0).contains(&score));
+            assert_eq!(score >= threshold, malicious, "{features:?} scored {score}");
+        }
     }
 
     #[test]
@@ -414,7 +426,7 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         let bytes = fs::read(exe).unwrap();
         let features = extract_features(&bytes).expect("test binary is a PE or Mach-O image");
-        assert!(features.iter().all(|f| (0.0..=1.0).contains(f)));
+        assert!(features_in_range(&features), "{features:?}");
     }
 
     /// Runs when THENEX_MODEL_PATH points at a model produced by train_onnx.py (CI sets it).

@@ -31,17 +31,6 @@ const SIGTERM: i32 = 15;
 const USERS_ROOT: &str = "/Users";
 const SKIPPED_HOMES: &[&str] = &["shared"];
 
-const PROTECTED_PROCESS_NAMES: &[&str] = &[
-    "launchd",
-    "kernel_task",
-    "windowserver",
-    "finder",
-    "loginwindow",
-    "dock",
-    "systemuiserver",
-    SELF_EXE_NAME,
-];
-
 /// SIP-protected locations; /usr/local is deliberately excluded.
 const TRUSTED_ROOTS: &[&str] = &[
     "/System/",
@@ -55,6 +44,15 @@ const TRUSTED_ROOTS: &[&str] = &[
 
 const NOTIFY_SCRIPT: &str =
     "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run\n";
+
+/// Runs argv (program first) as root after the standard macOS administrator prompt.
+const ELEVATE_SCRIPT: &str = "on run argv\n\
+set cmd to \"\"\n\
+repeat with a in argv\n\
+set cmd to cmd & quoted form of (a as text) & \" \"\n\
+end repeat\n\
+do shell script cmd with administrator privileges\n\
+end run\n";
 
 extern "C" {
     fn geteuid() -> u32;
@@ -154,6 +152,11 @@ pub fn discover_canary_dirs() -> Vec<PathBuf> {
     dedup_paths(home_folders(&["Desktop", "Documents"]))
 }
 
+/// Downloads and Desktop of every real user (/tmp is left to the live watcher).
+pub fn discover_quick_scan_dirs() -> Vec<PathBuf> {
+    dedup_paths(home_folders(&["Downloads", "Desktop"]))
+}
+
 pub fn set_hidden_file(path: &Path) {
     let _ = run_tool(
         Path::new("/usr/bin/chflags"),
@@ -207,14 +210,6 @@ pub fn send_desktop_notification(title: &str, body: &str) {
             ));
         }
     }
-}
-
-pub fn is_protected_process(pid: u32, name: &str) -> bool {
-    if pid == 0 || pid == 1 || pid == std::process::id() {
-        return true;
-    }
-    let lower = name.to_lowercase();
-    PROTECTED_PROCESS_NAMES.contains(&lower.as_str())
 }
 
 fn has_apple_anchored_signature(path: &Path) -> bool {
@@ -503,19 +498,70 @@ pub fn install_ctrlc_handler(shutdown: Arc<AtomicBool>) {
 /// LaunchAgents run without a terminal, so there is nothing to detach.
 pub fn detach_console() {}
 
+pub fn service_installed() -> bool {
+    Path::new(DAEMON_PLIST).is_file()
+}
+
+/// The menu-bar notifier is the LaunchAgent; the tray icon is a Windows feature.
+pub fn tray_is_running() -> bool {
+    false
+}
+
+pub fn run_tray(_cfg: AppConfig) -> Result<(), String> {
+    Err(
+        "--tray is available on Windows; on macOS notifications come from the notifier LaunchAgent"
+            .to_string(),
+    )
+}
+
+/// Runs `program args` as root via the standard administrator prompt; returns its exit code.
+pub fn run_elevated(program: &Path, args: &[&str]) -> Result<i32, String> {
+    if is_root() {
+        return Command::new(program)
+            .args(args)
+            .status()
+            .map(|s| s.code().unwrap_or(-1))
+            .map_err(|e| format!("{}: {e}", program.display()));
+    }
+    let mut child = Command::new("/usr/bin/osascript")
+        .arg("-")
+        .arg(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("osascript: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(ELEVATE_SCRIPT.as_bytes())
+            .map_err(|e| format!("osascript: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("osascript: {e}"))?;
+    if output.status.success() {
+        return Ok(0);
+    }
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if message.contains("-128") {
+        Err("the administrator prompt was cancelled".to_string())
+    } else {
+        Err(format!("{} failed: {message}", program.display()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn protected_processes() {
-        assert!(is_protected_process(0, "anything"));
-        assert!(is_protected_process(1, "launchd"));
-        assert!(is_protected_process(std::process::id(), "whatever"));
-        assert!(is_protected_process(4321, "WindowServer"));
-        assert!(is_protected_process(4321, "Finder"));
-        assert!(is_protected_process(4321, "the-nex"));
-        assert!(!is_protected_process(4321, "malware"));
+    fn tray_is_windows_only() {
+        assert!(!tray_is_running());
+        let cfg = AppConfig::for_base_dir(&env::temp_dir().join("thenex-tray-mac"));
+        assert!(run_tray(cfg).is_err());
+        assert!(ELEVATE_SCRIPT.contains("with administrator privileges"));
+        assert!(!ELEVATE_SCRIPT.contains("osascript -e"));
     }
 
     #[test]

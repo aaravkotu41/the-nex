@@ -118,7 +118,8 @@ pub fn run_notifier(cfg: &AppConfig, shutdown: Arc<AtomicBool>) {
     let mut tail = EventTail::new(cfg.events_log.clone());
     while !shutdown.load(Ordering::SeqCst) {
         let events = tail.poll();
-        if !events.is_empty() {
+        // A tray icon in this session already toasts alerts; stay quiet to avoid duplicates.
+        if !events.is_empty() && !platform::tray_is_running() {
             deliver(&events, &cfg.events_log);
         }
         thread::sleep(POLL_INTERVAL);

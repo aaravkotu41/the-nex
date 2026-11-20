@@ -18,9 +18,9 @@ env:
 
 jobs:
   windows:
-    name: Windows build and test
+    name: Windows build, test and live verify
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         shell: pwsh
@@ -53,37 +53,48 @@ jobs:
           }
           if ($failed) { exit 1 }
 
-      - name: Train ONNX model
+      - name: Generate icons and train the ONNX model
         run: |
+          python scripts/gen_icons.py
           python -m pip install --disable-pip-version-check numpy onnx
-          python train_onnx.py --out thenex_model.onnx
-
-      - name: Generate zip-bomb samples
-        run: python scripts/gen_test_zipbomb.py
+          python scripts/train_onnx.py --out thenex_model.onnx
+          python scripts/gen_test_zipbomb.py
 
       - name: cargo check
-        run: cargo check --all-targets --locked
+        run: cargo check --workspace --all-targets --locked
 
       - name: cargo test
         env:
           THENEX_MODEL_PATH: ${{ github.workspace }}\thenex_model.onnx
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
       - name: Release build
-        run: cargo build --release --locked
+        run: cargo build --release --workspace --locked
+
+      - name: Live end-to-end verification
+        run: python scripts/verify_thenex.py --skip-build
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: verify-sandbox-windows
+          path: thenex_live_sandbox
+          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v7
         with:
           name: the-nex-windows-x64
           path: |
             target/release/the-nex.exe
+            target/release/the-nex-gui.exe
             thenex_model.onnx
+            crates/the-nex-gui/icons/icon.ico
           if-no-files-found: error
 
   macos:
-    name: macOS build, test and package
+    name: macOS build, test, live verify and package
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
@@ -106,30 +117,41 @@ jobs:
       - name: Check shell scripts parse
         run: for script in packaging/macos/*.sh; do bash -n "$script"; done
 
-      - name: Train ONNX model
+      - name: Generate icons and train the ONNX model
         run: |
+          python scripts/gen_icons.py
           python -m pip install --disable-pip-version-check numpy onnx
-          python train_onnx.py --out thenex_model.onnx
-
-      - name: Generate zip-bomb samples
-        run: python scripts/gen_test_zipbomb.py
+          python scripts/train_onnx.py --out thenex_model.onnx
+          python scripts/gen_test_zipbomb.py
 
       - name: cargo check
-        run: cargo check --all-targets --locked
+        run: cargo check --workspace --all-targets --locked
 
       - name: cargo test
         env:
           THENEX_MODEL_PATH: ${{ github.workspace }}/thenex_model.onnx
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
       - name: Build TheNex.app and TheNex.dmg
         run: bash packaging/macos/build_dmg.sh
 
+      - name: Live end-to-end verification
+        run: python scripts/verify_thenex.py --skip-build
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: verify-sandbox-macos
+          path: thenex_live_sandbox
+          if-no-files-found: ignore
+
       - name: Verify bundle layout, plist and signature
         run: |
           APP=target/macos/TheNex.app
+          test -x "$APP/Contents/MacOS/the-nex-gui"
           test -x "$APP/Contents/MacOS/the-nex"
           test -f "$APP/Contents/Resources/thenex_model.onnx"
+          test -f "$APP/Contents/Resources/icon.icns"
           test -x "$APP/Contents/Resources/install_mac.sh"
           test -x "$APP/Contents/Resources/uninstall_mac.sh"
           plutil -lint "$APP/Contents/Info.plist"

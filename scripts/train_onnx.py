@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Train The Nex binary classifier and export it as a tract-compatible ONNX graph.
 
-Features (must match src/bin_ai.rs::feature_vector):
-  0 log10(1 + size_kb) / 6            clipped to [0, 1]
-  1 max PE section Shannon entropy / 8
-  2 section count / 16                 clipped to [0, 1]
-  3 distinct suspicious imports / 9
+Features (must match crates/the-nex-core/src/bin_ai.rs::feature_vector):
+  0 log10(size_kb), size floored at 1 KiB  in [0, 6]  (10 KB -> 1.0, 3 MB -> 3.5)
+  1 max section Shannon entropy / 8        in [0, 1]
+  2 section (PE) or segment (Mach-O) count / 16, clipped to [0, 1]
+  3 distinct suspicious imports / 9        in [0, 1]
 
 The exported graph is Gemm -> Relu -> Gemm -> Relu -> Gemm -> Sigmoid at opset 13,
 default domain only (no ai.onnx.ml operators), input "features" [N, 4] float32,
@@ -22,15 +22,21 @@ from onnx import TensorProto, helper, numpy_helper
 
 N_FEATURES = 4
 N_SUSPICIOUS_IMPORTS = 9
+MAX_LOG10_SIZE_KB = 6.0
 OPSET = 13
 IR_VERSION = 7
 ALLOWED_OPS = {"Gemm", "Relu", "Sigmoid"}
 HIDDEN = (16, 8)
+THRESHOLD = 0.65
+# Reference vectors the Rust test-suite also checks against the exported model.
+MALICIOUS_REFERENCE = [1.0, 0.98, 0.1, 0.9]
+BENIGN_REFERENCE = [3.5, 0.55, 0.3, 0.0]
+DEFAULT_OUT = Path(__file__).resolve().parent.parent / "thenex_model.onnx"
 
 
 def to_features(size_bytes, entropy, sections, suspicious):
-    size_kb = size_bytes / 1024.0
-    f_size = np.clip(np.log10(1.0 + size_kb) / 6.0, 0.0, 1.0)
+    size_kb = np.maximum(size_bytes / 1024.0, 1.0)
+    f_size = np.clip(np.log10(size_kb), 0.0, MAX_LOG10_SIZE_KB)
     f_entropy = np.clip(entropy / 8.0, 0.0, 1.0)
     f_sections = np.clip(sections / 16.0, 0.0, 1.0)
     f_suspicious = np.clip(suspicious / N_SUSPICIOUS_IMPORTS, 0.0, 1.0)
@@ -39,13 +45,14 @@ def to_features(size_bytes, entropy, sections, suspicious):
 
 def synth_benign(n, rng):
     size = 10.0 ** rng.uniform(4.3, 8.0, n)  # 20 KB .. 100 MB
-    has_packed_resources = rng.random(n) < 0.18  # installers, embedded archives, media
+    kind = rng.random(n)
+    # Typical compiled code, small/simple tools with low entropy, and installers with packed resources.
     entropy = np.where(
-        has_packed_resources,
-        rng.uniform(7.2, 7.98, n),
-        rng.normal(6.35, 0.35, n),
+        kind < 0.62,
+        rng.normal(6.3, 0.45, n),
+        np.where(kind < 0.82, rng.uniform(3.5, 6.0, n), rng.uniform(7.2, 7.98, n)),
     )
-    sections = rng.integers(4, 10, n)
+    sections = rng.integers(3, 11, n)
     # CRT start-up code alone pulls in IsDebuggerPresent; shells use ShellExecute.
     suspicious = rng.choice(np.arange(0, 4), size=n, p=[0.35, 0.40, 0.20, 0.05])
     return to_features(size, np.clip(entropy, 0.0, 8.0), sections, suspicious)
@@ -55,11 +62,11 @@ def synth_malicious(n, rng):
     size = 10.0 ** rng.uniform(3.7, 6.8, n)  # 5 KB .. 6 MB
     packed = rng.random(n) < 0.70
     entropy = np.where(packed, rng.uniform(7.2, 7.99, n), rng.normal(6.6, 0.4, n))
-    sections = np.where(rng.random(n) < 0.6, rng.integers(2, 5, n), rng.integers(5, 12, n))
+    sections = np.where(rng.random(n) < 0.6, rng.integers(1, 5, n), rng.integers(5, 12, n))
     suspicious = rng.choice(
-        np.arange(0, 8),
+        np.arange(0, 10),
         size=n,
-        p=[0.05, 0.08, 0.17, 0.22, 0.20, 0.14, 0.09, 0.05],
+        p=[0.04, 0.06, 0.12, 0.18, 0.18, 0.15, 0.11, 0.08, 0.05, 0.03],
     )
     return to_features(size, np.clip(entropy, 0.0, 8.0), sections, suspicious)
 
@@ -225,7 +232,7 @@ def verify_against_reference(model, params, x):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "thenex_model.onnx")
+    parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--samples", type=int, default=40_000)
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch-size", type=int, default=512)
@@ -251,8 +258,18 @@ def main():
         np.array([6, 3]),
         np.array([1, 5]),
     )
-    p_proto, _ = forward(params, prototypes)
-    print(f"prototype benign={p_proto[0, 0]:.3f} malicious={p_proto[1, 0]:.3f}")
+    references = np.array([BENIGN_REFERENCE, MALICIOUS_REFERENCE], dtype=np.float32)
+    checks = np.concatenate([prototypes, references])
+    scores, _ = forward(params, checks)
+    scores = scores.ravel()
+    print(
+        f"prototype benign={scores[0]:.3f} malicious={scores[1]:.3f}  "
+        f"reference benign={scores[2]:.3f} malicious={scores[3]:.3f}"
+    )
+    expected_malicious = [False, True, False, True]
+    wrong = [i for i, malicious in enumerate(expected_malicious) if (scores[i] >= THRESHOLD) != malicious]
+    if wrong:
+        raise SystemExit(f"model misclassifies reference vectors {wrong} at threshold {THRESHOLD}; retrain with another --seed")
 
     model = build_model(params)
     verify_graph(model)

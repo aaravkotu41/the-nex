@@ -1,0 +1,20 @@
+[package]
+name = "the-nex-gui"
+description = "The Nex desktop app (Tauri v2, plain HTML/CSS/JS frontend in ui/)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "the-nex-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+the-nex-core.workspace = true
+tauri.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

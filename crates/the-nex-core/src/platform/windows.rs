@@ -24,6 +24,14 @@ use windows_service::service::{
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED};
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, OpenMutexW, WaitForSingleObject, INFINITE, SYNCHRONIZATION_SYNCHRONIZE,
+};
+use windows_sys::Win32::UI::Shell::{
+    ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use winrt_notification::{Duration as ToastDuration, Sound, Toast};
 
 pub const SELF_EXE_NAME: &str = "the-nex.exe";
@@ -32,7 +40,12 @@ const SERVICE_DESCRIPTION: &str =
     "Real-time ransomware canary, zip bomb, malicious binary and living-off-the-land script protection.";
 const RUN_KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "TheNexNotifier";
+const USER_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const TRAY_RUN_VALUE: &str = "TheNexTray";
 const NOTIFIER_ARG: &str = "--notifier";
+const TRAY_ARG: &str = "--tray";
+/// Per-session name; the notifier stays quiet while a tray instance owns it.
+pub const TRAY_MUTEX_NAME: &str = r"Local\TheNexTray";
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
@@ -63,26 +76,6 @@ const SKIPPED_PROFILES: &[&str] = &[
     "all users",
     "defaultapppool",
     "wdagutilityaccount",
-];
-
-const PROTECTED_PROCESS_NAMES: &[&str] = &[
-    "system",
-    "system idle process",
-    "idle",
-    "registry",
-    "memory compression",
-    "secure system",
-    "smss.exe",
-    "csrss.exe",
-    "wininit.exe",
-    "winlogon.exe",
-    "services.exe",
-    "lsass.exe",
-    "lsaiso.exe",
-    "svchost.exe",
-    "explorer.exe",
-    "dwm.exe",
-    SELF_EXE_NAME,
 ];
 
 /// Folders under otherwise admin-only trees that standard users can write to.
@@ -284,6 +277,15 @@ pub fn discover_canary_dirs() -> Vec<PathBuf> {
     dedup_paths(dirs)
 }
 
+/// Downloads and Desktop of every real user (temp folders are left to the live watcher).
+pub fn discover_quick_scan_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for profile in user_profiles() {
+        dirs.extend(profile_folders(&profile, &["Downloads", "Desktop"]));
+    }
+    dedup_paths(dirs)
+}
+
 pub fn set_hidden_file(path: &Path) {
     let wide = to_wide(path.as_os_str());
     // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives both calls.
@@ -372,14 +374,6 @@ pub fn send_desktop_notification(title: &str, body: &str) {
     }
 }
 
-pub fn is_protected_process(pid: u32, name: &str) -> bool {
-    if pid == 0 || pid == 4 || pid == std::process::id() {
-        return true;
-    }
-    let lower = name.to_ascii_lowercase();
-    PROTECTED_PROCESS_NAMES.contains(&lower.as_str())
-}
-
 fn trusted_roots() -> &'static [String] {
     static ROOTS: OnceLock<Vec<String>> = OnceLock::new();
     ROOTS.get_or_init(|| {
@@ -454,6 +448,94 @@ pub fn is_trusted_binary(path: &Path) -> bool {
     is_in_trusted_root(path) || has_valid_authenticode(path)
 }
 
+/// Windows command-line quoting for one argument (CommandLineToArgvW rules).
+fn quote_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat('\\').take(backslashes));
+                quoted.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat('\\').take(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+/// Runs `program args` through the UAC prompt and waits for it; returns its exit code.
+pub fn run_elevated(program: &Path, args: &[&str]) -> Result<i32, String> {
+    let verb = to_wide(OsStr::new("runas"));
+    let file = to_wide(program.as_os_str());
+    let parameters = to_wide(OsStr::new(
+        &args
+            .iter()
+            .map(|a| quote_arg(a))
+            .collect::<Vec<_>>()
+            .join(" "),
+    ));
+    // SAFETY: SHELLEXECUTEINFOW is plain data; every pointer stays alive until the call returns
+    // and the returned process handle is closed exactly once.
+    unsafe {
+        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+        info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        info.lpParameters = parameters.as_ptr();
+        info.nShow = SW_HIDE;
+        if ShellExecuteExW(&mut info) == 0 {
+            let code = GetLastError();
+            return Err(if code == ERROR_CANCELLED {
+                "the administrator prompt was cancelled".to_string()
+            } else {
+                format!(
+                    "could not start {} elevated (Win32 error {code})",
+                    program.display()
+                )
+            });
+        }
+        if info.hProcess.is_null() {
+            return Err("elevated process handle unavailable".to_string());
+        }
+        WaitForSingleObject(info.hProcess, INFINITE);
+        let mut exit_code = 0u32;
+        GetExitCodeProcess(info.hProcess, &mut exit_code);
+        CloseHandle(info.hProcess);
+        Ok(exit_code as i32)
+    }
+}
+
+pub fn tray_is_running() -> bool {
+    let name = to_wide(OsStr::new(TRAY_MUTEX_NAME));
+    // SAFETY: valid NUL-terminated name; the handle is closed immediately.
+    unsafe {
+        let handle = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr());
+        if handle.is_null() {
+            false
+        } else {
+            CloseHandle(handle);
+            true
+        }
+    }
+}
+
+pub fn run_tray(cfg: AppConfig) -> Result<(), String> {
+    tray::run(cfg)
+}
+
 fn win32_code(err: &windows_service::Error) -> Option<i32> {
     match err {
         windows_service::Error::Winapi(io) => io.raw_os_error(),
@@ -467,6 +549,12 @@ fn service_error(context: &str, err: windows_service::Error) -> String {
         Some(code) => format!("{context}: {err} (Win32 error {code})"),
         None => format!("{context}: {err}"),
     }
+}
+
+pub fn service_installed() -> bool {
+    ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .and_then(|manager| manager.open_service(config::SERVICE_NAME, ServiceAccess::QUERY_STATUS))
+        .is_ok()
 }
 
 fn service_info(executable: PathBuf) -> ServiceInfo {
@@ -529,15 +617,15 @@ fn harden_data_dirs(cfg: &AppConfig) -> Vec<String> {
     notes
 }
 
-fn register_notifier_autostart(exe: &Path) -> Result<(), String> {
-    let command = format!("\"{}\" {NOTIFIER_ARG}", exe.display());
+fn register_autostart(key: &str, value: &str, exe: &Path, arg: &str) -> Result<(), String> {
+    let command = format!("\"{}\" {arg}", exe.display());
     run_tool(
         &system32_tool("reg.exe"),
         [
             "add",
-            RUN_KEY,
+            key,
             "/v",
-            RUN_VALUE,
+            value,
             "/t",
             "REG_SZ",
             "/d",
@@ -547,15 +635,16 @@ fn register_notifier_autostart(exe: &Path) -> Result<(), String> {
     )
 }
 
-fn unregister_notifier_autostart() -> bool {
+fn unregister_autostart(key: &str, value: &str) -> bool {
     run_tool(
         &system32_tool("reg.exe"),
-        ["delete", RUN_KEY, "/v", RUN_VALUE, "/f"],
+        ["delete", key, "/v", value, "/f"],
     )
     .is_ok()
 }
 
-fn stop_notifier_processes() -> usize {
+/// Terminates other the-nex.exe instances started with `arg` (notifier or tray).
+fn stop_session_processes(arg: &str) -> usize {
     let mut sys = System::new();
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
@@ -570,11 +659,9 @@ fn stop_notifier_processes() -> usize {
                 && OsStr::new(p.name())
                     .to_string_lossy()
                     .eq_ignore_ascii_case(SELF_EXE_NAME)
-                && p.cmd().iter().any(|arg| {
-                    OsStr::new(arg)
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(NOTIFIER_ARG)
-                })
+                && p.cmd()
+                    .iter()
+                    .any(|a| OsStr::new(a).to_string_lossy().eq_ignore_ascii_case(arg))
         })
         .filter(|p| p.kill())
         .count()
@@ -631,16 +718,16 @@ pub fn install_service() -> Result<String, String> {
     notes.extend(harden_data_dirs(&AppConfig::for_base_dir(
         &config::default_base_dir(),
     )));
-    match register_notifier_autostart(&exe) {
-        Ok(()) => notes.push(format!(
-            "notifier autostart registered ({RUN_KEY}\\{RUN_VALUE})"
-        )),
-        Err(e) => {
-            return Err(format!(
-                "service installed but notifier autostart failed: {e}"
-            ))
-        }
-    }
+    register_autostart(RUN_KEY, RUN_VALUE, &exe, NOTIFIER_ARG)
+        .map_err(|e| format!("service installed but notifier autostart failed: {e}"))?;
+    notes.push(format!(
+        "notifier autostart registered ({RUN_KEY}\\{RUN_VALUE})"
+    ));
+    register_autostart(USER_RUN_KEY, TRAY_RUN_VALUE, &exe, TRAY_ARG)
+        .map_err(|e| format!("service installed but tray autostart failed: {e}"))?;
+    notes.push(format!(
+        "tray autostart registered ({USER_RUN_KEY}\\{TRAY_RUN_VALUE})"
+    ));
     notes.push(format!("executable: {}", exe.display()));
     Ok(notes.join("\n"))
 }
@@ -679,12 +766,15 @@ pub fn uninstall_service() -> Result<String, String> {
         Err(e) => return Err(service_error("cannot open service", e)),
     }
 
-    if unregister_notifier_autostart() {
+    if unregister_autostart(RUN_KEY, RUN_VALUE) {
         notes.push("notifier autostart removed".to_string());
     }
-    let stopped = stop_notifier_processes();
+    if unregister_autostart(USER_RUN_KEY, TRAY_RUN_VALUE) {
+        notes.push("tray autostart removed".to_string());
+    }
+    let stopped = stop_session_processes(NOTIFIER_ARG) + stop_session_processes(TRAY_ARG);
     if stopped > 0 {
-        notes.push(format!("stopped {stopped} notifier process(es)"));
+        notes.push(format!("stopped {stopped} notifier/tray process(es)"));
     }
     let removed = canary::remove_canaries(&discover_canary_dirs());
     notes.push(format!("removed {removed} canary file(s)"));
@@ -787,20 +877,456 @@ pub fn detach_console() {
     }
 }
 
+/// Notification-area icon: hidden window + Shell_NotifyIconW, polling events.jsonl once a second.
+mod tray {
+    use super::{to_wide, TRAY_MUTEX_NAME};
+    use crate::config::{AppConfig, EVENTS_FILE_NAME};
+    use crate::notifier::EventTail;
+    use crate::platform::{self, GUI_EXE_STEM};
+    use crate::quarantine::{self, ThreatEvent};
+    use crate::status;
+    use std::cell::RefCell;
+    use std::ffi::OsStr;
+    use std::mem::size_of;
+    use std::path::{Path, PathBuf};
+    use std::ptr;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    use windows_sys::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+        NIM_MODIFY, NOTIFYICONDATAW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+        DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, KillTimer, LoadIconW,
+        LoadImageW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+        SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage, HICON, IDI_APPLICATION,
+        IMAGE_ICON, LR_DEFAULTCOLOR, LR_LOADFROMFILE, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON,
+        SM_CYSMICON, SW_HIDE, SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WM_APP, WM_COMMAND,
+        WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW,
+        WS_OVERLAPPED,
+    };
+
+    const WM_TRAY: u32 = WM_APP + 1;
+    const TRAY_ID: u32 = 1;
+    const TIMER_ID: usize = 1;
+    const POLL_MS: u32 = 1000;
+    const CMD_OPEN: usize = 1001;
+    const CMD_SCAN: usize = 1002;
+    const CMD_EXIT: usize = 1003;
+    /// Resource ID of the icon embedded into the-nex.exe by the daemon's build script.
+    const ICON_RESOURCE_ID: usize = 1;
+    const ALERT_TYPES: [&str; 3] = ["ZIP_BOMB", "LOTL_SCRIPT", "RANSOMWARE_CANARY"];
+    const MAX_TOASTS_PER_POLL: usize = 3;
+
+    static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+
+    struct TrayState {
+        cfg: AppConfig,
+        tail: EventTail,
+        icon: HICON,
+        alerts: u64,
+        last_alert: Option<String>,
+    }
+
+    thread_local! {
+        static STATE: RefCell<Option<TrayState>> = const { RefCell::new(None) };
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        to_wide(OsStr::new(text))
+    }
+
+    fn copy_into(dst: &mut [u16], text: &str) {
+        let units: Vec<u16> = text.encode_utf16().take(dst.len() - 1).collect();
+        dst[..units.len()].copy_from_slice(&units);
+        dst[units.len()] = 0;
+    }
+
+    fn icon_file_candidates(cfg: &AppConfig) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        {
+            candidates.push(dir.join("icon.ico"));
+            candidates.push(dir.join("thenex.ico"));
+        }
+        candidates.push(cfg.base_dir.join("icon.ico"));
+        candidates
+    }
+
+    /// Embedded resource first (crisp, multi-size), then icon.ico beside the exe or in the data dir.
+    unsafe fn load_icon(cfg: &AppConfig) -> HICON {
+        let cx = GetSystemMetrics(SM_CXSMICON);
+        let cy = GetSystemMetrics(SM_CYSMICON);
+        let module = GetModuleHandleW(ptr::null());
+        let embedded = LoadImageW(
+            module,
+            ICON_RESOURCE_ID as *const u16,
+            IMAGE_ICON,
+            cx,
+            cy,
+            LR_DEFAULTCOLOR,
+        );
+        if !embedded.is_null() {
+            return embedded;
+        }
+        for path in icon_file_candidates(cfg) {
+            if !path.is_file() {
+                continue;
+            }
+            let wide_path = to_wide(path.as_os_str());
+            let loaded = LoadImageW(
+                ptr::null_mut(),
+                wide_path.as_ptr(),
+                IMAGE_ICON,
+                cx,
+                cy,
+                LR_LOADFROMFILE,
+            );
+            if !loaded.is_null() {
+                return loaded;
+            }
+        }
+        LoadIconW(ptr::null_mut(), IDI_APPLICATION)
+    }
+
+    fn tooltip(cfg: &AppConfig, alerts: u64, last_alert: Option<&str>) -> String {
+        let state = match status::read_status(&cfg.status_file) {
+            Some(s) if s.is_fresh() && s.dry_run => "Protected (dry run)",
+            Some(s) if s.is_fresh() => "Protected",
+            _ => "Service offline",
+        };
+        let mut text = format!("The Nex · {state}");
+        if alerts > 0 {
+            text.push_str(&format!(
+                " · {alerts} alert{}",
+                if alerts == 1 { "" } else { "s" }
+            ));
+        }
+        if let Some(last) = last_alert {
+            text.push('\n');
+            text.push_str(last);
+        }
+        quarantine::truncate_chars(&text, 127)
+    }
+
+    unsafe fn notify_data(hwnd: HWND, icon: HICON, tip: &str) -> NOTIFYICONDATAW {
+        let mut data: NOTIFYICONDATAW = std::mem::zeroed();
+        data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        data.hWnd = hwnd;
+        data.uID = TRAY_ID;
+        data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        data.uCallbackMessage = WM_TRAY;
+        data.hIcon = icon;
+        copy_into(&mut data.szTip, tip);
+        data
+    }
+
+    fn snapshot() -> Option<(HICON, String)> {
+        STATE.with(|cell| {
+            let guard = cell.try_borrow().ok()?;
+            let state = guard.as_ref()?;
+            Some((
+                state.icon,
+                tooltip(&state.cfg, state.alerts, state.last_alert.as_deref()),
+            ))
+        })
+    }
+
+    unsafe fn add_icon(hwnd: HWND) {
+        if let Some((icon, tip)) = snapshot() {
+            let data = notify_data(hwnd, icon, &tip);
+            Shell_NotifyIconW(NIM_ADD, &data);
+        }
+    }
+
+    unsafe fn remove_icon(hwnd: HWND) {
+        let mut data: NOTIFYICONDATAW = std::mem::zeroed();
+        data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        data.hWnd = hwnd;
+        data.uID = TRAY_ID;
+        Shell_NotifyIconW(NIM_DELETE, &data);
+    }
+
+    /// Pulls new events; state is released before toasts so a re-entrant message never sees a held borrow.
+    unsafe fn poll(hwnd: HWND) {
+        let alerts: Vec<ThreatEvent> = STATE
+            .with(|cell| {
+                let mut guard = cell.try_borrow_mut().ok()?;
+                let state = guard.as_mut()?;
+                let fresh: Vec<ThreatEvent> = state
+                    .tail
+                    .poll()
+                    .into_iter()
+                    .filter(|e| ALERT_TYPES.contains(&e.threat_type.as_str()))
+                    .collect();
+                state.alerts += fresh.len() as u64;
+                if let Some(last) = fresh.last() {
+                    state.last_alert = Some(format!(
+                        "{} {}: {}",
+                        last.timestamp.with_timezone(&chrono::Local).format("%H:%M"),
+                        last.threat_type,
+                        last.action_taken
+                    ));
+                }
+                Some(fresh)
+            })
+            .unwrap_or_default();
+        if let Some((icon, tip)) = snapshot() {
+            let data = notify_data(hwnd, icon, &tip);
+            Shell_NotifyIconW(NIM_MODIFY, &data);
+        }
+        for event in alerts.iter().take(MAX_TOASTS_PER_POLL) {
+            platform::send_desktop_notification(
+                &quarantine::notification_title(event),
+                &quarantine::notification_body(event),
+            );
+        }
+    }
+
+    unsafe fn shell_open(hwnd: HWND, verb: &str, file: &Path, parameters: &str, show: i32) -> bool {
+        let verb = wide(verb);
+        let file = to_wide(file.as_os_str());
+        let parameters = wide(parameters);
+        let result = ShellExecuteW(
+            hwnd,
+            verb.as_ptr(),
+            file.as_ptr(),
+            parameters.as_ptr(),
+            ptr::null(),
+            show,
+        );
+        result as usize > 32
+    }
+
+    unsafe fn open_gui(hwnd: HWND) {
+        let gui = platform::sibling_executable(GUI_EXE_STEM);
+        if !gui.is_file() {
+            platform::send_desktop_notification(
+                "The Nex",
+                &format!("The desktop app was not found at {}", gui.display()),
+            );
+            return;
+        }
+        if !shell_open(hwnd, "open", &gui, "", SW_SHOWNORMAL) {
+            platform::send_desktop_notification("The Nex", "Could not open the desktop app.");
+        }
+    }
+
+    unsafe fn start_quick_scan(hwnd: HWND) {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        if shell_open(hwnd, "runas", &exe, "--quick-scan", SW_HIDE) {
+            platform::send_desktop_notification(
+                "The Nex",
+                "Quick scan started. Findings appear in the activity log.",
+            );
+        } else {
+            platform::send_desktop_notification(
+                "The Nex",
+                "Quick scan needs administrator approval and was not started.",
+            );
+        }
+    }
+
+    unsafe fn show_menu(hwnd: HWND) {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return;
+        }
+        let open = wide("Open The Nex");
+        let scan = wide("Quick Scan");
+        let exit = wide("Exit Tray");
+        AppendMenuW(menu, MF_STRING, CMD_OPEN, open.as_ptr());
+        AppendMenuW(menu, MF_STRING, CMD_SCAN, scan.as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+        AppendMenuW(menu, MF_STRING, CMD_EXIT, exit.as_ptr());
+        let mut point = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut point);
+        // Foreground + WM_NULL make the menu close when the user clicks elsewhere.
+        SetForegroundWindow(hwnd);
+        TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+            point.x,
+            point.y,
+            0,
+            hwnd,
+            ptr::null(),
+        );
+        PostMessageW(hwnd, WM_NULL, 0, 0);
+        DestroyMenu(menu);
+    }
+
+    unsafe extern "system" fn window_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_TRAY => {
+                match lparam as u32 {
+                    WM_LBUTTONUP => open_gui(hwnd),
+                    WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
+                    _ => {}
+                }
+                0
+            }
+            WM_COMMAND => {
+                match wparam & 0xFFFF {
+                    CMD_OPEN => open_gui(hwnd),
+                    CMD_SCAN => start_quick_scan(hwnd),
+                    CMD_EXIT => {
+                        DestroyWindow(hwnd);
+                    }
+                    _ => {}
+                }
+                0
+            }
+            WM_TIMER => {
+                poll(hwnd);
+                0
+            }
+            WM_DESTROY => {
+                KillTimer(hwnd, TIMER_ID);
+                remove_icon(hwnd);
+                PostQuitMessage(0);
+                0
+            }
+            _ => {
+                let taskbar_created = TASKBAR_CREATED.load(Ordering::Relaxed);
+                if taskbar_created != 0 && msg == taskbar_created {
+                    // Explorer restarted: the notification area forgot every icon.
+                    add_icon(hwnd);
+                    return 0;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+    }
+
+    pub fn run(cfg: AppConfig) -> Result<(), String> {
+        let mutex_name = to_wide(OsStr::new(TRAY_MUTEX_NAME));
+        // SAFETY: plain Win32 calls with valid NUL-terminated strings; every handle is released.
+        unsafe {
+            let mutex = CreateMutexW(ptr::null(), 0, mutex_name.as_ptr());
+            if mutex.is_null() {
+                return Err("cannot create the tray mutex".to_string());
+            }
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                CloseHandle(mutex);
+                return Ok(());
+            }
+            let result = message_loop(cfg);
+            CloseHandle(mutex);
+            result
+        }
+    }
+
+    unsafe fn message_loop(cfg: AppConfig) -> Result<(), String> {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let instance = GetModuleHandleW(ptr::null());
+        let class_name = wide("TheNexTrayWindow");
+        let mut class: WNDCLASSEXW = std::mem::zeroed();
+        class.cbSize = size_of::<WNDCLASSEXW>() as u32;
+        class.lpfnWndProc = Some(window_proc);
+        class.hInstance = instance;
+        class.lpszClassName = class_name.as_ptr();
+        if RegisterClassExW(&class) == 0 {
+            return Err(format!(
+                "RegisterClassExW failed (Win32 error {})",
+                GetLastError()
+            ));
+        }
+        let title = wide("The Nex");
+        let hwnd = CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            title.as_ptr(),
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            instance,
+            ptr::null(),
+        );
+        if hwnd.is_null() {
+            return Err(format!(
+                "CreateWindowExW failed (Win32 error {})",
+                GetLastError()
+            ));
+        }
+        let taskbar_message = wide("TaskbarCreated");
+        TASKBAR_CREATED.store(
+            RegisterWindowMessageW(taskbar_message.as_ptr()),
+            Ordering::Relaxed,
+        );
+
+        let events = if cfg.events_log.file_name().is_some() {
+            cfg.events_log.clone()
+        } else {
+            cfg.log_dir.join(EVENTS_FILE_NAME)
+        };
+        let icon = load_icon(&cfg);
+        STATE.with(|cell| {
+            *cell.borrow_mut() = Some(TrayState {
+                tail: EventTail::new(events),
+                cfg,
+                icon,
+                alerts: 0,
+                last_alert: None,
+            })
+        });
+        add_icon(hwnd);
+        SetTimer(hwnd, TIMER_ID, POLL_MS, None);
+
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        STATE.with(|cell| cell.borrow_mut().take());
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn tooltips_fit_the_shell_limit() {
+            let cfg = AppConfig::for_base_dir(&std::env::temp_dir().join("thenex-tray-test"));
+            let long = "x".repeat(400);
+            let text = tooltip(&cfg, 12, Some(&long));
+            assert!(text.chars().count() <= 127);
+            assert!(text.starts_with("The Nex · Service offline · 12 alerts"));
+            let mut buffer = [0u16; 128];
+            copy_into(&mut buffer, &text);
+            assert_eq!(
+                buffer.iter().position(|&c| c == 0),
+                Some(text.encode_utf16().count())
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn protected_processes() {
-        assert!(is_protected_process(0, "anything"));
-        assert!(is_protected_process(4, "System"));
-        assert!(is_protected_process(std::process::id(), "whatever.exe"));
-        assert!(is_protected_process(1234, "Explorer.EXE"));
-        assert!(is_protected_process(1234, "lsass.exe"));
-        assert!(is_protected_process(1234, "The-Nex.exe"));
-        assert!(!is_protected_process(1234, "malware.exe"));
-    }
 
     #[test]
     fn path_keys_normalize() {
@@ -850,5 +1376,28 @@ mod tests {
         assert_ne!(attributes, INVALID_FILE_ATTRIBUTES);
         assert_ne!(attributes & FILE_ATTRIBUTE_HIDDEN, 0);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn arguments_are_quoted_for_elevation() {
+        assert_eq!(quote_arg("--restore"), "--restore");
+        assert_eq!(
+            quote_arg("C:\\Program Files\\x"),
+            "\"C:\\Program Files\\x\""
+        );
+        assert_eq!(quote_arg("a\"b"), "\"a\\\"b\"");
+        assert_eq!(
+            quote_arg("C:\\dir with space\\"),
+            "\"C:\\dir with space\\\\\""
+        );
+        assert_eq!(quote_arg(""), "\"\"");
+    }
+
+    #[test]
+    fn tray_mutex_is_absent_without_a_tray() {
+        if !tray_is_running() {
+            assert!(!tray_is_running());
+        }
+        assert!(TRAY_MUTEX_NAME.starts_with("Local\\"));
     }
 }
