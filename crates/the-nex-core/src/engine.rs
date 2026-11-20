@@ -108,16 +108,18 @@ fn is_engine_output(cfg: &AppConfig, path: &Path) -> bool {
     let events = cfg
         .events_log
         .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase());
-    events
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let own_files = [
+        events.as_str(),
+        crate::config::STATUS_FILE_NAME,
+        QUICK_SCAN_REPORT_FILE,
+        logger::LOG_FILE_NAME,
+    ];
+    let is_own = own_files
         .iter()
-        .map(String::as_str)
-        .chain([
-            crate::config::STATUS_FILE_NAME,
-            QUICK_SCAN_REPORT_FILE,
-            logger::LOG_FILE_NAME,
-        ])
-        .any(|own| name.starts_with(&own.to_lowercase()))
+        .any(|own| !own.is_empty() && name.starts_with(&own.to_lowercase()));
+    is_own
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
