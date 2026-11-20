@@ -67,11 +67,32 @@ jobs:
       # One test at a time: libtest prints each name before running it, so a crash
       # (not just a failed assertion) still shows which test caused it.
       - name: cargo test
+        id: test
         env:
           THENEX_MODEL_PATH: ${{ github.workspace }}\thenex_model.onnx
           RUST_TEST_THREADS: "1"
           RUST_BACKTRACE: "1"
         run: cargo test --workspace --locked --no-fail-fast
+
+      # A native crash (e.g. STATUS_ACCESS_VIOLATION) has no Rust backtrace, so rerun the
+      # core unit tests under cdb and print the faulting stack. Diagnostic only.
+      - name: Native crash stack (only after a test failure)
+        if: ${{ failure() && steps.test.outcome == 'failure' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          THENEX_MODEL_PATH: ${{ github.workspace }}\thenex_model.onnx
+        run: |
+          $cdb = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe"
+          if (-not (Test-Path $cdb)) { "cdb not found at $cdb"; exit 0 }
+          $exe = $null
+          foreach ($line in (cargo test -p the-nex-core --lib --no-run --locked --message-format=json)) {
+            $msg = $line | ConvertFrom-Json
+            if ($msg.reason -eq 'compiler-artifact' -and $msg.executable -and $msg.profile.test) { $exe = $msg.executable }
+          }
+          "core test binary: $exe"
+          # -g/-G skip the initial and final breaks, so the first break-in is the fault itself.
+          & $cdb -g -G -lines -c ".lastevent; .exr -1; r; kn 60; ~* kn 20; q" $exe --test-threads=1
 
       # The steps below still run when tests fail (the job stays failed) so one CI
       # run reports on the build and the live verifier too.

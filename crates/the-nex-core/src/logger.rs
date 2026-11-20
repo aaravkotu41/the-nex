@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-const LOG_FILE_NAME: &str = "thenex.log";
+pub(crate) const LOG_FILE_NAME: &str = "thenex.log";
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
 struct LoggerState {

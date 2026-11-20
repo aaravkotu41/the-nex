@@ -88,8 +88,36 @@ pub fn classify_file(path: &Path) -> FileKind {
 fn should_ignore(cfg: &AppConfig, path: &Path) -> bool {
     platform::path_is_within(path, &cfg.base_dir)
         || platform::path_is_within(path, &cfg.quarantine_dir)
-        || platform::path_is_within(path, &cfg.log_dir)
+        || is_engine_output(cfg, path)
         || zip_bomb::is_ignored_extension(path)
+}
+
+/// The files the engine itself writes next to the event log (including rotated and
+/// staging copies). Only these are skipped, not the whole folder: `--log-file` may
+/// point into a watched directory, which must stay protected.
+fn is_engine_output(cfg: &AppConfig, path: &Path) -> bool {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    let same_dir = platform::path_is_within(parent, &cfg.log_dir)
+        && platform::path_is_within(&cfg.log_dir, parent);
+    if !same_dir {
+        return false;
+    }
+    let name = name.to_string_lossy().to_lowercase();
+    let events = cfg
+        .events_log
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase());
+    events
+        .iter()
+        .map(String::as_str)
+        .chain([
+            crate::config::STATUS_FILE_NAME,
+            QUICK_SCAN_REPORT_FILE,
+            logger::LOG_FILE_NAME,
+        ])
+        .any(|own| name.starts_with(&own.to_lowercase()))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -591,6 +619,31 @@ mod tests {
             &cfg,
             Path::new(r"C:\Users\x\Downloads\a.exe")
         ));
+    }
+
+    /// `--log-file` inside a watched folder must not blind the scanner to that folder.
+    #[test]
+    fn log_file_beside_watched_files_only_skips_engine_output() {
+        let root = std::env::temp_dir().join("thenex-engine-logbeside");
+        let watch = root.join("watch");
+        let cfg = AppConfig::for_base_dir(&root.join("base")).with_overrides(
+            Some(root.join("quarantine").as_path()),
+            Some(root.join("events.jsonl").as_path()),
+        );
+        for own in [
+            "events.jsonl",
+            "events.jsonl.1",
+            "status.json",
+            "status.json.tmp",
+            "last_quick_scan.json",
+            "thenex.log",
+            "thenex.log.1",
+        ] {
+            assert!(should_ignore(&cfg, &root.join(own)), "{own}");
+        }
+        assert!(!should_ignore(&cfg, &root.join("invoice.zip")));
+        assert!(!should_ignore(&cfg, &watch.join("ratio_bomb.zip")));
+        assert!(!should_ignore(&cfg, &watch.join("events.jsonl")));
     }
 
     #[test]

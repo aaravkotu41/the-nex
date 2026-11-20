@@ -25,6 +25,15 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED};
+use windows_sys::Win32::Security::WinTrust::{
+    WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
+    WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOCATION_CHECK_NONE,
+    WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+};
+use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesW, SetFileAttributesW};
+use windows_sys::Win32::System::Console::{
+    FreeConsole, GetConsoleProcessList, SetConsoleCtrlHandler,
+};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenMutexW, WaitForSingleObject, INFINITE, SYNCHRONIZATION_SYNCHRONIZE,
 };
@@ -56,14 +65,6 @@ const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: i32 = 1063;
 const ERROR_SERVICE_EXISTS: i32 = 1073;
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
-const WTD_UI_NONE: u32 = 2;
-const WTD_REVOKE_NONE: u32 = 0;
-const WTD_CHOICE_FILE: u32 = 1;
-const WTD_STATEACTION_VERIFY: u32 = 1;
-const WTD_STATEACTION_CLOSE: u32 = 2;
-const WTD_REVOCATION_CHECK_NONE: u32 = 0x0000_0010;
-const WTD_CACHE_ONLY_URL_RETRIEVAL: u32 = 0x0000_1000;
-
 const SID_SYSTEM: &str = "*S-1-5-18";
 const SID_ADMINISTRATORS: &str = "*S-1-5-32-544";
 const SID_USERS: &str = "*S-1-5-32-545";
@@ -90,67 +91,6 @@ const USER_WRITABLE_FRAGMENTS: &[&str] = &[
     r"\registration\crmlog\",
     r"\catroot2\",
 ];
-
-// FFI structs below are read by wintrust.dll, never by Rust.
-#[allow(dead_code)]
-#[repr(C)]
-struct Guid {
-    data1: u32,
-    data2: u16,
-    data3: u16,
-    data4: [u8; 8],
-}
-
-const WINTRUST_ACTION_GENERIC_VERIFY_V2: Guid = Guid {
-    data1: 0x00AA_C56B,
-    data2: 0xCD44,
-    data3: 0x11D0,
-    data4: [0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE],
-};
-
-#[allow(dead_code)]
-#[repr(C)]
-struct WinTrustFileInfo {
-    cb_struct: u32,
-    file_path: *const u16,
-    file_handle: *mut c_void,
-    known_subject: *const Guid,
-}
-
-#[allow(dead_code)]
-#[repr(C)]
-struct WinTrustData {
-    cb_struct: u32,
-    policy_callback_data: *mut c_void,
-    sip_client_data: *mut c_void,
-    ui_choice: u32,
-    revocation_checks: u32,
-    union_choice: u32,
-    file: *mut WinTrustFileInfo,
-    state_action: u32,
-    state_data: *mut c_void,
-    url_reference: *const u16,
-    prov_flags: u32,
-    ui_context: u32,
-    signature_settings: *mut c_void,
-}
-
-#[link(name = "kernel32", kind = "raw-dylib")]
-extern "system" {
-    fn GetFileAttributesW(file_name: *const u16) -> u32;
-    fn SetFileAttributesW(file_name: *const u16, attributes: u32) -> i32;
-    fn SetConsoleCtrlHandler(
-        handler: Option<unsafe extern "system" fn(u32) -> i32>,
-        add: i32,
-    ) -> i32;
-    fn GetConsoleProcessList(process_list: *mut u32, count: u32) -> u32;
-    fn FreeConsole() -> i32;
-}
-
-#[link(name = "wintrust", kind = "raw-dylib")]
-extern "system" {
-    fn WinVerifyTrust(hwnd: *mut c_void, action_id: *mut Guid, data: *mut c_void) -> i32;
-}
 
 fn to_wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
@@ -410,35 +350,38 @@ fn is_in_trusted_root(path: &Path) -> bool {
 
 fn has_valid_authenticode(path: &Path) -> bool {
     let wide = to_wide(path.as_os_str());
-    let mut file_info = WinTrustFileInfo {
-        cb_struct: size_of::<WinTrustFileInfo>() as u32,
-        file_path: wide.as_ptr(),
-        file_handle: ptr::null_mut(),
-        known_subject: ptr::null(),
+    let mut file_info = WINTRUST_FILE_INFO {
+        cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: wide.as_ptr(),
+        hFile: ptr::null_mut(),
+        pgKnownSubject: ptr::null_mut(),
     };
-    let mut data = WinTrustData {
-        cb_struct: size_of::<WinTrustData>() as u32,
-        policy_callback_data: ptr::null_mut(),
-        sip_client_data: ptr::null_mut(),
-        ui_choice: WTD_UI_NONE,
-        revocation_checks: WTD_REVOKE_NONE,
-        union_choice: WTD_CHOICE_FILE,
-        file: &mut file_info,
-        state_action: WTD_STATEACTION_VERIFY,
-        state_data: ptr::null_mut(),
-        url_reference: ptr::null(),
-        prov_flags: WTD_REVOCATION_CHECK_NONE | WTD_CACHE_ONLY_URL_RETRIEVAL,
-        ui_context: 0,
-        signature_settings: ptr::null_mut(),
+    let mut data = WINTRUST_DATA {
+        cbStruct: size_of::<WINTRUST_DATA>() as u32,
+        pPolicyCallbackData: ptr::null_mut(),
+        pSIPClientData: ptr::null_mut(),
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 {
+            pFile: &mut file_info,
+        },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        hWVTStateData: ptr::null_mut(),
+        pwszURLReference: ptr::null_mut(),
+        dwProvFlags: WTD_REVOCATION_CHECK_NONE | WTD_CACHE_ONLY_URL_RETRIEVAL,
+        dwUIContext: 0,
+        pSignatureSettings: ptr::null_mut(),
     };
     let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    // INVALID_HANDLE_VALUE as the window: never show UI.
     let no_ui = usize::MAX as *mut c_void;
     // SAFETY: all pointers reference live, correctly laid out structures for the call;
     // the CLOSE call releases the state allocated by VERIFY.
     unsafe {
-        let status = WinVerifyTrust(no_ui, &mut action, (&mut data as *mut WinTrustData).cast());
-        data.state_action = WTD_STATEACTION_CLOSE;
-        WinVerifyTrust(no_ui, &mut action, (&mut data as *mut WinTrustData).cast());
+        let status = WinVerifyTrust(no_ui, &mut action, (&mut data as *mut WINTRUST_DATA).cast());
+        data.dwStateAction = WTD_STATEACTION_CLOSE;
+        WinVerifyTrust(no_ui, &mut action, (&mut data as *mut WINTRUST_DATA).cast());
         status == 0
     }
 }
