@@ -562,7 +562,9 @@ mod tests {
 
     #[test]
     fn canary_names_are_recognized() {
-        assert!(is_canary_path(Path::new(r"C:\x\.thenex_canary_01.docx")));
+        assert!(is_canary_path(
+            &Path::new("x").join(".thenex_canary_01.docx")
+        ));
         assert!(is_canary_path(Path::new(".THENEX_CANARY_02.xlsx.locked")));
         assert!(!is_canary_path(Path::new("report.docx")));
     }
