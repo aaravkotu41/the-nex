@@ -6,7 +6,7 @@ use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use the_nex_core::bin_ai::{self, BinaryAiScanner, FeatureVector};
+use the_nex_core::bin_ai::{self, BinaryAiScanner};
 use the_nex_core::config::{
     AppConfig, Engine, LiveToggles, RuntimeToggles, ZipLimits, AI_MALWARE_THRESHOLD,
 };
@@ -266,19 +266,20 @@ fn shannon_entropy_is_accurate() {
 
 #[test]
 fn feature_vectors_are_bounded() {
-    for features in [
-        bin_ai::feature_vector(0, 0.0, 0, 0, 9),
-        bin_ai::feature_vector(u64::MAX, 8.0, 10_000, 9, 9),
-        bin_ai::feature_vector(1, f64::MAX, 1, 100, 9),
-        bin_ai::feature_vector(64 * 1024, 4.0, 4, 3, 7),
-    ] {
+    for (profile, _) in bin_ai::prototypes::all() {
+        let features = profile.features();
         assert!(bin_ai::features_in_range(&features), "{features:?}");
     }
     let exe = std::env::current_exe().unwrap();
-    let native = bin_ai::extract_features(&fs::read(&exe).unwrap())
+    let profile = bin_ai::extract_profile(&fs::read(&exe).unwrap())
         .expect("the test executable is a PE (Windows) or Mach-O (macOS) image");
+    let native = profile.features();
+    assert_eq!(native.len(), bin_ai::FEATURE_COUNT);
     assert!(bin_ai::features_in_range(&native), "{native:?}");
-    assert!(native[1] > 0.0 && native[2] > 0.0, "{native:?}");
+    assert!(
+        native[1] > 0.0 && native[2] > 0.0 && native[6] > 0.0,
+        "{profile:?}"
+    );
 }
 
 /// THENEX_MODEL_PATH makes the model mandatory (CI); otherwise the workspace-root model is used if present.
@@ -293,8 +294,9 @@ fn model_path() -> Option<PathBuf> {
     local.is_file().then_some(local)
 }
 
+/// The prototypes are the same programs scripts/train_onnx.py checks before exporting.
 #[test]
-fn tract_loads_model_and_separates_reference_vectors() {
+fn tract_loads_model_and_separates_prototypes() {
     let Some(path) = model_path() else {
         eprintln!(
             "thenex_model.onnx not found; run `python scripts/train_onnx.py` to include this test"
@@ -309,16 +311,18 @@ fn tract_loads_model_and_separates_reference_vectors() {
     );
     assert_eq!(scanner.engine_name(), "onnx");
 
-    let malicious: FeatureVector = [1.0, 0.98, 0.1, 0.9];
-    let benign: FeatureVector = [3.5, 0.55, 0.3, 0.0];
-    let m = scanner.score_features(&malicious);
-    let b = scanner.score_features(&benign);
-    assert!((0.0..=1.0).contains(&m) && (0.0..=1.0).contains(&b));
-    assert!(m > AI_MALWARE_THRESHOLD, "malicious scored {m}");
-    assert!(b < AI_MALWARE_THRESHOLD, "benign scored {b}");
-    let inference_ran = [malicious, benign]
-        .iter()
-        .any(|f| (scanner.score_features(f) - bin_ai::heuristic_score(f)).abs() > 1e-4);
+    let mut inference_ran = false;
+    for (profile, malicious) in bin_ai::prototypes::all() {
+        let features = profile.features();
+        let score = scanner.score_features(&features);
+        assert!((0.0..=1.0).contains(&score), "{score}");
+        assert_eq!(
+            score >= AI_MALWARE_THRESHOLD,
+            malicious,
+            "{profile:?} scored {score}"
+        );
+        inference_ran |= (score - bin_ai::heuristic_score(&features)).abs() > 1e-4;
+    }
     assert!(
         inference_ran,
         "scores equal the heuristic; ONNX inference fell back"
@@ -345,7 +349,8 @@ fn corrupt_and_non_binary_files_fail_gracefully() {
     assert_eq!(scanner.scan_file(&dir.path().join("missing.exe")), None);
     let missing_model = BinaryAiScanner::load(&dir.path().join("missing.onnx"));
     assert!(!missing_model.has_model());
-    let features: FeatureVector = [1.0, 0.98, 0.1, 0.9];
+    assert_eq!(missing_model.engine_name(), "heuristic");
+    let features = bin_ai::prototypes::packed_injector().features();
     assert_eq!(
         missing_model.score_features(&features),
         bin_ai::heuristic_score(&features)

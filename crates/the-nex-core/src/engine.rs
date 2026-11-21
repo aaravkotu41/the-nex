@@ -160,11 +160,11 @@ fn inspect_file(
         FileKind::Binary if cfg.engine_enabled(Engine::BinAi) => {
             telemetry.add_files_scanned(1);
             bin_ai::scan_and_respond(path, cfg, scanner)
-                .filter(|score| *score >= cfg.ai_threshold)
-                .map(|score| QuickScanFinding {
+                .and_then(|outcome| outcome.detection)
+                .map(|detail| QuickScanFinding {
                     path: path.to_path_buf(),
                     threat_type: "MALWARE_AI".to_string(),
-                    detail: format!("score={score:.3}"),
+                    detail,
                 })
         }
         _ => None,

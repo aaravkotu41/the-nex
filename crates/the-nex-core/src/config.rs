@@ -38,7 +38,9 @@ Modes:
   --tray                    show the system tray icon (Windows)
   --quick-scan              scan Downloads and Desktop (or --watch-dir) once and exit
   --rearm-canaries          verify and recreate canary files, then exit
-  --restore <ID>            restore a quarantined file by its quarantine ID
+  --scan-file <PATH>        explain the binary AI verdict for PATH (a file, a folder or
+                            @list.txt); prints JSON lines and never changes anything
+  --restore <ID>          restore a quarantined file by its quarantine ID
   --delete <ID>             permanently delete a quarantined file by its quarantine ID
   --set <ENGINE>=<on|off>   toggle zip_bomb, bin_ai, process_guard, canary or dry_run
   --help                    show this help
@@ -109,6 +111,7 @@ pub enum Mode {
     Tray,
     QuickScan,
     RearmCanaries,
+    ScanFile(PathBuf),
     Restore(String),
     Delete(String),
     Set(Engine, bool),
@@ -159,6 +162,10 @@ where
             "--help" | "-h" | "/?" => Some(Mode::Help),
             "--restore" => Some(Mode::Restore(take_value(&mut iter, "--restore")?)),
             "--delete" => Some(Mode::Delete(take_value(&mut iter, "--delete")?)),
+            "--scan-file" => Some(Mode::ScanFile(PathBuf::from(take_value(
+                &mut iter,
+                "--scan-file",
+            )?))),
             "--set" => {
                 let value = take_value(&mut iter, "--set")?;
                 let (name, state) = value.split_once('=').ok_or("--set expects ENGINE=on|off")?;
@@ -617,6 +624,12 @@ mod tests {
             args(&["--quick-scan", "--dry-run"]).unwrap().mode,
             Mode::QuickScan
         );
+        assert_eq!(
+            args(&["--scan-file", "setup.exe"]).unwrap().mode,
+            Mode::ScanFile(PathBuf::from("setup.exe"))
+        );
+        assert!(args(&["--scan-file"]).is_err());
+        assert!(args(&["--scan-file", "a.exe", "--dry-run"]).is_err());
     }
 
     #[test]

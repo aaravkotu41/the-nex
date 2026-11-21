@@ -118,6 +118,15 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Get-Item target\TheNexSetup.exe | Format-List Name, Length
 
+      # Rust and the Python code that built the training data must compute identical features
+      # on real files, the model must stay quiet on this runner's own system programs, and our
+      # binaries and installer must score clean.
+      - name: Binary AI parity and false-positive check
+        if: ${{ !cancelled() && steps.release.outcome == 'success' }}
+        run: |
+          python -m pip install --disable-pip-version-check pefile
+          python scripts/check_feature_parity.py --binary target\release\the-nex.exe --extra target\release\the-nex.exe --extra target\release\the-nex-gui.exe --extra target\TheNexSetup.exe
+
       # Installs for real on the runner (silent), checks the service is up, then uninstalls.
       - name: Installer smoke test (install, verify, uninstall)
         if: ${{ !cancelled() && steps.installer.outcome == 'success' }}
@@ -235,6 +244,14 @@ jobs:
       - name: Live end-to-end verification
         if: ${{ !cancelled() && steps.dmg.outcome == 'success' }}
         run: python scripts/verify_thenex.py --skip-build
+
+      # The Mach-O side is trained on synthetic profiles only, so this run on real macOS
+      # programs is its reality check (no pefile parity on macOS: there are no PE files here).
+      - name: Binary AI false-positive check
+        if: ${{ !cancelled() && steps.dmg.outcome == 'success' }}
+        run: |
+          BIN=target/macos/TheNex.app/Contents/MacOS
+          python scripts/check_feature_parity.py --binary "$BIN/the-nex" --extra "$BIN/the-nex" --extra "$BIN/the-nex-gui" --max-fpr 0.05
 
       - uses: actions/upload-artifact@v7
         if: always()

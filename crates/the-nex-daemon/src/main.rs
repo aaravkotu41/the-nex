@@ -1,3 +1,5 @@
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -29,6 +31,7 @@ fn main() -> ExitCode {
         Mode::Set(engine, enabled) => set_toggle(*engine, *enabled, &args),
         Mode::QuickScan => quick_scan(&args),
         Mode::RearmCanaries => rearm_canaries(&args),
+        Mode::ScanFile(target) => scan_file(target, &args),
         Mode::Notifier => {
             platform::detach_console();
             logger::init_without_file(false);
@@ -167,6 +170,84 @@ fn quick_scan(args: &CliArgs) -> ExitCode {
     println!(
         "{}",
         serde_json::to_string_pretty(&result).unwrap_or_default()
+    );
+    ExitCode::SUCCESS
+}
+
+/// `--scan-file`: a file, every file directly inside a folder, or `@list` (one path per line).
+fn scan_targets(target: &Path) -> Result<Vec<PathBuf>, String> {
+    let text = target.to_string_lossy();
+    if let Some(list) = text.strip_prefix('@') {
+        let content = fs::read_to_string(list).map_err(|e| format!("{list}: {e}"))?;
+        return Ok(content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect());
+    }
+    if target.is_dir() {
+        let entries = fs::read_dir(target).map_err(|e| format!("{}: {e}", target.display()))?;
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.is_file())
+            .collect();
+        files.sort();
+        return Ok(files);
+    }
+    if target.is_file() {
+        Ok(vec![target.to_path_buf()])
+    } else {
+        Err(format!("{} does not exist", target.display()))
+    }
+}
+
+/// Read-only: scores each binary with the AI engine and prints one JSON object per line with
+/// the verdict, the reasons behind it and the raw features. Nothing is quarantined or logged.
+fn scan_file(target: &Path, args: &CliArgs) -> ExitCode {
+    logger::init_without_file(true);
+    let cfg = AppConfig::from_cli(args);
+    let paths = match scan_targets(target) {
+        Ok(paths) => paths,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let scanner = BinaryAiScanner::load(&cfg.model_path).with_max_scan_bytes(cfg.max_ai_scan_bytes);
+    let mut flagged = 0usize;
+    for path in &paths {
+        let line = match scanner.assess(path) {
+            Some(assessment) => {
+                let malicious = assessment.score >= cfg.ai_threshold;
+                flagged += usize::from(malicious);
+                let verdict = if malicious { "malicious" } else { "clean" };
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "verdict": verdict,
+                    "score": assessment.score,
+                    "threshold": cfg.ai_threshold,
+                    "engine": assessment.engine,
+                    "heuristic": assessment.heuristic,
+                    "trusted": platform::is_trusted_binary(path),
+                    "reasons": assessment.reasons,
+                    "features": assessment.features,
+                    "profile": assessment.profile,
+                })
+            }
+            None => serde_json::json!({
+                "path": path.display().to_string(),
+                "verdict": "not_scored",
+                "error": "not a readable PE or Mach-O executable within the size limit",
+            }),
+        };
+        println!("{line}");
+    }
+    eprintln!(
+        "{} file(s) checked, {flagged} at or above the {:.2} threshold (engine: {})",
+        paths.len(),
+        cfg.ai_threshold,
+        scanner.engine_name()
     );
     ExitCode::SUCCESS
 }

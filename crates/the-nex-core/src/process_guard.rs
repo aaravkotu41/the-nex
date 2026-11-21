@@ -286,10 +286,9 @@ impl ProcessGuard {
             return;
         }
         let details = format!(
-            "pid={} name={name} score={score:.3} threshold={:.2} engine={}",
+            "pid={} name={name} {}",
             pid.as_u32(),
-            self.cfg.ai_threshold,
-            self.scanner.engine_name()
+            self.scanner.explain(exe, score, self.cfg.ai_threshold)
         );
         let action = if self.cfg.is_dry_run() {
             "DRY_RUN: would terminate process and quarantine executable".to_string()

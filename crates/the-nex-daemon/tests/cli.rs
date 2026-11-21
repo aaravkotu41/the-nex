@@ -213,6 +213,43 @@ fn set_writes_settings_json() {
 }
 
 #[test]
+fn scan_file_explains_verdicts_and_changes_nothing() {
+    let sandbox = Sandbox::new("scanfile");
+    let own = PathBuf::from(env!("CARGO_BIN_EXE_the-nex"));
+    let notes = sandbox.path().join("notes.txt");
+    fs::write(&notes, b"plain text").unwrap();
+    let list = sandbox.path().join("list.txt");
+    fs::write(&list, format!("{}\n\n{}\n", own.display(), notes.display())).unwrap();
+
+    let output = sandbox.run(&["--scan-file", &format!("@{}", list.display())]);
+    assert!(output.status.success(), "{}", describe(&output));
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2, "{}", describe(&output));
+
+    let exe = &lines[0];
+    assert_eq!(exe["verdict"], "clean", "The Nex flags itself: {exe}");
+    assert_eq!(exe["features"].as_array().unwrap().len(), 14);
+    assert!(
+        exe["profile"]["import_count"].as_u64().unwrap() > 0,
+        "{exe}"
+    );
+    assert!(exe["reasons"].is_array());
+    let notes_line = &lines[1];
+    assert_eq!(notes_line["verdict"], "not_scored", "{notes_line}");
+    assert!(notes.exists() && own.exists());
+    assert!(
+        !sandbox.events().exists(),
+        "--scan-file must not log threat events"
+    );
+
+    let missing = sandbox.run(&["--scan-file", "definitely-missing.exe"]);
+    assert_eq!(missing.status.code(), Some(1));
+}
+
+#[test]
 fn quick_scan_finds_bombs_without_touching_them_in_dry_run() {
     let sandbox = Sandbox::new("scan");
     let watch = sandbox.path().join("watch");
