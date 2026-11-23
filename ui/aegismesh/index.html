@@ -147,17 +147,18 @@
           <div class="vision-status" id="vision-status"><span class="dot"></span><span id="vision-text">On-device vision not loaded yet</span></div>
           <p class="tip" id="sign-tip" role="status" hidden></p>
           <ul class="sign-list" id="sign-list"></ul>
+          <div class="verdict" id="sign-test" aria-live="polite"></div>
           <div class="teach">
-            <h3>Teach your own sign or expression</h3>
+            <h3>Add your own emergency sign or expression</h3>
             <div class="row wrap">
               <input id="teach-name" type="text" maxlength="40" placeholder="Name, e.g. Two fingers" autocomplete="off">
               <select id="teach-kind" aria-label="Kind">
                 <option value="hand">Hand sign</option>
                 <option value="face">Facial expression</option>
               </select>
-              <button class="btn" id="teach-start" disabled>Teach (3 s + 3 s)</button>
+              <button class="btn primary" id="teach-start">Teach it</button>
             </div>
-            <p class="hint">Hold the sign for 3 seconds, then keep your hand or face in view but relaxed for 3 seconds, so it also learns what not to react to. Only landmark numbers are kept, never pictures.</p>
+            <p class="hint">After a 3-second countdown, hold your sign still for 3 seconds; then let go and stay relaxed, still in view, for 3 seconds so it learns what not to react to. It is tested straight away, and every sign has a Test button. Tests never send an SOS. Only landmark numbers are kept, never pictures.</p>
           </div>
           <ul class="sign-log" id="sign-log"></ul>
         </div>

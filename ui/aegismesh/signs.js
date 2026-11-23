@@ -174,8 +174,23 @@
     if (kind !== "hand" && kind !== "face") throw new Error("kind must be hand or face");
     if (!samples || samples.length < MIN_FRAMES) throw new Error(`hold the sign a little longer (${MIN_FRAMES}+ frames needed)`);
     if (!neutral || neutral.length < MIN_FRAMES) throw new Error(`record your normal ${kind === "hand" ? "hand" : "face"} for a little longer (${MIN_FRAMES}+ frames needed)`);
-    const pos = thin(samples, 40);
+    let pos = thin(samples, 40);
     const neg = thin(neutral, 40);
+    // A held sign is a dense cluster; frames caught while moving into or out of it form a thin
+    // trail. Leaving them in would widen the sign to cover in-between poses, so drop them: a
+    // frame whose 6th-nearest fellow example is over 3x the usual distance is on such a trail
+    // (held frames, even of a sign taught two ways, stay near 2x).
+    if (pos.length >= 16) {
+      const reach = pos.map((v, i) => {
+        const ds = [];
+        for (let j = 0; j < pos.length; j++) if (j !== i) ds.push(euclid(v, pos[j]));
+        ds.sort((a, b) => a - b);
+        return ds[Math.min(5, ds.length - 1)];
+      });
+      const typical = median(reach);
+      const kept = pos.filter((v, i) => reach[i] <= typical * 3);
+      if (kept.length >= pos.length * 0.75) pos = kept;
+    }
     const spread = median(pos.map((v, i) => knn(v, pos, 2, i)));
     const radius = Math.max(spread * 3.0, kind === "face" ? 0.12 : 0.08);
     const separation = median(neg.map((v) => knn(v, pos, 3))) / radius;
@@ -184,16 +199,39 @@
     return { name: String(name).trim().slice(0, 40), kind, pos, neg, radius, separation, quality };
   }
 
+  /**
+   * Teaches more examples of an existing sign (another angle, distance or light) or its
+   * ordinary pose; old and new examples are learned together.
+   */
+  function improveSign(model, { samples = [], neutral = [] }) {
+    return trainSign({
+      name: model.name,
+      kind: model.kind,
+      samples: [...thin(model.pos, 30), ...samples],
+      neutral: [...thin(model.neg, 30), ...neutral],
+    });
+  }
+
+  /**
+   * How one frame compares with a trained sign: score < 1 is inside the sign's radius, and
+   * `match` also requires it to be clearly nearer the sign than the person's ordinary pose.
+   */
+  function signDistance(m, vector) {
+    if (!vector || !m.pos.length || vector.length !== m.pos[0].length) return null;
+    const dPos = knn(vector, m.pos, 3);
+    const dNeg = knn(vector, m.neg, 3);
+    const score = dPos / m.radius;
+    return { kind: m.kind, score, match: score < 1 && dPos < dNeg * 0.8 };
+  }
+
   /** Best matching trained sign for one frame's feature vector, or null. */
   function matchSign(models, vector, kind) {
     let best = null;
     for (const m of models) {
-      if (m.kind !== kind || !vector || vector.length !== m.pos[0].length) continue;
-      const dPos = knn(vector, m.pos, 3);
-      const dNeg = knn(vector, m.neg, 3);
-      const score = dPos / m.radius;
-      if (score < 1 && dPos < dNeg * 0.8 && (!best || score < best.score)) {
-        best = { name: m.name, kind, score, confidence: Math.max(0, Math.min(1, 1 - score)) };
+      if (m.kind !== kind) continue;
+      const d = signDistance(m, vector);
+      if (d && d.match && (!best || d.score < best.score)) {
+        best = { name: m.name, kind, score: d.score, confidence: Math.max(0, Math.min(1, 1 - d.score)) };
       }
     }
     return best;
@@ -295,25 +333,36 @@
     update(frame) {
       const t = frame.t;
       const events = [];
-      const status = { handState: null, faceState: null, custom: null, progress: {} };
+      // scores: for every taught sign, how close this frame came (its best hand or the face).
+      const status = { handState: null, faceState: null, custom: null, scores: {}, progress: {} };
+      const note = (vector, kind) => {
+        for (const m of this.customs) {
+          if (m.kind !== kind) continue;
+          const d = signDistance(m, vector);
+          if (d && (!status.scores[m.name] || d.score < status.scores[m.name].score)) status.scores[m.name] = d;
+        }
+      };
       let handLabel = "none";
-      let best = null;
       for (const hand of frame.hands || []) {
         const p = normalizeHand(hand.landmarks, hand.handedness, frame.aspect);
         const state = handState(p);
         if (handLabel === "none" || state === "open_thumb_tucked" || state === "folded") handLabel = state;
-        const m = matchSign(this.customs, handFeatures(p), "hand");
-        if (m && (!best || m.score < best.score)) best = m;
+        note(handFeatures(p), "hand");
       }
       status.handState = handLabel;
       const scores = faceScores(frame.face);
       let faceLabel = "none";
       if (scores) {
         faceLabel = faceState(scores);
-        const m = matchSign(this.customs, faceFeatures(scores), "face");
-        if (m && (!best || m.score < best.score)) best = m;
+        note(faceFeatures(scores), "face");
       }
       status.faceState = faceLabel;
+      let best = null;
+      for (const [name, d] of Object.entries(status.scores)) {
+        if (d.match && (!best || d.score < best.score)) {
+          best = { name, kind: d.kind, score: d.score, confidence: Math.max(0, Math.min(1, 1 - d.score)) };
+        }
+      }
       status.custom = best;
 
       const cooling = t < this.cooldownUntil;
@@ -343,6 +392,79 @@
     }
   }
 
+  /**
+   * A rehearsal of one sign: feed it each frame's SignWatcher output for up to `timeoutMs`. It
+   * reports whether the sign was recognised and how fast, or else the most likely reason.
+   * target: "signal_for_help", "double_wink" or "custom:<name>"; kind: "hand" or "face".
+   */
+  function makeSignTest(target, kind, { timeoutMs = 10000 } = {}) {
+    const custom = target.startsWith("custom:") ? target.slice(7) : null;
+    const n = { frames: 0, seen: 0, match: 0, nearNeutral: 0, unlike: 0 };
+    let start = null;
+    let best = 0;
+    let other = null;
+    let result = null;
+
+    function advice() {
+      const what = kind === "face" ? "face" : "hand";
+      const lead = other ? `It recognised "${other}" instead. ` : "";
+      if (n.seen < n.frames * 0.3) return `${lead}The camera hardly saw your ${what}: face it from about an arm's length away, in good light.`;
+      if (custom) {
+        if (n.match > 0) return `${lead}It matched only in moments: hold the sign still for a full second.`;
+        if (n.nearNeutral >= n.unlike) return `${lead}It looked too much like your ordinary ${what}: teach a more distinctive sign.`;
+        return `${lead}It never looked like the sign you taught: make it the way you taught it, or press "add examples" to teach it from here.`;
+      }
+      if (target === "signal_for_help") {
+        return lead + (best < 0.5
+          ? "The open palm with the thumb tucked in was not seen: palm flat to the camera, fingers up, thumb folded across the palm."
+          : "The tucked thumb was seen but not the fold: then fold all four fingers down over the thumb within 2 seconds.");
+      }
+      if (target === "double_wink") {
+        return lead + (best < 0.5
+          ? "No clear wink was seen: close one eye fully while the other stays open."
+          : "One wink was seen: wink the other eye within a second and a half.");
+      }
+      return `${lead}It was not recognised.`;
+    }
+
+    return {
+      target,
+      get result() { return result; },
+      /** seen: whether a hand (for a hand sign) or a face (for an expression) was in this frame. */
+      update(t, events, status, seen) {
+        if (result) return result;
+        if (start === null) start = t;
+        const elapsed = t - start;
+        n.frames++;
+        if (seen) n.seen++;
+        if (events.some((e) => e.sign === target)) {
+          result = { passed: true, ms: elapsed, best: 1 };
+          return result;
+        }
+        const otherEvent = events.find((e) => e.sign !== target);
+        if (otherEvent) other = otherEvent.name;
+        let progress = 0;
+        if (custom) {
+          const d = status.scores && status.scores[custom];
+          if (d) {
+            if (d.match) n.match++;
+            else if (d.score < 1) n.nearNeutral++;
+            else n.unlike++;
+          }
+          if (status.custom && status.custom.name === custom) progress = status.progress.custom || 0;
+        } else {
+          progress = status.progress[target] || 0;
+        }
+        best = Math.max(best, progress);
+        if (elapsed >= timeoutMs) {
+          result = { passed: false, ms: elapsed, best, advice: advice() };
+          return result;
+        }
+        return { passed: null, ms: elapsed, left: timeoutMs - elapsed, progress, best };
+      },
+    };
+  }
+
   return {
     FACE_KEYS,
     BUILTINS,
@@ -355,9 +477,12 @@
     faceFeatures,
     faceState,
     trainSign,
+    improveSign,
+    signDistance,
     matchSign,
     makeSequence,
     makeHoldVoter,
     SignWatcher,
+    makeSignTest,
   };
 });

@@ -88,7 +88,10 @@ function view(pts, cam, r) {
 }
 const lerp = (a, b, u) => a.map((v, i) => v + (b[i] - v) * u);
 
-/** Plays a script of [durationMs, flexFrom, flexTo, thumb] segments through a SignWatcher. */
+/**
+ * Plays a script of [durationMs, flexFrom, flexTo, thumb] segments through a SignWatcher.
+ * thumb "away" means no hand in the picture. opts.test: a makeSignTest fed every frame.
+ */
 function play(watcher, script, r, opts = {}) {
   const cam = camera(r);
   const fps = opts.fps || uni(r, 24, 30);
@@ -101,10 +104,10 @@ function play(watcher, script, r, opts = {}) {
       if (r() < 0.02) continue; // dropped frame
       const flex = lerp(from, to, frames === 1 ? 1 : i / (frames - 1)).map((f) => Math.min(1, Math.max(0, f + gauss(r) * 0.03)));
       const sway = opts.wave ? Math.sin(t / 180) * 0.5 : 0;
-      const pts = pose(flex, thumb);
-      const v = view(pts, { ...cam, rot: cam.rot + sway }, r);
-      const out = watcher.update({ t, aspect: cam.aspect, hands: [v], face: null });
+      const hands = thumb === "away" ? [] : [view(pose(flex, thumb), { ...cam, rot: cam.rot + sway }, r)];
+      const out = watcher.update({ t, aspect: cam.aspect, hands, face: null });
       events.push(...out.events);
+      if (opts.test && opts.test.update(t, out.events, out.status, hands.length > 0).passed !== null) return events;
     }
   }
   return events;
@@ -198,6 +201,63 @@ console.log("custom hand sign");
   check("too few frames is refused", threw);
   const same = S.trainSign({ name: "Same", kind: "hand", samples: frames(OPEN, "out", 30), neutral: frames(OPEN, "out", 30) });
   check("a sign identical to the normal pose is flagged poor", same.quality === "poor", `separation ${same.separation.toFixed(2)}`);
+
+  const rateOf = (m, vectors) => vectors.filter((v) => S.matchSign([m], v, "hand")).length / vectors.length;
+  // Frames caught while the hand moves into the sign must not widen it to in-between poses.
+  const moving = [];
+  for (let k = 0; k < 8; k++) moving.push(...frames(lerp(OPEN, PEACE, (k + 1) / 9), "out", 1));
+  const withMoves = S.trainSign({ name: "Peace", kind: "hand", samples: [...moving.slice(0, 4), ...frames(PEACE, "tucked", 40), ...moving.slice(4)], neutral });
+  const between = rateOf(withMoves, frames(lerp(OPEN, PEACE, 0.5), "out", 300));
+  check("frames of moving into the sign are left out", between <= 0.05 && withMoves.quality !== "poor", `in-between pose matched ${(between * 100).toFixed(1)}%, quality ${withMoves.quality}`);
+  check("...and the sign is still recognised", rateOf(withMoves, frames(PEACE, "tucked", 300)) >= 0.9, `${(rateOf(withMoves, frames(PEACE, "tucked", 300)) * 100).toFixed(1)}%`);
+
+  // Add examples: teach the same sign made a little differently (thumb out instead of tucked);
+  // both ways count afterwards, and the stored model stays bounded.
+  const before = rateOf(model, frames(PEACE, "out", 300));
+  const improved = S.improveSign(model, { samples: frames(PEACE, "out", 40), neutral: frames([0.25, 0.3, 0.3, 0.35], "out", 20) });
+  const after = rateOf(improved, frames(PEACE, "out", 300));
+  check("add examples: the new way is recognised", after >= 0.9, `${(before * 100).toFixed(1)}% before, ${(after * 100).toFixed(1)}% after`);
+  check("add examples: the original way still is", rateOf(improved, frames(PEACE, "tucked", 300)) >= 0.9, `${(rateOf(improved, frames(PEACE, "tucked", 300)) * 100).toFixed(1)}%`);
+  const openFp = rateOf(improved, frames(OPEN, "out", 300));
+  check("add examples: other poses still not mistaken", openFp <= 0.05 && rateOf(improved, frames(FIST, "wrapped", 300)) <= 0.05, `open ${(openFp * 100).toFixed(1)}%`);
+  check("add examples: model stays bounded, same name and kind", improved.pos.length <= 40 && improved.neg.length <= 40 && improved.name === "Peace" && improved.kind === "hand", `${improved.pos.length}+${improved.neg.length} vectors`);
+
+  console.log("testing a taught sign (rehearsal)");
+  const rehearse = (script, target = "custom:Peace", extra = {}) => {
+    const test = S.makeSignTest(target, "hand", { timeoutMs: 10000 });
+    play(new S.SignWatcher({ enabled: [], customs: [model], ...extra }), script, r, { test });
+    return test.result;
+  };
+  const pass = rehearse([[800, OPEN, OPEN, "out"], [1600, PEACE, PEACE, "tucked"], [8000, OPEN, OPEN, "out"]]);
+  check("test passes when the sign is made", pass && pass.passed && pass.ms < 3000, pass ? `${pass.passed} after ${Math.round(pass.ms)} ms` : "no result");
+  const ordinary = rehearse([[11000, [0.25, 0.3, 0.3, 0.35], [0.25, 0.3, 0.3, 0.35], "out"]]);
+  check("test fails, explained, when the sign is never made", ordinary && ordinary.passed === false && /never looked like/.test(ordinary.advice), ordinary && ordinary.advice);
+  const away = rehearse([[11000, OPEN, OPEN, "away"]]);
+  check("test explains when no hand is in view", away && away.passed === false && /hardly saw your hand/.test(away.advice), away && away.advice);
+  const flick = rehearse([[600, OPEN, OPEN, "out"], ...Array.from({ length: 12 }, () => [[300, PEACE, PEACE, "tucked"], [450, OPEN, OPEN, "out"]]).flat(), [2000, OPEN, OPEN, "out"]]);
+  check("test explains a sign that is not held long enough", flick && flick.passed === false && /full second/.test(flick.advice), flick && flick.advice);
+  const both = rehearse([[600, OPEN, OPEN, "out"], [450, OPEN, OPEN, "tucked"], [300, OPEN, FIST, "tucked"], [600, FIST, FIST, "tucked"], [9000, OPEN, OPEN, "out"]], "custom:Peace", { enabled: ["signal_for_help"] });
+  check("test names the sign it saw instead", both && both.passed === false && /Signal for Help/.test(both.advice), both && both.advice);
+}
+
+console.log("testing Signal for Help (rehearsal)");
+{
+  const r = rng(5);
+  const rehearse = (script) => {
+    const test = S.makeSignTest("signal_for_help", "hand", { timeoutMs: 10000 });
+    play(new S.SignWatcher({ enabled: ["signal_for_help"] }), script, r, { test });
+    return test.result;
+  };
+  let passed = 0;
+  for (let i = 0; i < 50; i++) {
+    const res = rehearse([[uni(r, 500, 3000), OPEN, OPEN, "out"], [500, OPEN, OPEN, "tucked"], [250, OPEN, FIST, "tucked"], [600, FIST, FIST, "tucked"], [7000, OPEN, OPEN, "out"]]);
+    passed += res && res.passed ? 1 : 0;
+  }
+  check("test passes when the Signal for Help is made", passed >= 48, `${passed}/50`);
+  const noFold = rehearse([[11000, OPEN, OPEN, "tucked"]]);
+  check("test explains a missing fold", noFold && noFold.passed === false && /not the fold/.test(noFold.advice), noFold && noFold.advice);
+  const noTuck = rehearse([[11000, OPEN, OPEN, "out"]]);
+  check("test explains a missing thumb tuck", noTuck && noTuck.passed === false && /thumb tucked in was not seen/.test(noTuck.advice), noTuck && noTuck.advice);
 }
 
 console.log("face");

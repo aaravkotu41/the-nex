@@ -374,7 +374,18 @@ td.num, th.num { text-align: right; font-family: var(--mono); }
   border-radius: 8px;
   background: var(--bg);
 }
-.sign-list li.off { opacity: 0.55; }
+.sign-list li.off .sign-toggle { opacity: 0.55; }
+.sign-list li.testing { border-color: var(--info); box-shadow: 0 0 0 1px var(--info) inset; }
+.sign-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 4px 12px; flex-wrap: wrap; }
+.sign-actions .tested { margin-right: auto; }
+.sign-links { display: flex; flex-wrap: wrap; gap: 2px 12px; margin-top: 4px; }
+.sign-links .link { padding: 0; }
+.tested { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+.tested.good { color: var(--accent); }
+.tested.bad { color: var(--danger); }
+.meter.hot span { background: var(--info); }
+.verdict .box.testing { border-color: #284a7a; }
+.verdict .testing .title { color: var(--info); }
 .sign-list .meter { grid-column: 1 / -1; margin-top: 0; }
 .sign-toggle { display: flex; align-items: flex-start; gap: 9px; cursor: pointer; }
 .sign-toggle input { margin-top: 3px; }
