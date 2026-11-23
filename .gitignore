@@ -3,3 +3,5 @@
 /thenex_live_sandbox/
 __pycache__/
 *.pyc
+# On-device vision runtime, fetched and verified by scripts/fetch_vision_models.py
+/ui/aegismesh/vendor/

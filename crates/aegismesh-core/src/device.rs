@@ -213,6 +213,16 @@ impl Wearable {
         verdict
     }
 
+    /// A trigger recognised on the user's own camera (an emergency sign or expression): takes
+    /// one fix and queues the same silent SOS as the tap rhythm. False if one is already queued.
+    pub fn trigger_sos(&mut self, gnss: &SimulatedGnss, now_unix_ms: i64) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        self.pending = Some(DispatchBuffers::new(gnss.fix(now_unix_ms)));
+        true
+    }
+
     pub fn sos_pending(&self) -> bool {
         self.pending.is_some()
     }

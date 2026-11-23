@@ -332,6 +332,9 @@ pub struct MeshConfig {
     /// The responder comes into range late, so relays must store frames before forwarding.
     pub late_link: bool,
     pub seconds: u64,
+    /// Set (to the sign's name) when a camera sign or expression triggers the SOS instead of
+    /// the tap rhythm.
+    pub camera_sign: Option<String>,
 }
 
 impl Default for MeshConfig {
@@ -343,6 +346,7 @@ impl Default for MeshConfig {
             redundant_links: true,
             late_link: true,
             seconds: 6,
+            camera_sign: None,
         }
     }
 }
@@ -387,8 +391,23 @@ fn equally_spaced(times: &[u64]) -> bool {
     gaps.windows(2).all(|w| w[0] == w[1])
 }
 
-/// Wearable taps the rhythm while frames flow; every frame is relayed hop by hop to the
-/// simulated responder.
+/// A sign recognised by the camera watch queues the same silent SOS as the tap rhythm.
+fn camera_trigger(wearable: &mut Wearable, gnss: &SimulatedGnss, sign: &str) -> TapVerdict {
+    let queued = wearable.trigger_sos(gnss, now_unix_ms());
+    let sign: String = sign.trim().chars().take(40).collect();
+    TapVerdict {
+        accepted: queued,
+        reason: format!("camera sign \"{sign}\" recognised on this device"),
+        taps_seen: 0,
+        groups: 0,
+        deviation: None,
+        confidence: if queued { 1.0 } else { 0.0 },
+        window_ms: None,
+    }
+}
+
+/// The wearable is triggered (tap rhythm or camera sign) while frames flow; every frame is
+/// relayed hop by hop to the simulated responder.
 pub fn mesh_scenario(cfg: &MeshConfig) -> MeshOutcome {
     let relays = cfg.relays.clamp(1, 12);
     let ttl = cfg.ttl.clamp(1, 16);
@@ -417,7 +436,10 @@ pub fn mesh_scenario(cfg: &MeshConfig) -> MeshOutcome {
     let mut now = 0u64;
     while now <= seconds * 1000 {
         if now == 1500 {
-            tap = Some(wearable.on_taps(&perform(&profile, 0.0), &gnss, now_unix_ms()));
+            tap = Some(match &cfg.camera_sign {
+                Some(sign) => camera_trigger(&mut wearable, &gnss, sign),
+                None => wearable.on_taps(&perform(&profile, 0.0), &gnss, now_unix_ms()),
+            });
         }
         let pending = wearable.sos_pending();
         if let Some(frame) = wearable.tick(now) {
@@ -448,7 +470,7 @@ pub fn mesh_scenario(cfg: &MeshConfig) -> MeshOutcome {
     let phone = wearable.phone_effects().clone();
 
     let mut checks = vec![
-        check("rhythm recognised", tap.accepted, tap.reason.clone()),
+        check("trigger recognised", tap.accepted, tap.reason.clone()),
         check(
             "SOS reached the responder exactly once",
             stats.delivered_sos == 1,

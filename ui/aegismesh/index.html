@@ -3,6 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Camera analysis stays on this device: the page may only talk to itself and the app. -->
+  <meta http-equiv="Content-Security-Policy" content="connect-src 'self' ipc: http://ipc.localhost blob: data:">
   <title>AegisMesh Console</title>
   <link rel="stylesheet" href="console.css">
 </head>
@@ -105,6 +107,45 @@
       </div>
     </section>
 
+    <section class="card wide" id="card-signs">
+      <div class="card-head">
+        <h2>Emergency signs</h2>
+        <span class="muted">Look at a camera and make a hand sign or a facial expression to send the silent SOS.</span>
+      </div>
+      <div class="signs-row">
+        <div class="viewport" id="sign-viewport">
+          <video id="sign-video" playsinline muted></video>
+          <canvas id="sign-overlay" class="overlay"></canvas>
+          <div class="cam-empty" id="sign-empty">Camera off</div>
+          <div class="hud" id="sign-hud" hidden></div>
+        </div>
+        <div class="signs-side">
+          <div class="row wrap">
+            <button class="btn primary" id="sign-start">Start watching</button>
+            <button class="btn ghost" id="sign-stop" disabled>Stop</button>
+            <label class="inline" title="Nothing on screen changes when a sign is recognised; only the log below records it.">
+              <input type="checkbox" id="sign-discreet" checked> Discreet
+            </label>
+          </div>
+          <div class="vision-status" id="vision-status"><span class="dot"></span><span id="vision-text">On-device vision not loaded yet</span></div>
+          <ul class="sign-list" id="sign-list"></ul>
+          <div class="teach">
+            <h3>Teach your own sign or expression</h3>
+            <div class="row wrap">
+              <input id="teach-name" type="text" maxlength="40" placeholder="Name, e.g. Two fingers" autocomplete="off">
+              <select id="teach-kind" aria-label="Kind">
+                <option value="hand">Hand sign</option>
+                <option value="face">Facial expression</option>
+              </select>
+              <button class="btn" id="teach-start" disabled>Teach (3 s + 3 s)</button>
+            </div>
+            <p class="hint">Hold the sign for 3 seconds, then keep your hand or face in view but relaxed for 3 seconds, so it also learns what not to react to. Only landmark numbers are kept, never pictures.</p>
+          </div>
+          <ul class="sign-log" id="sign-log"></ul>
+        </div>
+      </div>
+    </section>
+
     <section class="card" id="card-bench">
       <div class="card-head">
         <h2>Recogniser benchmark</h2>
@@ -149,6 +190,7 @@
     </section>
   </main>
 
+  <script src="signs.js"></script>
   <script src="console.js"></script>
 </body>
 </html>

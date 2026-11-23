@@ -359,6 +359,32 @@ fn end_to_end_mesh_scenario_is_silent_and_complete() {
 }
 
 #[test]
+fn camera_sign_triggers_the_same_silent_pipeline() {
+    let outcome = scenario::mesh_scenario(&MeshConfig {
+        camera_sign: Some("Signal for Help".to_string()),
+        late_link: false,
+        ..MeshConfig::default()
+    });
+    assert!(outcome.pass, "{:#?}", outcome.checks);
+    assert_eq!(outcome.stats.delivered_sos, 1);
+    assert!(
+        outcome.tap.reason.contains("Signal for Help"),
+        "{}",
+        outcome.tap.reason
+    );
+    assert!(outcome.phone.is_silent());
+    assert_eq!(outcome.retained_location_bytes, 0);
+
+    let mut wearable = Wearable::new(FormFactor::Ring, &[4u8; KEY_LEN], 0);
+    assert!(wearable.trigger_sos(&SimulatedGnss::default(), 0));
+    assert!(
+        !wearable.trigger_sos(&SimulatedGnss::default(), 0),
+        "one SOS at a time"
+    );
+    assert!(wearable.tick(0).is_some() && !wearable.sos_pending());
+}
+
+#[test]
 fn envelopes_carry_no_origin_or_destination() {
     let (_, a) = sos_frame(&[9u8; KEY_LEN]);
     let (_, b) = sos_frame(&[9u8; KEY_LEN]);
@@ -506,6 +532,12 @@ fn console_api_round_trips() {
     let mesh =
         console::handle("simulate_mesh", &json!({ "relays": 3, "form": "bracelet" })).unwrap();
     assert_eq!(mesh["pass"], true, "{mesh}");
+    let signed = console::handle(
+        "simulate_mesh",
+        &json!({ "camera_sign": "Wink, then the other eye", "late_link": false }),
+    )
+    .unwrap();
+    assert_eq!(signed["pass"], true, "{signed}");
     let bench = console::handle("robustness", &json!({ "trials": 200 })).unwrap();
     assert!(bench["detection_rate"].as_f64().unwrap() > 0.98, "{bench}");
     let preview = console::handle("frame_preview", &json!({ "form": "clothing_tag" })).unwrap();

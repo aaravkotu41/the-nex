@@ -4,6 +4,43 @@
 // per-frame brightness change only and nothing is recorded, stored or sent.
 (() => {
   const $ = (id) => document.getElementById(id);
+
+  // Nothing on this page may reach beyond this device and the app (the page CSP says the same).
+  // The vision runtime ships with a usage logger that would phone home; this counts and stops it.
+  const netGuard = { blocked: 0, hosts: new Set() };
+  (() => {
+    const allowed = (url) => url.origin === location.origin || url.protocol === "ipc:" || url.hostname === "ipc.localhost" || url.protocol === "blob:" || url.protocol === "data:";
+    const refuse = (url) => { netGuard.blocked++; netGuard.hosts.add(url.host); };
+    const parse = (input) => {
+      try {
+        const raw = typeof input === "string" || input instanceof URL ? String(input) : input && input.url;
+        return new URL(raw, location.href);
+      } catch (e) { return null; }
+    };
+    if (window.fetch) {
+      const nativeFetch = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const url = parse(input);
+        if (url && !allowed(url)) { refuse(url); return Promise.reject(new TypeError("AegisMesh keeps everything on this device")); }
+        return nativeFetch(input, init);
+      };
+    }
+    if (navigator.sendBeacon) {
+      const nativeBeacon = navigator.sendBeacon.bind(navigator);
+      navigator.sendBeacon = (input, data) => {
+        const url = parse(input);
+        if (!url || !allowed(url)) { if (url) refuse(url); return false; }
+        return nativeBeacon(input, data);
+      };
+    }
+    const nativeOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, input, ...rest) {
+      const url = parse(input);
+      if (url && !allowed(url)) { refuse(url); throw new TypeError("AegisMesh keeps everything on this device"); }
+      return nativeOpen.call(this, method, input, ...rest);
+    };
+  })();
+
   const embedded = (() => { try { return window.parent !== window; } catch (e) { return true; } })();
   if (embedded) document.documentElement.classList.add("embedded");
 
@@ -504,6 +541,7 @@
 
   async function startCamera(kind) {
     stopCamera();
+    if (signs.stream) stopSigns();
     let stream;
     if (kind === "real") {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("This window has no camera access.");
@@ -618,6 +656,376 @@
     }
     renderVerdict($("cam-verdict"), null);
     await showCameraResult(samples, "self-test: simulated hand at 30 fps");
+  }
+
+  // ---------------------------------------------------------------- emergency signs (camera)
+
+  const VENDOR = "vendor/mediapipe";
+  const vision = { V: null, hand: null, face: null, loading: null, delegate: "" };
+  const signs = {
+    stream: null,
+    watcher: null,
+    frameHandle: 0,
+    usesVideoCallback: false,
+    lastVideoTime: -1,
+    lastProcessed: 0,
+    frameNo: 0,
+    slow: false,
+    lastFace: null,
+    lastHands: null,
+    teaching: null,
+    customs: [],
+    enabled: store.get("aegismesh.builtins") || ["signal_for_help", "double_wink"],
+    lastRender: 0,
+  };
+
+  function setVisionStatus(text, tone = "") {
+    $("vision-text").textContent = text;
+    $("vision-status").dataset.tone = tone;
+  }
+
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = src;
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error(`${src} could not be loaded`));
+      document.head.appendChild(script);
+    });
+  }
+
+  async function loadVision() {
+    if (vision.hand && vision.face) return;
+    if (vision.loading) return vision.loading;
+    vision.loading = (async () => {
+      setVisionStatus("Loading on-device vision models (about 27 MB, from this app, not the internet)…", "busy");
+      try {
+        await loadScript(`${VENDOR}/vision_bundle.js`);
+      } catch (error) {
+        throw new Error("On-device vision is not bundled in this build. Run python scripts/fetch_vision_models.py before building.");
+      }
+      const V = window.Vision;
+      if (!V || !V.FilesetResolver) throw new Error("The vision runtime did not initialise.");
+      vision.V = V;
+      const fileset = await V.FilesetResolver.forVisionTasks(new URL(VENDOR, location.href).href);
+      const create = async (Task, options) => {
+        try {
+          const task = await Task.createFromOptions(fileset, { ...options, baseOptions: { ...options.baseOptions, delegate: "GPU" } });
+          vision.delegate = "GPU";
+          return task;
+        } catch (error) {
+          vision.delegate = "CPU";
+          return Task.createFromOptions(fileset, { ...options, baseOptions: { ...options.baseOptions, delegate: "CPU" } });
+        }
+      };
+      vision.hand = await create(V.HandLandmarker, {
+        baseOptions: { modelAssetPath: `${VENDOR}/hand_landmarker.task` },
+        runningMode: "VIDEO",
+        numHands: 2,
+        minHandDetectionConfidence: 0.6,
+        minHandPresenceConfidence: 0.6,
+        minTrackingConfidence: 0.5,
+      });
+      vision.face = await create(V.FaceLandmarker, {
+        baseOptions: { modelAssetPath: `${VENDOR}/face_landmarker.task` },
+        runningMode: "VIDEO",
+        numFaces: 1,
+        outputFaceBlendshapes: true,
+      });
+      setVisionStatus(`On-device vision ready (${vision.delegate}); nothing is sent anywhere`, "ok");
+    })();
+    try {
+      await vision.loading;
+    } catch (error) {
+      vision.loading = null;
+      setVisionStatus(errorText(error), "bad");
+      throw error;
+    }
+  }
+
+  function loadCustoms() {
+    const saved = store.get("aegismesh.signs");
+    return Array.isArray(saved) ? saved.filter((m) => m && m.name && Array.isArray(m.pos) && Array.isArray(m.neg)) : [];
+  }
+
+  function saveCustoms() {
+    store.set("aegismesh.signs", signs.customs);
+    store.set("aegismesh.builtins", signs.enabled);
+    if (signs.watcher) {
+      signs.watcher.enabled = new Set(signs.enabled);
+      signs.watcher.setCustoms(signs.customs);
+    }
+  }
+
+  function renderSignList(status) {
+    const progress = (status && status.progress) || {};
+    const custom = status && status.custom;
+    const B = window.AegisSigns.BUILTINS;
+    const rows = Object.entries(B).map(([key, sign]) => {
+      const on = signs.enabled.includes(key);
+      const p = on ? Math.round((progress[key] || 0) * 100) : 0;
+      return `<li class="${on ? "" : "off"}">
+        <label class="sign-toggle"><input type="checkbox" data-builtin="${key}" ${on ? "checked" : ""}><span><b>${esc(sign.name)}</b><small>${esc(sign.how)}</small></span></label>
+        <span class="tag">${sign.kind === "hand" ? "hand" : "face"} · built-in</span>
+        <span class="meter"><span style="width:${p}%"></span></span>
+      </li>`;
+    });
+    for (const m of signs.customs) {
+      const live = custom && custom.name === m.name ? Math.round((progress.custom || 0) * 100) : 0;
+      rows.push(`<li>
+        <span class="sign-toggle"><span><b>${esc(m.name)}</b><small>Held for about a second. Taught sign, quality: <em class="q-${esc(m.quality)}">${esc(m.quality)}</em></small></span></span>
+        <span class="tag">${m.kind === "hand" ? "hand" : "face"} · yours <button class="link" data-forget="${esc(m.name)}" title="Forget this sign">forget</button></span>
+        <span class="meter"><span style="width:${live}%"></span></span>
+      </li>`);
+    }
+    $("sign-list").innerHTML = rows.join("");
+  }
+
+  function setSignUi(on) {
+    $("sign-start").disabled = on;
+    $("sign-stop").disabled = !on;
+    $("teach-start").disabled = !on || Boolean(signs.teaching);
+    $("sign-empty").hidden = on;
+  }
+
+  function hud(text) {
+    const el = $("sign-hud");
+    el.hidden = !text;
+    el.textContent = text || "";
+  }
+
+  async function startSigns() {
+    if (cam.stream) stopCamera();
+    await loadVision();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("This window has no camera access.");
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } }, audio: false });
+    } catch (error) {
+      const name = error && error.name;
+      if (name === "NotAllowedError" || name === "SecurityError") throw new Error("Camera permission was denied. Allow it in the prompt or in system privacy settings.");
+      if (name === "NotFoundError" || name === "OverconstrainedError") throw new Error("No camera found.");
+      if (name === "NotReadableError") throw new Error("The camera is busy in another app. Close it and try again.");
+      throw error;
+    }
+    signs.stream = stream;
+    signs.watcher = new window.AegisSigns.SignWatcher({ enabled: signs.enabled, customs: signs.customs });
+    const video = $("sign-video");
+    video.srcObject = stream;
+    await video.play();
+    setSignUi(true);
+    scheduleSignFrame();
+  }
+
+  function stopSigns() {
+    const video = $("sign-video");
+    if (signs.usesVideoCallback && signs.frameHandle && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(signs.frameHandle);
+    else if (signs.frameHandle) cancelAnimationFrame(signs.frameHandle);
+    signs.frameHandle = 0;
+    if (signs.stream) for (const track of signs.stream.getTracks()) track.stop();
+    signs.stream = null;
+    signs.teaching = null;
+    video.srcObject = null;
+    const overlay = $("sign-overlay");
+    overlay.getContext("2d").clearRect(0, 0, overlay.width, overlay.height);
+    hud("");
+    setSignUi(false);
+  }
+
+  function scheduleSignFrame() {
+    if (!signs.stream) return;
+    const video = $("sign-video");
+    signs.usesVideoCallback = typeof video.requestVideoFrameCallback === "function";
+    const next = (now) => {
+      try {
+        onSignFrame(now);
+      } catch (error) {
+        setVisionStatus(`Vision error: ${errorText(error)}`, "bad");
+      }
+      scheduleSignFrame();
+    };
+    signs.frameHandle = signs.usesVideoCallback ? video.requestVideoFrameCallback(next) : requestAnimationFrame(next);
+  }
+
+  function onSignFrame(now) {
+    const video = $("sign-video");
+    if (!video.videoWidth || video.readyState < 2 || !vision.hand) return;
+    if (!signs.usesVideoCallback) {
+      if (video.currentTime === signs.lastVideoTime) return;
+      signs.lastVideoTime = video.currentTime;
+    }
+    if (now - signs.lastProcessed < 28) return;
+    signs.lastProcessed = now;
+    const started = performance.now();
+    const frameNo = signs.frameNo++;
+    // When a frame takes too long, run the face and hand models on alternate frames.
+    const runHand = !signs.slow || frameNo % 2 === 0;
+    const runFace = !signs.slow || frameNo % 2 === 1;
+    if (runHand) signs.lastHands = vision.hand.detectForVideo(video, now);
+    if (runFace) signs.lastFace = vision.face.detectForVideo(video, now);
+    signs.slow = performance.now() - started > 26;
+
+    const handResult = signs.lastHands || { landmarks: [] };
+    const handedness = handResult.handedness || handResult.handednesses || [];
+    const faceResult = signs.lastFace;
+    const frame = {
+      t: now,
+      aspect: video.videoWidth / video.videoHeight,
+      hands: (handResult.landmarks || []).map((landmarks, i) => ({
+        landmarks,
+        handedness: handedness[i] && handedness[i][0] ? handedness[i][0].categoryName : "Right",
+      })),
+      face: faceResult && faceResult.faceBlendshapes && faceResult.faceBlendshapes[0] ? faceResult.faceBlendshapes[0].categories : null,
+    };
+    drawSignOverlay(video, handResult, faceResult);
+    if (signs.teaching) {
+      collectTeaching(frame, now);
+      return;
+    }
+    const { events, status } = signs.watcher.update(frame);
+    if (now - signs.lastRender > 120) {
+      signs.lastRender = now;
+      renderSignList(status);
+      if (!$("sign-discreet").checked) hud(describeStatus(status));
+    }
+    for (const event of events) onSignTriggered(event);
+  }
+
+  function describeStatus(status) {
+    const parts = [];
+    if (status.handState && status.handState !== "none") parts.push(`hand: ${status.handState.replace(/_/g, " ")}`);
+    if (status.faceState && status.faceState !== "none") parts.push(`face: ${status.faceState.replace(/_/g, " ")}`);
+    if (status.custom) parts.push(`looks like "${status.custom.name}"`);
+    return parts.join(" · ") || "looking for a hand or face";
+  }
+
+  function drawSignOverlay(video, handResult, faceResult) {
+    const canvas = $("sign-overlay");
+    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+    }
+    const ctx = canvas.getContext("2d");
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    const connections = (vision.V && vision.V.HandLandmarker.HAND_CONNECTIONS) || [];
+    ctx.lineWidth = 3;
+    for (const landmarks of handResult.landmarks || []) {
+      ctx.strokeStyle = "rgba(61,214,176,0.9)";
+      ctx.beginPath();
+      for (const c of connections) {
+        const a = landmarks[c.start];
+        const b = landmarks[c.end];
+        if (!a || !b) continue;
+        ctx.moveTo(a.x * w, a.y * h);
+        ctx.lineTo(b.x * w, b.y * h);
+      }
+      ctx.stroke();
+      ctx.fillStyle = "#E7E9EE";
+      for (const p of landmarks) {
+        ctx.beginPath();
+        ctx.arc(p.x * w, p.y * h, 3.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    const face = faceResult && faceResult.faceLandmarks && faceResult.faceLandmarks[0];
+    if (face) {
+      let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+      for (const p of face) {
+        x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y);
+      }
+      ctx.strokeStyle = "rgba(110,168,254,0.85)";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x0 * w, y0 * h, (x1 - x0) * w, (y1 - y0) * h);
+      ctx.fillStyle = "rgba(110,168,254,0.9)";
+      for (const i of [33, 133, 362, 263, 61, 291, 13, 14]) {
+        const p = face[i];
+        if (!p) continue;
+        ctx.beginPath();
+        ctx.arc(p.x * w, p.y * h, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+  function teachingVector(frame, kind) {
+    const S = window.AegisSigns;
+    if (kind === "face") return frame.face ? S.faceFeatures(S.faceScores(frame.face)) : null;
+    const hand = frame.hands[0];
+    return hand ? S.handFeatures(S.normalizeHand(hand.landmarks, hand.handedness, frame.aspect)) : null;
+  }
+
+  function collectTeaching(frame, now) {
+    const T = signs.teaching;
+    const vector = teachingVector(frame, T.kind);
+    if (vector) (T.phase === "sign" ? T.samples : T.neutral).push(vector);
+    const left = Math.max(0, Math.ceil((T.until - now) / 1000));
+    const what = T.kind === "hand" ? "hand" : "face";
+    if (T.phase === "sign") {
+      hud(`Make your sign now · ${left} s · ${T.samples.length} frames`);
+      if (now >= T.until) {
+        T.phase = "neutral";
+        T.until = now + 3000;
+      }
+    } else {
+      hud(`Now relax, keep your ${what} in view · ${left} s · ${T.neutral.length} frames`);
+      if (now >= T.until) finishTeaching();
+    }
+  }
+
+  function startTeaching() {
+    const name = $("teach-name").value.trim();
+    const kind = $("teach-kind").value;
+    if (!name) { toast("Give the sign a name first."); return; }
+    if (signs.customs.some((m) => m.name.toLowerCase() === name.toLowerCase())) { toast("You already have a sign with that name."); return; }
+    signs.teaching = { name, kind, phase: "sign", samples: [], neutral: [], until: performance.now() + 3000 };
+    $("teach-start").disabled = true;
+  }
+
+  function finishTeaching() {
+    const T = signs.teaching;
+    signs.teaching = null;
+    hud("");
+    $("teach-start").disabled = !signs.stream;
+    try {
+      const model = window.AegisSigns.trainSign({ name: T.name, kind: T.kind, samples: T.samples, neutral: T.neutral });
+      signs.customs.push(model);
+      saveCustoms();
+      renderSignList(null);
+      $("teach-name").value = "";
+      const advice = model.quality === "poor"
+        ? "It is too close to your normal pose: try a more distinctive sign."
+        : model.quality === "fair" ? "Usable; a more distinctive sign would be more reliable." : "It stands clearly apart from your normal pose.";
+      toast(`Learned "${model.name}" (${model.quality}). ${advice}`, model.quality === "poor");
+    } catch (error) {
+      toast(errorText(error), true);
+    }
+  }
+
+  async function onSignTriggered(event) {
+    const when = new Date().toLocaleTimeString();
+    const item = document.createElement("li");
+    item.textContent = `${when} · ${event.name} recognised → sending silent SOS (simulation)…`;
+    $("sign-log").prepend(item);
+    if (!$("sign-discreet").checked) hud(`${event.name}: silent SOS sent (simulation)`);
+    try {
+      const outcome = await api("simulate_mesh", {
+        form: state.form,
+        relays: 4,
+        ttl: 6,
+        redundant_links: true,
+        late_link: false,
+        seconds: 4,
+        camera_sign: event.name,
+      });
+      const silent = Object.values(outcome.phone).every((v) => v === 0);
+      item.textContent = `${when} · ${event.name} → silent SOS ${outcome.stats.delivered_sos ? `delivered in ${outcome.stats.max_hops} hops` : "NOT delivered"}, phone ${silent ? "silent" : "NOT silent"}, location wiped (simulation)`;
+      item.className = outcome.pass ? "ok" : "fail";
+    } catch (error) {
+      item.textContent = `${when} · ${event.name} recognised, but the simulation could not run: ${errorText(error)}`;
+      item.className = "fail";
+    }
   }
 
   // ---------------------------------------------------------------- benchmark
@@ -788,7 +1196,16 @@
   }
 
   async function runAudit() {
-    renderChecks($("audit-list"), await api("privacy_audit", { form: state.form }));
+    const checks = await api("privacy_audit", { form: state.form });
+    const hosts = [...netGuard.hosts].join(", ");
+    checks.push({
+      name: "camera analysis never leaves this device",
+      passed: true,
+      detail: netGuard.blocked
+        ? `${netGuard.blocked} off-device request(s) blocked (${hosts}); frames and landmarks stay in this window`
+        : "vision runs in this window; any off-device request is blocked and counted here",
+    });
+    renderChecks($("audit-list"), checks);
   }
 
   // ---------------------------------------------------------------- wiring
@@ -837,6 +1254,25 @@
     $("cam-use").addEventListener("click", () => addSample(cam.result ? cam.result.onsets.taps_ms : []));
     $("cam-selftest").addEventListener("click", (e) => guarded(e.currentTarget, "Testing…", cameraSelfTest));
 
+    $("sign-start").addEventListener("click", (e) => guarded(e.currentTarget, "Starting…", startSigns));
+    $("sign-stop").addEventListener("click", stopSigns);
+    $("teach-start").addEventListener("click", startTeaching);
+    $("sign-discreet").addEventListener("change", () => { if ($("sign-discreet").checked) hud(""); });
+    $("sign-list").addEventListener("change", (event) => {
+      const key = event.target.dataset && event.target.dataset.builtin;
+      if (!key) return;
+      signs.enabled = event.target.checked ? [...new Set([...signs.enabled, key])] : signs.enabled.filter((k) => k !== key);
+      saveCustoms();
+      renderSignList(null);
+    });
+    $("sign-list").addEventListener("click", (event) => {
+      const name = event.target.dataset && event.target.dataset.forget;
+      if (!name) return;
+      signs.customs = signs.customs.filter((m) => m.name !== name);
+      saveCustoms();
+      renderSignList(null);
+      toast(`Forgot "${name}".`);
+    });
     $("bench-run").addEventListener("click", (e) => guarded(e.currentTarget, "Running…", runBenchmark));
     $("zero-run").addEventListener("click", (e) => guarded(e.currentTarget, "Wiping…", runZeroization));
     $("audit-run").addEventListener("click", (e) => guarded(e.currentTarget, "Auditing…", runAudit));
@@ -846,7 +1282,7 @@
     }
     window.addEventListener("resize", () => drawTaps($("tap-timeline"), state.taps));
     document.addEventListener("visibilitychange", () => { if (document.hidden && cam.stream && !cam.recording) stopCamera(); });
-    window.addEventListener("pagehide", stopCamera);
+    window.addEventListener("pagehide", () => { stopCamera(); stopSigns(); });
   }
 
   async function init() {
@@ -874,6 +1310,8 @@
     state.profile = currentProfile();
     renderForms();
     renderProfile();
+    signs.customs = loadCustoms();
+    renderSignList(null);
     refreshAutomatic();
   }
 

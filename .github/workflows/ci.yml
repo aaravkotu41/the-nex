@@ -60,6 +60,13 @@ jobs:
           python scripts/train_onnx.py --out thenex_model.onnx
           python scripts/gen_test_zipbomb.py
 
+      # On-device hand/face models for AegisMesh's emergency signs: pinned, SHA-256 verified,
+      # embedded into the apps at build time.
+      - name: Fetch the vision runtime and test the sign recogniser
+        run: |
+          python scripts/fetch_vision_models.py
+          node scripts/test_signs.js
+
       - name: cargo check
         id: check
         run: cargo check --workspace --all-targets --locked
@@ -237,6 +244,11 @@ jobs:
           python -m pip install --disable-pip-version-check numpy onnx
           python scripts/train_onnx.py --out thenex_model.onnx
           python scripts/gen_test_zipbomb.py
+
+      - name: Fetch the vision runtime and test the sign recogniser
+        run: |
+          python scripts/fetch_vision_models.py
+          node scripts/test_signs.js
 
       - name: cargo check
         id: check

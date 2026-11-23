@@ -210,8 +210,10 @@ function renderDashboard(d) {
     $("protection-text").textContent = "Protected — Local Rust Engine";
   }
   $("stat-scanned").textContent = count(d.scanned);
+  $("stat-threats").textContent = count(d.threats_detected);
   $("stat-quarantined").textContent = count(d.quarantined);
   $("stat-cpu").textContent = online ? `${(d.daemon.cpu_percent || 0).toFixed(1)}%` : "—";
+  renderScore(d);
 
   const badge = $("quarantine-badge");
   badge.textContent = String(d.quarantined);
@@ -275,11 +277,93 @@ function renderDashboard(d) {
   ], true);
 }
 
+/** 0-100: service 30, engines 40, AI model 10, canaries 10, blocking (not dry run) 10. */
+function protectionScore(d) {
+  const t = d.toggles || {};
+  const enginesOn = ["zip_bomb_enabled", "bin_ai_enabled", "process_guard_enabled", "canary_enabled"].filter((k) => t[k]).length;
+  const canaries = (d.canaries || []).length;
+  const canariesOk = canaries > 0 && d.canaries_intact === canaries;
+  const items = [
+    { ok: d.daemon.online, text: d.daemon.online ? "Background service running" : "Background service offline" },
+    { ok: enginesOn === 4, text: `${enginesOn} of 4 engines on` },
+    { ok: Boolean(d.model_loaded), text: d.model_loaded ? "AI model loaded" : "AI on heuristic fallback" },
+    { ok: canariesOk, text: `${d.canaries_intact} of ${canaries} canaries intact` },
+    { ok: !d.dry_run, text: d.dry_run ? "Dry run: detecting only" : "Blocking threats" },
+  ];
+  const score = d.daemon.online
+    ? Math.round(30 + (40 * enginesOn) / 4 + (d.model_loaded ? 10 : 0) + (canariesOk ? 10 : 0) + (d.dry_run ? 0 : 10))
+    : 0;
+  return { score, items };
+}
+
+function setRing(score, tone) {
+  $("ring-value").style.strokeDasharray = `${score} 100`;
+  $("score-value").textContent = score === null ? "–" : String(score);
+  $("hero").dataset.tone = tone;
+}
+
+function renderScore(d) {
+  const { score, items } = protectionScore(d);
+  const allOk = items.every((item) => item.ok);
+  const tone = allOk ? "ok" : score >= 60 ? "warn" : "bad";
+  setRing(score, tone);
+  $("protection-detail").textContent = allOk
+    ? "Every engine is active. New downloads, archives and processes are checked as they appear."
+    : "Some protection is off or degraded; the items marked ! need attention.";
+  replaceIfChanged($("score-items"), JSON.stringify(items), () => items.map((item) => el("li", { className: item.ok ? "ok" : "no", text: item.text })));
+}
+
+const CHART_REFRESH_MS = 30000;
+
+async function loadChart(force) {
+  if (!force && state.chartAt && Date.now() - state.chartAt < CHART_REFRESH_MS) return;
+  state.chartAt = Date.now();
+  const events = await call("get_events", { limit: 1000, query: null, severity: "ALL" }).catch(() => []);
+  const days = [];
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  for (let i = 6; i >= 0; i--) {
+    const day = new Date(today);
+    day.setDate(day.getDate() - i);
+    days.push({ start: day.getTime(), label: day.toLocaleDateString(undefined, { weekday: "short" }), critical: 0, high: 0, other: 0 });
+  }
+  for (const event of events) {
+    const severity = String(event.severity || "").toLowerCase();
+    if (severity === "low") continue; // restores, deletions and scan summaries are not threats
+    const t = Date.parse(event.timestamp);
+    for (let i = days.length - 1; i >= 0; i--) {
+      if (t >= days[i].start) {
+        if (i === days.length - 1 || t < days[i + 1].start) days[i][severity === "critical" ? "critical" : severity === "high" ? "high" : "other"]++;
+        break;
+      }
+    }
+  }
+  const max = Math.max(1, ...days.map((d) => d.critical + d.high + d.other));
+  replaceIfChanged($("threat-chart"), JSON.stringify(days), () => days.map((d) => {
+    const total = d.critical + d.high + d.other;
+    const stack = el("div", { className: "bar-stack" });
+    for (const kind of ["critical", "high", "other"]) {
+      if (!d[kind]) continue;
+      const seg = el("div", { className: `seg ${kind}` });
+      seg.style.height = `${(d[kind] / max) * 100}%`;
+      stack.append(seg);
+    }
+    return el("div", { className: "bar-col", title: `${d.label}: ${total} threat${total === 1 ? "" : "s"}` }, [
+      el("b", { className: "mono", text: total ? String(total) : "" }),
+      stack,
+      el("span", { text: d.label }),
+    ]);
+  }));
+}
+
 function renderOffline(reason) {
   $("service-dot").className = "dot";
   $("service-text").textContent = "Daemon Offline";
   $("protection-dot").className = "dot bad";
   $("protection-text").textContent = reason;
+  setRing(0, "bad");
+  $("protection-detail").textContent = "Without the background service nothing is being checked.";
+  replaceIfChanged($("score-items"), "offline", () => [el("li", { className: "no", text: "Background service unavailable" })]);
   $("service-state").className = "pill status red";
   $("service-state").textContent = "Unavailable";
   renderToggles(null, false);
@@ -381,6 +465,7 @@ async function refresh(force) {
       if (!$(id).dataset.busy) $(id).disabled = false;
     }
     await loadEvents();
+    if (state.page === "overview") await loadChart(force);
     state.quarantine = await call("list_quarantine").catch((error) => {
       if (state.page === "quarantine") notice(errorText(error), true);
       return state.quarantine;

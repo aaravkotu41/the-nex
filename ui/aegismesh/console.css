@@ -309,3 +309,56 @@ td.num, th.num { text-align: right; font-family: var(--mono); }
 .checks .fail .mark { color: var(--danger); }
 .checks .name { font-size: 13px; }
 .checks .why { display: block; color: var(--muted); font-size: 11px; }
+
+/* Emergency signs */
+.signs-row { display: grid; grid-template-columns: minmax(280px, 480px) 1fr; gap: 16px; }
+@media (max-width: 760px) { .signs-row { grid-template-columns: minmax(0, 1fr); } }
+.signs-side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+#sign-video, .overlay { transform: scaleX(-1); }
+.overlay { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; pointer-events: none; }
+.hud {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 10px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(10, 11, 13, 0.78);
+  color: var(--text);
+  font-size: 12px;
+  backdrop-filter: blur(6px);
+}
+.vision-status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+.vision-status .dot { width: 8px; height: 8px; border-radius: 50%; background: #3a404c; flex: none; }
+.vision-status[data-tone="busy"] .dot { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+.vision-status[data-tone="ok"] .dot { background: var(--accent); }
+.vision-status[data-tone="bad"] { color: var(--danger); }
+.vision-status[data-tone="bad"] .dot { background: var(--danger); }
+@keyframes pulse { 50% { opacity: 0.3; } }
+.sign-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.sign-list li {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.sign-list li.off { opacity: 0.55; }
+.sign-list .meter { grid-column: 1 / -1; margin-top: 0; }
+.sign-toggle { display: flex; align-items: flex-start; gap: 9px; cursor: pointer; }
+.sign-toggle input { margin-top: 3px; }
+.sign-toggle b { display: block; font-weight: 600; font-size: 13px; }
+.sign-toggle small { display: block; color: var(--muted); font-size: 11.5px; }
+.tag { align-self: start; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.link { border: 0; background: none; color: var(--info); font: inherit; font-size: 11px; cursor: pointer; padding: 0 0 0 6px; }
+.q-good { color: var(--accent); font-style: normal; }
+.q-fair { color: var(--warn); font-style: normal; }
+.q-poor { color: var(--danger); font-style: normal; }
+.teach { padding-top: 10px; border-top: 1px solid var(--border); }
+.teach input[type="text"] { width: 190px; }
+.sign-log { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.sign-log:empty { display: none; }
+.sign-log li.ok { color: var(--accent); }
+.sign-log li.fail { color: var(--danger); }

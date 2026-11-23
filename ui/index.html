@@ -85,16 +85,61 @@
         <div class="notice" id="notice" hidden></div>
 
         <section class="page active" id="page-overview">
-          <div class="strip">
-            <div class="strip-status">
-              <span class="dot" id="protection-dot"></span>
-              <span id="protection-text">Connecting…</span>
+          <div class="hero" id="hero" data-tone="idle">
+            <div class="hero-ring" aria-hidden="true">
+              <svg class="ring" viewBox="0 0 120 120">
+                <circle class="ring-track" cx="60" cy="60" r="52"/>
+                <circle class="ring-value" id="ring-value" cx="60" cy="60" r="52" pathLength="100"/>
+              </svg>
+              <div class="ring-label"><b id="score-value">–</b><span>protection</span></div>
             </div>
-            <div class="strip-stats mono">
-              <span><b id="stat-scanned">0</b> Scanned</span>
-              <span><b id="stat-quarantined">0</b> Quarantined</span>
-              <span><b id="stat-cpu">0.0%</b> CPU</span>
+            <div class="hero-body">
+              <div class="hero-status">
+                <span class="dot" id="protection-dot"></span>
+                <h2 id="protection-text">Connecting…</h2>
+              </div>
+              <p class="muted" id="protection-detail">Checking the background service, engines, AI model and canaries.</p>
+              <ul class="score-items" id="score-items"></ul>
             </div>
+          </div>
+
+          <div class="stat-grid">
+            <div class="stat">
+              <span class="stat-icon"><svg viewBox="0 0 24 24"><path d="M4 7V4h3M17 4h3v3M20 17v3h-3M7 20H4v-3"/><path d="M4 12h16"/></svg></span>
+              <b class="mono" id="stat-scanned">0</b>
+              <span>files and processes checked</span>
+            </div>
+            <div class="stat">
+              <span class="stat-icon threat"><svg viewBox="0 0 24 24"><path d="M12 3 21 19H3z"/><path d="M12 10v4M12 17h.01"/></svg></span>
+              <b class="mono" id="stat-threats">0</b>
+              <span>threats stopped</span>
+            </div>
+            <div class="stat">
+              <span class="stat-icon"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9M10 13h4"/></svg></span>
+              <b class="mono" id="stat-quarantined">0</b>
+              <span>files in quarantine</span>
+            </div>
+            <div class="stat">
+              <span class="stat-icon"><svg viewBox="0 0 24 24"><path d="M3 12h4l2-6 4 12 2-6h6"/></svg></span>
+              <b class="mono" id="stat-cpu">0.0%</b>
+              <span>engine CPU</span>
+            </div>
+          </div>
+
+          <div class="overview-split">
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Threats, last 7 days</h2>
+                <span class="legend"><i class="seg critical"></i>critical <i class="seg high"></i>high <i class="seg other"></i>other</span>
+              </div>
+              <div class="chart" id="threat-chart" role="img" aria-label="Threats per day for the last 7 days"></div>
+            </div>
+            <button class="panel aegis-tile" data-goto="aegismesh">
+              <span class="aegis-glyph"><svg viewBox="0 0 24 24"><path d="M12 2.5 20 5.2l-.4 7.3c-.3 4.3-3.6 7.4-7.6 9-4-1.6-7.3-4.7-7.6-9L4 5.2z"/><path d="m12 8.6 2.5 3.2-2.5 3.2-2.5-3.2z"/></svg></span>
+              <b>AegisMesh silent SOS</b>
+              <span class="muted">Tap rhythm, hand signs or facial expressions send an SOS without touching a phone.</span>
+              <span class="tile-foot">Open the simulation →</span>
+            </button>
           </div>
 
           <div class="engine-grid">
