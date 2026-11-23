@@ -361,7 +361,7 @@ jobs:
             target/macos/TheNex.pkg
           if-no-files-found: warn
 
-  # Pushing a tag like v0.2.0 publishes a GitHub Release with the installers attached.
+  # Pushing a tag like v0.3.0 publishes a GitHub Release with the installers attached.
   release:
     name: Publish release
     needs: [windows, macos]
@@ -381,9 +381,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ls -R dist
+          # What's new (release-notes/<tag>.md, if there is one) followed by the install guide.
+          if [ -f "release-notes/$GITHUB_REF_NAME.md" ]; then
+            cat "release-notes/$GITHUB_REF_NAME.md" INSTALL.md > release-body.md
+          else
+            cp INSTALL.md release-body.md
+          fi
           gh release create "$GITHUB_REF_NAME" \
             dist/TheNexSetup-windows-x64/TheNexSetup.exe \
             dist/the-nex-macos/TheNex.pkg \
             dist/the-nex-macos/TheNex.dmg \
             --title "The Nex $GITHUB_REF_NAME" \
-            --notes-file INSTALL.md
+            --notes-file release-body.md

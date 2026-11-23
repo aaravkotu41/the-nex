@@ -42,7 +42,11 @@ then drag TheNex.app to the Trash.
 
 ## Before you rely on it
 
-- The Nex acts on what it detects: it terminates processes and moves files into quarantine.
+- The Nex acts on what it detects: it moves files into quarantine and stops malicious
+  script commands. It stops a newly started program only when the AI is at least 90% sure;
+  for anything less, or for programs already running when it starts, it alerts you instead.
   To watch what it *would* do first, open The Nex → **Settings** and switch on **Dry run**.
+- The **AegisMesh** page is a simulation: it never contacts anyone. Its camera watch asks for
+  camera access the first time; video stays on your device.
 - Quarantined files can be restored from the **Quarantine** page.
 - Your wallpaper and theme are under **Settings → Appearance & Wallpaper**.
