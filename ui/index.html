@@ -27,6 +27,7 @@
 </head>
 <body>
   <div id="bg-wallpaper" aria-hidden="true"></div>
+  <div id="bg-ambient" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
   <div id="bg-scrim" aria-hidden="true"></div>
   <div class="app">
     <aside class="sidebar">
@@ -75,6 +76,7 @@
           <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg></span>
           <span>Settings</span>
         </button>
+        <span class="nav-indicator" id="nav-indicator" aria-hidden="true"></span>
       </nav>
       <div class="sidebar-footer">
         <span class="service-icon"><span class="dot" id="service-dot"></span></span>
@@ -137,6 +139,7 @@
           <div class="overview-top">
             <div class="hero" id="hero" data-tone="idle">
               <div class="hero-ring" aria-hidden="true">
+                <span class="ring-halo"></span>
                 <svg class="ring" viewBox="0 0 120 120">
                   <defs>
                     <linearGradient id="ring-grad" x1="0" y1="0" x2="1" y2="1">
@@ -419,6 +422,13 @@
                 <div>
                   <span class="field-label">Presets</span>
                   <div class="presets" id="wallpaper-presets"></div>
+                </div>
+                <div class="toggle-line">
+                  <div>
+                    <span class="field-label">Animated background</span>
+                    <p class="muted small">Slowly drifting colour behind the cards, with the Aurora and Matte wallpapers. Turn it off to save a little battery.</p>
+                  </div>
+                  <button class="switch" id="ambient-switch" type="button" role="switch" aria-checked="true" aria-label="Animated background"></button>
                 </div>
                 <div class="sliders">
                   <label class="slider"><span>Background dim</span><input id="bg-dim" type="range" min="0" max="90" step="1" value="20"><output id="bg-dim-value" for="bg-dim">20%</output></label>

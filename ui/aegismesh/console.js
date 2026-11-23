@@ -1855,6 +1855,54 @@
     if (query && query.addEventListener) query.addEventListener("change", () => applyTheme(resolved()));
   }
 
+  // The section bar's highlight slides to the section you are reading.
+  function movePill() {
+    const pill = $("nav-pill");
+    const active = document.querySelector(".section-nav a.active");
+    if (!pill || !active) return;
+    pill.style.transform = `translateX(${active.offsetLeft}px)`;
+    pill.style.width = `${active.offsetWidth}px`;
+    if (!pill.classList.contains("ready")) requestAnimationFrame(() => pill.classList.add("ready"));
+  }
+
+  // Cards fade up as they scroll into view, and the glass under the mouse gets a soft light.
+  function watchMotion() {
+    document.querySelector(".section-nav").classList.add("has-pill");
+    movePill();
+    window.addEventListener("resize", movePill);
+    const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!reduce && "IntersectionObserver" in window) {
+      const reveal = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          entry.target.classList.add("in");
+          reveal.unobserve(entry.target);
+        }
+      }, { threshold: 0.06 });
+      for (const card of document.querySelectorAll(".card")) {
+        card.classList.add("reveal");
+        reveal.observe(card);
+      }
+      // never leave a card hidden (a frame that is not laid out reports nothing)
+      setTimeout(() => { for (const card of document.querySelectorAll(".card.reveal")) card.classList.add("in"); }, 2500);
+    }
+    let pending = null;
+    document.addEventListener("pointermove", (event) => {
+      if (pending === null) {
+        requestAnimationFrame(() => {
+          const card = pending.target && pending.target.closest ? pending.target.closest(".card, .section-nav") : null;
+          if (card) {
+            const box = card.getBoundingClientRect();
+            card.style.setProperty("--mx", `${Math.round(pending.clientX - box.left)}px`);
+            card.style.setProperty("--my", `${Math.round(pending.clientY - box.top)}px`);
+          }
+          pending = null;
+        });
+      }
+      pending = event;
+    }, { passive: true });
+  }
+
   function watchSections() {
     const links = [...document.querySelectorAll(".section-nav a")];
     const byId = new Map(links.map((a) => [a.getAttribute("href").slice(1), a]));
@@ -1866,7 +1914,10 @@
         const ratio = seen.get(id) || 0;
         if (ratio > 0 && (best === null || ratio > (seen.get(best) || 0))) best = id;
       }
-      if (best) for (const [id, a] of byId) a.classList.toggle("active", id === best);
+      if (best) {
+        for (const [id, a] of byId) a.classList.toggle("active", id === best);
+        movePill();
+      }
     }, { threshold: [0, 0.25, 0.5, 0.75, 1], rootMargin: "-60px 0px -35% 0px" });
     for (const id of byId.keys()) {
       const section = $(id);
@@ -1877,6 +1928,7 @@
   async function init() {
     wire();
     watchSections();
+    watchMotion();
     watchTheme();
     drawEnergyIdle();
     setCamStep(1);

@@ -584,13 +584,15 @@ async function loadChart(force) {
   const max = Math.max(1, ...days.map((d) => d.critical + d.high + d.other));
   replaceIfChanged($("threat-chart"), JSON.stringify(days), () => days.map((d, index) => {
     const total = d.critical + d.high + d.other;
-    const stack = el("div", { className: "bar-stack" });
+    const fill = el("div", { className: "bar-fill" });
+    fill.style.setProperty("--i", String(index));
     for (const kind of ["critical", "high", "other"]) {
       if (!d[kind]) continue;
       const seg = el("div", { className: `seg ${kind}` });
       seg.style.height = `${(d[kind] / max) * 100}%`;
-      stack.append(seg);
+      fill.append(seg);
     }
+    const stack = el("div", { className: "bar-stack" }, [fill]);
     const col = el("button", {
       className: `bar-col${index === days.length - 1 ? " today" : ""}`,
       title: `${d.label}: ${total} threat${total === 1 ? "" : "s"}. Click to see them.`,
@@ -888,6 +890,7 @@ async function runQuickScan() {
   button.disabled = true;
   button.querySelector(".scan-label").textContent = "Scanning…";
   $("hero").classList.add("scanning");
+  document.querySelector(".main").classList.add("scanning");
   const sheet = $("scan-sheet");
   $("scan-findings").replaceChildren();
   $("scan-view").hidden = true;
@@ -924,6 +927,7 @@ async function runQuickScan() {
   button.disabled = false;
   button.querySelector(".scan-label").textContent = "Quick Scan";
   $("hero").classList.remove("scanning");
+  document.querySelector(".main").classList.remove("scanning");
   state.scanning = false;
   $("scan-close").hidden = false;
 
@@ -948,15 +952,31 @@ async function runQuickScan() {
       $("scan-view").hidden = false;
     } else {
       setScanSheet("ok", "Scan complete: no threats found", notes);
+      $("hero").classList.add("scan-done");
+      setTimeout(() => $("hero").classList.remove("scan-done"), 1000);
       scanUi.hideTimer = setTimeout(hideScanSheet, 9000);
     }
   }
   await refresh(true);
 }
 
+/** Slides the sidebar highlight onto the active page's item. */
+function moveNavIndicator() {
+  const indicator = $("nav-indicator");
+  const active = document.querySelector(".nav-item.active");
+  if (!indicator || !active) return;
+  indicator.style.transform = `translateY(${active.offsetTop}px)`;
+  indicator.style.height = `${active.offsetHeight}px`;
+  if (!indicator.classList.contains("ready")) {
+    // first placement: appear in place instead of sliding in from the top
+    requestAnimationFrame(() => indicator.classList.add("ready"));
+  }
+}
+
 function showPage(page) {
   state.page = page;
   for (const item of document.querySelectorAll(".nav-item")) item.classList.toggle("active", item.dataset.page === page);
+  moveNavIndicator();
   for (const section of document.querySelectorAll(".page")) section.classList.toggle("active", section.id === `page-${page}`);
   $("page-title").textContent = PAGE_TITLES[page];
   $("page-sub").textContent = page === "overview" ? greeting() : PAGE_SUBS[page] || "";
@@ -1270,6 +1290,64 @@ function applyAppearance(appearance, css) {
   look.css = css;
   if (!look.previewUrl) writeMirror(appearance, css);
   updateAppearanceControls();
+  applyAmbient();
+}
+
+/* ---- Motion: drifting background, a glow that follows the mouse --------------------------- */
+
+const AMBIENT_KEY = "thenex.ambient";
+const reducedMotion = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+
+function ambientWanted() {
+  try {
+    return localStorage.getItem(AMBIENT_KEY) !== "off";
+  } catch {
+    return true;
+  }
+}
+
+/** The drifting colour shows over the app's own wallpapers, never over a photo you chose. */
+function applyAmbient() {
+  const source = (look.current && look.current.wallpaper_source) || "";
+  const ownWallpaper = !look.previewUrl && /^preset:(aurora|matte)$/.test(source);
+  const on = ambientWanted() && ownWallpaper && !(reducedMotion && reducedMotion.matches);
+  document.documentElement.dataset.ambient = on ? "on" : "off";
+  const toggle = $("ambient-switch");
+  if (toggle) toggle.setAttribute("aria-checked", String(ambientWanted()));
+}
+
+function wireMotion() {
+  $("ambient-switch").addEventListener("click", () => {
+    try {
+      localStorage.setItem(AMBIENT_KEY, ambientWanted() ? "off" : "on");
+    } catch {
+      /* storage disabled: nothing to remember */
+    }
+    applyAmbient();
+  });
+  if (reducedMotion && reducedMotion.addEventListener) reducedMotion.addEventListener("change", applyAmbient);
+
+  // The glass under the mouse gets a soft light at the pointer (CSS reads --mx and --my).
+  const GLASS = ".sidebar, .topbar, .panel, .hero, .stat, .aegis-tile";
+  let pending = null;
+  document.addEventListener("pointermove", (event) => {
+    if (pending === null) {
+      requestAnimationFrame(() => {
+        const target = pending.target && pending.target.closest ? pending.target.closest(GLASS) : null;
+        if (target) {
+          const box = target.getBoundingClientRect();
+          target.style.setProperty("--mx", `${Math.round(pending.clientX - box.left)}px`);
+          target.style.setProperty("--my", `${Math.round(pending.clientY - box.top)}px`);
+        }
+        pending = null;
+      });
+    }
+    pending = event;
+  }, { passive: true });
+
+  document.querySelector(".nav").classList.add("has-indicator");
+  moveNavIndicator();
+  window.addEventListener("resize", moveNavIndicator);
 }
 
 function appearanceStatus(text, kind) {
@@ -1504,6 +1582,7 @@ async function initAppearance() {
 wire();
 $("page-sub").textContent = greeting();
 wireTheme();
+wireMotion();
 initAppearance().then(applyTheme);
 refresh(true);
 setInterval(() => refresh(false), REFRESH_MS);
