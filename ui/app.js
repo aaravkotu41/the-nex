@@ -52,6 +52,9 @@ const state = {
   confirm: null,
   openEvent: null,
   openQuarantine: null,
+  activityType: null, // Activity filters set by clicking the overview (a threat type, a day)
+  activityDay: null,
+  scanning: false,
 };
 
 const SEARCH_PAGES = new Set(["overview", "activity", "quarantine", "canaries"]);
@@ -106,6 +109,26 @@ function formatTime(iso) {
 function formatDateTime(iso) {
   const date = new Date(iso);
   return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString([], { hour12: false });
+}
+
+/** Counts a tile's number up (or down) to its new value instead of jumping. */
+function setCount(node, value) {
+  const target = Number(value) || 0;
+  const from = Number(node.dataset.value);
+  node.dataset.value = String(target);
+  if (!Number.isFinite(from) || from === target || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    node.textContent = count(target);
+    return;
+  }
+  const start = performance.now();
+  const step = (now) => {
+    if (node.dataset.value !== String(target)) return; // a newer value took over
+    const k = Math.min(1, (now - start) / 700);
+    const eased = 1 - Math.pow(1 - k, 3);
+    node.textContent = count(Math.round(from + (target - from) * eased));
+    if (k < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
 }
 
 function sameDay(a, b) {
@@ -263,13 +286,45 @@ function severityBadge(severity) {
 }
 
 function eventRow(event) {
-  return el("tr", {}, [
+  const row = el("tr", { title: "Open in Activity", attrs: { tabindex: "0" } }, [
     el("td", { text: formatWhen(event.timestamp), title: formatDateTime(event.timestamp) }),
     el("td", {}, [el("span", { className: typeClass(event.threat_type), text: event.threat_type })]),
     el("td", { text: shortPath(event.target), title: event.target }),
     el("td", { text: event.details, title: event.details }),
     el("td", { text: actionLabel(event.action_taken), title: event.action_taken }),
   ]);
+  const open = () => openActivity({ open: event.id });
+  row.addEventListener("click", open);
+  row.addEventListener("keydown", (e) => { if (e.key === "Enter") open(); });
+  return row;
+}
+
+const DAY_MS = 86400000;
+
+/** Opens Activity, optionally filtered to one threat type or one day, or with one event open. */
+function openActivity({ type = null, day = null, open = null } = {}) {
+  state.activityType = type;
+  state.activityDay = day;
+  state.openEvent = open;
+  state.severity = "ALL";
+  for (const pill of document.querySelectorAll(".pill-filter")) pill.classList.toggle("active", pill.dataset.severity === "ALL");
+  showPage("activity");
+}
+
+function renderActivityFilters() {
+  const chips = [];
+  if (state.activityType) chips.push(["Type", state.activityType, () => { state.activityType = null; }]);
+  if (state.activityDay !== null) {
+    const label = new Date(state.activityDay).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "short" });
+    chips.push(["Day", label, () => { state.activityDay = null; }]);
+  }
+  const holder = $("activity-filters");
+  holder.hidden = chips.length === 0;
+  replaceIfChanged(holder, JSON.stringify(chips.map((c) => c.slice(0, 2))), () => chips.map(([name, value, clear]) => {
+    const close = el("button", { text: "×", title: `Show every ${name.toLowerCase()}`, attrs: { type: "button", "aria-label": `Clear the ${name.toLowerCase()} filter` } });
+    close.addEventListener("click", () => { clear(); refresh(true); });
+    return el("span", { className: "filter-chip" }, [el("small", { text: name }), el("span", { text: value }), close]);
+  }));
 }
 
 function activityRows(event) {
@@ -315,6 +370,17 @@ function renderToggles(toggles, enabled) {
   }
 }
 
+function focusEngine(engine) {
+  const row = document.querySelector(`[data-engine-row="${engine}"]`);
+  if (!row) return;
+  requestAnimationFrame(() => {
+    row.scrollIntoView({ block: "center", behavior: "smooth" });
+    row.classList.remove("flash");
+    void row.offsetWidth; // restart the highlight
+    row.classList.add("flash");
+  });
+}
+
 function buildEngineRows() {
   const rows = $("engine-rows");
   const engines = [
@@ -325,7 +391,7 @@ function buildEngineRows() {
   ];
   for (const [engine, title, description] of engines) {
     const thresholds = el("div", { className: "thresholds", attrs: { "data-thresholds": engine } });
-    rows.append(el("div", { className: "row" }, [
+    rows.append(el("div", { className: "row", attrs: { "data-engine-row": engine } }, [
       el("div", {}, [el("h3", { text: title }), el("p", { className: "muted", text: description }), thresholds]),
       el("button", { className: "switch", attrs: { role: "switch", "aria-checked": "false", "data-engine": engine, "aria-label": title } }),
     ]));
@@ -377,9 +443,9 @@ function renderDashboard(d) {
     protection.className = "dot ok";
     $("protection-text").textContent = "Protected — Local Rust Engine";
   }
-  $("stat-scanned").textContent = count(d.scanned);
-  $("stat-threats").textContent = count(d.threats_detected);
-  $("stat-quarantined").textContent = count(d.quarantined);
+  setCount($("stat-scanned"), d.scanned);
+  setCount($("stat-threats"), d.threats_detected);
+  setCount($("stat-quarantined"), d.quarantined);
   $("stat-cpu").textContent = online ? `${(d.daemon.cpu_percent || 0).toFixed(1)}%` : "—";
   renderScore(d);
 
@@ -452,11 +518,11 @@ function protectionScore(d) {
   const canaries = (d.canaries || []).length;
   const canariesOk = canaries > 0 && d.canaries_intact === canaries;
   const items = [
-    { ok: d.daemon.online, text: d.daemon.online ? "Background service running" : "Background service offline" },
-    { ok: enginesOn === 4, text: `${enginesOn} of 4 engines on` },
-    { ok: Boolean(d.model_loaded), text: d.model_loaded ? "AI model loaded" : "AI on heuristic fallback" },
-    { ok: canariesOk, text: `${d.canaries_intact} of ${canaries} canaries intact` },
-    { ok: !d.dry_run, text: d.dry_run ? "Dry run: detecting only" : "Blocking threats" },
+    { ok: d.daemon.online, text: d.daemon.online ? "Background service running" : "Background service offline", goto: "settings" },
+    { ok: enginesOn === 4, text: `${enginesOn} of 4 engines on`, goto: "engines" },
+    { ok: Boolean(d.model_loaded), text: d.model_loaded ? "AI model loaded" : "AI on heuristic fallback", goto: "engines", focus: "bin_ai" },
+    { ok: canariesOk, text: `${d.canaries_intact} of ${canaries} canaries intact`, goto: "canaries" },
+    { ok: !d.dry_run, text: d.dry_run ? "Dry run: detecting only" : "Blocking threats", goto: "engines" },
   ];
   const score = d.daemon.online
     ? Math.round(30 + (40 * enginesOn) / 4 + (d.model_loaded ? 10 : 0) + (canariesOk ? 10 : 0) + (d.dry_run ? 0 : 10))
@@ -478,7 +544,9 @@ function renderScore(d) {
   $("protection-detail").textContent = allOk
     ? "Every engine is active. New downloads, archives and processes are checked as they appear."
     : "Some protection is off or degraded; the items marked ! need attention.";
-  replaceIfChanged($("score-items"), JSON.stringify(items), () => items.map((item) => el("li", { className: item.ok ? "ok" : "no", text: item.text })));
+  replaceIfChanged($("score-items"), JSON.stringify(items), () => items.map((item) => el("li", { className: item.ok ? "ok" : "no" }, [
+    el("button", { text: item.text, attrs: { type: "button", "data-goto": item.goto, ...(item.focus ? { "data-focus": item.focus } : {}) } }),
+  ])));
 }
 
 const CHART_REFRESH_MS = 30000;
@@ -523,11 +591,17 @@ async function loadChart(force) {
       seg.style.height = `${(d[kind] / max) * 100}%`;
       stack.append(seg);
     }
-    return el("div", { className: `bar-col${index === days.length - 1 ? " today" : ""}`, title: `${d.label}: ${total} threat${total === 1 ? "" : "s"}` }, [
+    const col = el("button", {
+      className: `bar-col${index === days.length - 1 ? " today" : ""}`,
+      title: `${d.label}: ${total} threat${total === 1 ? "" : "s"}. Click to see them.`,
+      attrs: { type: "button" },
+    }, [
       el("b", { className: total ? "mono" : "mono zero", text: String(total) }),
       stack,
       el("span", { text: d.label }),
     ]);
+    col.addEventListener("click", () => openActivity({ day: d.start }));
+    return col;
   }));
 }
 
@@ -561,7 +635,11 @@ function renderChartFacts(days, byType) {
     const bar = el("i");
     bar.style.setProperty("--w", `${Math.max(6, (n / top) * 100)}%`);
     if (TYPE_COLOURS[type]) bar.style.setProperty("--bar", TYPE_COLOURS[type]);
-    return el("li", { title: TYPE_NOTES[type] || type }, [el("span", { text: type }), el("b", { text: String(n) }), bar]);
+    const button = el("button", { title: `${TYPE_NOTES[type] || type} Click to see these events.`, attrs: { type: "button" } }, [
+      el("span", { text: type }), el("b", { text: String(n) }), bar,
+    ]);
+    button.addEventListener("click", () => openActivity({ type }));
+    return el("li", {}, [button]);
   }) : [el("li", { className: "none", text: "No threats in the last 7 days." })]));
 }
 
@@ -716,7 +794,16 @@ async function loadEvents() {
   replaceIfChanged($("overview-events"), eventsSignature(overview), () => overview.map((e) => eventRow(e)));
   $("overview-empty").hidden = overview.length > 0;
   if (state.page === "activity") {
-    const all = await call("get_events", { limit: 1000, query: state.query || null, severity: "ALL" });
+    const fetched = await call("get_events", { limit: 1000, query: state.query || null, severity: "ALL" });
+    const all = fetched.filter((e) => {
+      if (state.activityType && e.threat_type !== state.activityType) return false;
+      if (state.activityDay !== null) {
+        const t = Date.parse(e.timestamp);
+        if (t < state.activityDay || t >= state.activityDay + DAY_MS) return false;
+      }
+      return true;
+    });
+    renderActivityFilters();
     const counts = { ALL: all.length, CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
     for (const e of all) counts[severityKey(e.severity)] = (counts[severityKey(e.severity)] || 0) + 1;
     for (const [key, value] of Object.entries(counts)) {
@@ -773,6 +860,100 @@ async function busy(buttonId, label, work) {
   }
 }
 
+/* ---- Quick scan: a running sheet with a radar, then the result ------------------------------ */
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const MIN_SCAN_SHOW_MS = 1600; // a very fast scan still shows the animation long enough to read
+const scanUi = { ticker: 0, hideTimer: 0 };
+
+function hideScanSheet() {
+  clearTimeout(scanUi.hideTimer);
+  $("scan-sheet").hidden = true;
+}
+
+function setScanSheet(stateName, title, detail) {
+  const sheet = $("scan-sheet");
+  sheet.dataset.state = stateName;
+  $("scan-title").textContent = title;
+  $("scan-detail").textContent = detail;
+}
+
+async function runQuickScan() {
+  if (state.scanning) return;
+  state.scanning = true;
+  clearTimeout(scanUi.hideTimer);
+  const button = $("quick-scan");
+  button.classList.add("scanning");
+  button.dataset.busy = "1"; // the 2 s refresh leaves a busy button alone
+  button.disabled = true;
+  button.querySelector(".scan-label").textContent = "Scanning…";
+  $("hero").classList.add("scanning");
+  const sheet = $("scan-sheet");
+  $("scan-findings").replaceChildren();
+  $("scan-view").hidden = true;
+  $("scan-close").hidden = true;
+  const roots = (state.dashboard && state.dashboard.watched_dirs) || [];
+  setScanSheet("running", "Quick scan running", roots.length ? `Checking ${roots[0]}…` : "Checking your watched folders…");
+  sheet.hidden = false;
+  const started = performance.now();
+  let rootIndex = 0;
+  let lastSwitch = started;
+  scanUi.ticker = setInterval(() => {
+    const now = performance.now();
+    $("scan-time").textContent = `${((now - started) / 1000).toFixed(1)} s`;
+    if (roots.length > 1 && now - lastSwitch > 650) {
+      lastSwitch = now;
+      rootIndex = (rootIndex + 1) % roots.length;
+      $("scan-detail").textContent = `Checking ${roots[rootIndex]}… (${rootIndex + 1} of ${roots.length} folders)`;
+    }
+  }, 100);
+
+  let report = null;
+  let failure = null;
+  try {
+    report = await call("run_quick_scan");
+  } catch (error) {
+    failure = error;
+  }
+  const shown = performance.now() - started;
+  if (shown < MIN_SCAN_SHOW_MS) await sleep(MIN_SCAN_SHOW_MS - shown);
+  clearInterval(scanUi.ticker);
+
+  button.classList.remove("scanning");
+  delete button.dataset.busy;
+  button.disabled = false;
+  button.querySelector(".scan-label").textContent = "Quick Scan";
+  $("hero").classList.remove("scanning");
+  state.scanning = false;
+  $("scan-close").hidden = false;
+
+  if (failure) {
+    setScanSheet("error", "The scan could not run", errorText(failure));
+  } else {
+    const threats = report.findings.length;
+    const seconds = ((report.duration_ms || 0) / 1000).toFixed(1);
+    $("scan-time").textContent = `${seconds} s`;
+    const folders = report.roots.length;
+    const notes = [
+      `${count(report.files_scanned)} of ${count(report.files_examined)} files inspected in ${seconds} s across ${folders} folder${folders === 1 ? "" : "s"}`,
+      report.dry_run ? "dry run: nothing was moved" : "",
+      report.truncated ? "stopped at the file limit" : "",
+    ].filter(Boolean).join(" · ");
+    if (threats) {
+      setScanSheet("bad", `Scan found ${threats} threat${threats === 1 ? "" : "s"}`, notes);
+      $("scan-findings").replaceChildren(...report.findings.slice(0, 5).map((f) => el("li", {}, [
+        el("span", { className: typeClass(f.threat_type), text: f.threat_type }),
+        el("span", { text: `${fileName(f.path)} · ${f.detail}`, title: f.path }),
+      ])));
+      $("scan-view").hidden = false;
+    } else {
+      setScanSheet("ok", "Scan complete: no threats found", notes);
+      scanUi.hideTimer = setTimeout(hideScanSheet, 9000);
+    }
+  }
+  await refresh(true);
+}
+
 function showPage(page) {
   state.page = page;
   for (const item of document.querySelectorAll(".nav-item")) item.classList.toggle("active", item.dataset.page === page);
@@ -806,7 +987,24 @@ async function toggleEngine(button) {
 function wire() {
   buildEngineRows();
   for (const item of document.querySelectorAll(".nav-item")) item.addEventListener("click", () => showPage(item.dataset.page));
-  for (const link of document.querySelectorAll("[data-goto]")) link.addEventListener("click", () => showPage(link.dataset.goto));
+  // Anything with data-goto opens that page (tiles, engine cards, score items, links); a switch
+  // inside a card still only toggles. data-focus also highlights one engine on the Engines page.
+  const go = (target) => {
+    if (target.dataset.goto === "activity") openActivity();
+    else showPage(target.dataset.goto);
+    if (target.dataset.focus) focusEngine(target.dataset.focus);
+  };
+  document.addEventListener("click", (event) => {
+    const target = event.target.closest("[data-goto]");
+    if (target && !event.target.closest(".switch")) go(target);
+  });
+  document.addEventListener("keydown", (event) => {
+    const target = event.target.closest && event.target.closest(".engine-card[data-goto]");
+    if (target && event.target === target && (event.key === "Enter" || event.key === " ")) {
+      event.preventDefault();
+      go(target);
+    }
+  });
   document.addEventListener("click", (event) => {
     const button = event.target.closest(".switch[data-engine]");
     if (button && !button.disabled) toggleEngine(button);
@@ -846,12 +1044,9 @@ function wire() {
     }
   });
 
-  $("quick-scan").addEventListener("click", () => busy("quick-scan", "Scanning…", async () => {
-    const report = await call("run_quick_scan");
-    const threats = report.findings.length;
-    const mode = report.dry_run ? " (dry run)" : "";
-    notice(`Quick scan${mode}: ${count(report.files_scanned)} of ${count(report.files_examined)} files inspected, ${threats} threat${threats === 1 ? "" : "s"} found.`, threats > 0);
-  }));
+  $("quick-scan").addEventListener("click", runQuickScan);
+  $("scan-close").addEventListener("click", hideScanSheet);
+  $("scan-view").addEventListener("click", () => { hideScanSheet(); openActivity(); });
   $("verify-canaries").addEventListener("click", () => busy("verify-canaries", "Verifying…", async () => {
     const canaries = await call("verify_canaries");
     const intact = canaries.filter((c) => c.state === "Intact").length;
