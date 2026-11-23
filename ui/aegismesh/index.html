@@ -45,6 +45,7 @@
   <nav class="section-nav" aria-label="Sections">
     <span class="nav-pill" id="nav-pill" aria-hidden="true"></span>
     <a href="#card-form" class="active">Wearable</a>
+    <a href="#card-triggers">My triggers</a>
     <a href="#card-tap">Tap rhythm</a>
     <a href="#card-camera">Camera test</a>
     <a href="#card-signs">Emergency signs</a>
@@ -78,6 +79,21 @@
       </div>
     </section>
 
+    <section class="card wide" id="card-triggers">
+      <div class="card-head">
+        <h2><span class="ico violet"><svg viewBox="0 0 24 24"><path d="M12 3 20 6v6c0 4.5-3.4 7.7-8 9-4.6-1.3-8-4.5-8-9V6z"/><path d="M12 8.5v7M8.5 12h7"/></svg></span>My SOS triggers</h2>
+        <span class="muted" id="trigger-count">Your own rhythms, movements, expressions and hand signs, saved in AegisMesh on this device.</span>
+      </div>
+      <div class="trigger-new" role="group" aria-label="Make a new trigger">
+        <button class="new-trigger" type="button" data-new="rhythm"><span class="ico teal"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.5"/><path d="M12 5.5a6.5 6.5 0 0 1 6.5 6.5M5.5 12A6.5 6.5 0 0 1 12 5.5M12 2a10 10 0 0 1 10 10M2 12A10 10 0 0 1 12 2"/></svg></span><span><b>New tap rhythm</b><small>Tap it 3 times on the pad</small></span></button>
+        <button class="new-trigger" type="button" data-new="move"><span class="ico violet"><svg viewBox="0 0 24 24"><path d="M2.5 12c2-4.5 4-4.5 6 0s4 4.5 6 0 4-4.5 7 0"/><path d="M18 4.5l2.5 2.5L18 9.5M6 14.5 3.5 17 6 19.5"/></svg></span><span><b>New movement</b><small>A wave, circle or swipe, 3 times on camera</small></span></button>
+        <button class="new-trigger" type="button" data-new="face"><span class="ico pink"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8.5 14.5c1 1.2 2.2 1.8 3.5 1.8s2.5-.6 3.5-1.8M9 9.5h.01M15 9.5h.01"/></svg></span><span><b>New expression</b><small>Hold a face for 3 seconds on camera</small></span></button>
+        <button class="new-trigger" type="button" data-new="hand"><span class="ico blue"><svg viewBox="0 0 24 24"><path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V11m0-6a1.5 1.5 0 0 1 3 0v6m0-4.5a1.5 1.5 0 0 1 3 0V14c0 3.9-2.6 7-6.4 7-3 0-4.6-1.6-5.8-4L3.3 13.8a1.5 1.5 0 0 1 2.6-1.5L8 15"/></svg></span><span><b>New hand sign</b><small>Hold a hand shape for 3 seconds</small></span></button>
+      </div>
+      <ul class="trigger-grid" id="trigger-grid"></ul>
+      <p class="hint">Everything here is kept on this device only, as timings and landmark numbers, never video. A rhythm works with the wearable you pick above; movements, expressions and hand signs work with the camera watch below. Tests never send an SOS.</p>
+    </section>
+
     <section class="card" id="card-tap">
       <div class="card-head">
         <h2><span class="ico teal"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.5"/><path d="M12 5.5a6.5 6.5 0 0 1 6.5 6.5M5.5 12A6.5 6.5 0 0 1 12 5.5M12 2a10 10 0 0 1 10 10M2 12A10 10 0 0 1 12 2"/></svg></span>Tap rhythm calibration</h2>
@@ -100,14 +116,14 @@
       </div>
       <div class="verdict" id="tap-verdict"></div>
       <div class="calibrate">
-        <p class="muted">Your own rhythm: tap it once (pad or camera), add it as a sample, repeat 3 times, then build.</p>
+        <p class="muted">Save your own rhythm: name it, tap it once on the pad (or with the camera test), press Add sample. Do that 3 times, then Save rhythm.</p>
         <div class="row wrap">
           <input id="cal-name" type="text" maxlength="60" placeholder="Rhythm name" autocomplete="off">
           <label class="inline">Perform
             <select id="cal-repeats"><option value="1">once</option><option value="2" selected>twice</option><option value="3">3 times</option></select>
           </label>
           <button class="btn" id="cal-add">Add sample (0)</button>
-          <button class="btn primary" id="cal-build" disabled>Build profile</button>
+          <button class="btn primary" id="cal-build" disabled>Save rhythm</button>
           <button class="btn ghost" id="cal-reset">Default rhythm</button>
         </div>
       </div>
@@ -209,16 +225,17 @@
           <ul class="sign-list" id="sign-list"></ul>
           <div class="verdict" id="sign-test" aria-live="polite"></div>
           <div class="teach">
-            <h3>Add your own emergency sign or expression</h3>
+            <h3>Add your own emergency sign, expression or movement</h3>
             <div class="row wrap">
               <input id="teach-name" type="text" maxlength="40" placeholder="Name, e.g. Two fingers" autocomplete="off">
               <select id="teach-kind" aria-label="Kind">
                 <option value="hand">Hand sign</option>
                 <option value="face">Facial expression</option>
+                <option value="move">Movement (wave, circle, swipe…)</option>
               </select>
               <button class="btn primary" id="teach-start">Teach it</button>
             </div>
-            <p class="hint">After a 3-second countdown, hold your sign still for 3 seconds; then let go and stay relaxed, still in view, for 3 seconds so it learns what not to react to. It is tested straight away, and every sign has a Test button. Tests never send an SOS. Only landmark numbers are kept, never pictures.</p>
+            <p class="hint" id="teach-hint">After a 3-second countdown, hold your sign still for 3 seconds; then let go and stay relaxed, still in view, for 3 seconds so it learns what not to react to. It is tested straight away, and every sign has a Test button. Tests never send an SOS. Only landmark numbers are kept, never pictures.</p>
           </div>
           <ul class="sign-log" id="sign-log"></ul>
         </div>

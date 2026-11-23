@@ -308,5 +308,127 @@ console.log("face");
   check("other expressions not mistaken (smile, open mouth)", smile <= 0.05 && open <= 0.05, `${(smile * 100).toFixed(1)}%, ${(open * 100).toFixed(1)}%`);
 }
 
+console.log("taught movements");
+{
+  // A movement is the palm's path. Offsets are in palm lengths; u runs 0..1 over the movement.
+  const WAVE = (amp, cycles = 2) => (u) => ({ dx: amp * Math.sin(2 * Math.PI * cycles * u), dy: 0 });
+  const CIRCLE = (rad) => (u) => ({ dx: rad * Math.cos(2 * Math.PI * u), dy: rad * Math.sin(2 * Math.PI * u) });
+  const SWIPE = (len) => (u) => ({ dx: 0, dy: -len / 2 + len * u });
+  const WANDER = (r) => {
+    const f = [uni(r, 0.2, 0.6), uni(r, 0.3, 0.9), uni(r, 0.5, 1.3)];
+    const ph = [r() * 6, r() * 6, r() * 6];
+    return (u) => ({
+      dx: 0.7 * Math.sin(u * 10 * f[0] + ph[0]) + 0.3 * Math.sin(u * 10 * f[2] + ph[2]),
+      dy: 0.6 * Math.sin(u * 10 * f[1] + ph[1]),
+    });
+  };
+
+  /** Plays [[ms, path | null (hold still) | "away"]] segments with one hand; returns events. */
+  function playMove(watcher, segments, r, opts = {}) {
+    const cam = camera(r);
+    const fps = opts.fps || uni(r, 24, 30);
+    const events = [];
+    let t = 0;
+    let last = { dx: 0, dy: 0 };
+    for (const [ms, fn] of segments) {
+      const frames = Math.max(1, Math.round((ms / 1000) * fps));
+      for (let i = 0; i < frames; i++) {
+        t += 1000 / fps;
+        if (r() < 0.02) continue;
+        const u = frames === 1 ? 1 : i / (frames - 1);
+        let hands = [];
+        if (fn !== "away") {
+          if (fn) last = fn(u);
+          const at = { ...cam, cx: cam.cx + (last.dx * cam.scale) / cam.aspect, cy: cam.cy + last.dy * cam.scale };
+          hands = [view(pose(OPEN, "out"), at, r)];
+        }
+        const out = watcher.update({ t, aspect: cam.aspect, hands, face: null });
+        events.push(...out.events);
+        if (opts.test && opts.test.update(t, out.events, out.status, hands.length > 0).passed !== null) return events;
+      }
+    }
+    return events;
+  }
+
+  /** One teaching recording: a still moment, the movement, a still moment (frames from palmPoint). */
+  function record(fn, ms, r) {
+    const cam = camera(r);
+    const fps = uni(r, 24, 30);
+    const frames = [];
+    let t = 0;
+    const seg = (dur, path) => {
+      const n = Math.round((dur / 1000) * fps);
+      for (let i = 0; i < n; i++) {
+        t += 1000 / fps;
+        const off = path(n === 1 ? 1 : i / (n - 1));
+        const at = { ...cam, cx: cam.cx + (off.dx * cam.scale) / cam.aspect, cy: cam.cy + off.dy * cam.scale };
+        const hand = view(pose(OPEN, "out"), at, r);
+        frames.push({ t, ...S.palmPoint(hand.landmarks, cam.aspect) });
+      }
+    };
+    const start = fn(0);
+    const end = fn(1);
+    seg(400, () => start);
+    seg(ms, fn);
+    seg(400, () => end);
+    return frames;
+  }
+
+  const r = rng(77);
+  const vary = (k) => uni(r, 1 - k, 1 + k);
+  const wave = S.trainMovement({ name: "Wave", recordings: [0, 1, 2].map(() => record(WAVE(1.2 * vary(0.12)), 1600 * vary(0.12), r)) });
+  check("training a wave gives a usable movement", wave.quality !== "poor" && wave.kind === "move" && wave.templates.length === 3, `quality ${wave.quality}, separation ${wave.separation.toFixed(2)}`);
+
+  const fires = (segments, model = wave, seed) => playMove(new S.SignWatcher({ enabled: [], customs: [model] }), segments, seed ? rng(seed) : r);
+  let hits = 0;
+  for (let i = 0; i < 60; i++) {
+    hits += fires([[600, null], [1600 * vary(0.2), WAVE(1.2 * vary(0.2))], [800, null]]).some((e) => e.name === "Wave") ? 1 : 0;
+  }
+  check("the wave is recognised at any distance, angle, speed +-20% and size +-20%", hits >= 54, `${hits}/60`);
+  const twice = fires([[600, null], [1600, WAVE(1.2)], [5000, null], [1600, WAVE(1.2)], [800, null]]).filter((e) => e.name === "Wave").length;
+  check("each wave triggers once", twice === 2, `${twice} triggers for 2 waves`);
+
+  let falseHits = 0;
+  const others = [["a circle", () => CIRCLE(1.0 * vary(0.2))], ["a swipe down", () => SWIPE(2.5 * vary(0.2))], ["a small wave", () => WAVE(0.25)]];
+  for (const [label, make] of others) {
+    let n = 0;
+    for (let i = 0; i < 40; i++) n += fires([[600, null], [1600 * vary(0.2), make()], [800, null]]).length;
+    check(`not mistaken for the wave: ${label}`, n <= 2, `${n}/40`);
+    falseHits += n;
+  }
+  let wander = 0;
+  for (let i = 0; i < 40; i++) wander += fires([[10000, WANDER(r)]]).length;
+  check("ordinary hand movement for 10 s does not trigger", wander <= 2, `${wander}/40 sessions`);
+  check("a still hand never triggers", fires([[15000, null]]).length === 0);
+  check("hand leaving the picture mid-wave does not trigger", fires([[600, null], [700, WAVE(1.2, 1)], [800, "away"], [700, WAVE(1.2, 1)], [800, null]]).length === 0);
+
+  const circle = S.trainMovement({ name: "Circle", recordings: [0, 1, 2].map(() => record(CIRCLE(1.0 * vary(0.1)), 1400 * vary(0.1), r)) });
+  let both = 0;
+  let crossed = 0;
+  for (let i = 0; i < 30; i++) {
+    const w = new S.SignWatcher({ enabled: [], customs: [wave, circle] });
+    const ev = playMove(w, [[600, null], [1400, CIRCLE(1.0 * vary(0.15))], [900, null]], r);
+    both += ev.length === 1 && ev[0].name === "Circle" ? 1 : 0;
+    crossed += ev.some((e) => e.name === "Wave") ? 1 : 0;
+  }
+  check("two taught movements are told apart", both >= 27 && crossed <= 1, `circle ${both}/30, wave fired ${crossed}`);
+
+  let tiny = false;
+  try { S.trainMovement({ name: "Tiny", recordings: [0, 1, 2].map(() => record(WAVE(0.15), 1500, r)) }); } catch (e) { tiny = /too small/.test(e.message); }
+  check("a movement that is too small is refused", tiny);
+  let unseen = false;
+  try { S.trainMovement({ name: "Unseen", recordings: [record(WAVE(1.2), 1500, r).slice(0, 4), [], []] }); } catch (e) { unseen = /fewer than 2/.test(e.message); }
+  check("recordings without the hand are refused", unseen);
+  const more = S.trainMovement({ name: "Wave", base: wave, recordings: [record(WAVE(1.2), 1600, r)] });
+  check("add examples keeps the old ones (bounded)", more.templates.length === 4 && more.name === "Wave", `${more.templates.length} examples`);
+
+  const testOk = S.makeSignTest("custom:Wave", "move");
+  playMove(new S.SignWatcher({ enabled: [], customs: [wave] }), [[600, null], [1600, WAVE(1.2)], [3000, null]], r, { test: testOk });
+  check("test passes when the movement is made", testOk.result && testOk.result.passed, testOk.result ? `${testOk.result.passed} after ${Math.round(testOk.result.ms)} ms` : "no result");
+  const testNo = S.makeSignTest("custom:Wave", "move", { timeoutMs: 4000 });
+  playMove(new S.SignWatcher({ enabled: [], customs: [wave] }), [[600, null], [1500, SWIPE(2.5)], [3000, null]], r, { test: testNo });
+  check("test fails, explained, when another movement is made", testNo.result && testNo.result.passed === false && /movement you taught/.test(testNo.result.advice), testNo.result && testNo.result.advice);
+}
+
 console.log(failures ? `${failures} check(s) failed` : "all sign checks passed");
 process.exit(failures ? 1 : 0);

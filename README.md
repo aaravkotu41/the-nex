@@ -15,8 +15,9 @@ and ransomware canary files, with a Tauri desktop dashboard.
 - `crates/aegismesh-*`: AegisMesh silent-SOS wearable simulation (core library, `aegismesh-sim`
   CLI, `aegismesh-gui` console; the console is also the AegisMesh page of The Nex app).
   Simulation only: no radio, network or emergency service is ever used. Its camera watch
-  recognises emergency hand signs (the Signal for Help) and facial expressions, plus signs you
-  teach it, with Google MediaPipe models run on-device (`scripts/fetch_vision_models.py` pins and
+  recognises emergency hand signs (the Signal for Help) and facial expressions, plus hand signs,
+  expressions and movements (a wave, a circle, a swipe) you teach it; "My SOS triggers" keeps
+  those and your own tap rhythms, saved on the device, with Google MediaPipe models run on-device (`scripts/fetch_vision_models.py` pins and
   verifies them, and three.js for the 3D wearable viewer; the page blocks every off-device
   connection). Recogniser tests: `node scripts/test_signs.js`. The ring, bracelet and clothing-tag
   models (`ui/aegismesh/models/`, GLB plus a still render each) are built in Blender by
