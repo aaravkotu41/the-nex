@@ -27,7 +27,7 @@
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSCameraUsageDescription</key>
-  <string>The AegisMesh page uses the camera only to test tap rhythms on this Mac. Video never leaves the app and is not recorded.</string>
+  <string>The AegisMesh page uses the camera to recognise tap rhythms, emergency hand signs and facial expressions on this Mac. Video never leaves the app and is not recorded.</string>
   <key>NSHumanReadableCopyright</key>
   <string>The Nex endpoint protection</string>
 </dict>

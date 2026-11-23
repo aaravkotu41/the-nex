@@ -260,6 +260,35 @@ input[type="checkbox"] { accent-color: var(--accent); }
 }
 .camera-side { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 
+/* Camera access: one bar for both camera cards */
+.cam-access {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 18px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+}
+.cam-state { display: flex; align-items: flex-start; gap: 10px; flex: 1 1 320px; min-width: 0; }
+.cam-state .dot { width: 10px; height: 10px; margin-top: 5px; border-radius: 50%; background: #3a404c; flex: none; }
+.cam-state b { display: block; font-size: 14px; font-weight: 600; }
+.cam-state span:not(.dot) { display: block; color: var(--muted); font-size: 12.5px; }
+.cam-state[data-tone="ok"] .dot { background: var(--accent); box-shadow: 0 0 0 4px rgba(61, 214, 176, 0.15); }
+.cam-state[data-tone="ok"] b { color: var(--accent); }
+.cam-state[data-tone="bad"] .dot { background: var(--danger); box-shadow: 0 0 0 4px rgba(255, 107, 107, 0.15); }
+.cam-state[data-tone="bad"] b { color: var(--danger); }
+.cam-state[data-tone="busy"] .dot { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+.cam-actions select { max-width: 260px; }
+.tip {
+  margin: 0;
+  padding: 7px 10px;
+  border: 1px solid #5a4520;
+  border-radius: 8px;
+  background: #1d1810;
+  color: var(--warn);
+  font-size: 12px;
+}
+
 .bench-head { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
 .big { padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
 .big b { display: block; font-size: 22px; font-weight: 600; }

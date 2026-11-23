@@ -428,7 +428,7 @@
   function makeAnalyzer() {
     let prev = null;
     let prevMean = 0;
-    return (source, width, height) => {
+    const analyze = (source, width, height) => {
       workCtx.drawImage(source, width * ROI.x, height * ROI.y, width * ROI.w, height * ROI.h, 0, 0, GRID_W, GRID_H);
       const data = workCtx.getImageData(0, 0, GRID_W, GRID_H).data;
       const gray = new Uint8Array(GRID_W * GRID_H);
@@ -447,9 +447,16 @@
       }
       prev = gray;
       prevMean = mean;
+      analyze.brightness = mean;
       return energy;
     };
+    analyze.brightness = null;
+    return analyze;
   }
+
+  // Brightness (0..255) at which a webcam's motion and landmark readings stop being reliable.
+  const TOO_DARK = 40;
+  const TOO_BRIGHT = 225;
 
   function cancelFrames() {
     const video = $("cam-video");
@@ -477,6 +484,14 @@
       cam.lastVideoTime = video.currentTime;
     }
     const energy = cam.analyze(video, video.videoWidth, video.videoHeight);
+    if (!cam.synthetic && now - (cam.lastTip || 0) > 700) {
+      cam.lastTip = now;
+      const b = cam.analyze.brightness;
+      setTip("cam-tip", b === null ? null
+        : b < TOO_DARK ? "Too dark inside the box for reliable taps: turn on a light or face a window."
+        : b > TOO_BRIGHT ? "The box is washed out: move away from a bright light behind your hand."
+        : null);
+    }
     if (energy === null) return;
     cam.live.push({ t: now, energy });
     while (cam.live.length && now - cam.live[0].t > 8000) cam.live.shift();
@@ -539,24 +554,176 @@
     $("roi").classList.toggle("live", on);
   }
 
+  // ---------------------------------------------------------------- camera access (shared)
+  // One place opens the camera for both the tap test and the sign watch: it remembers which
+  // camera you picked, and when access fails it says exactly where to switch it on.
+
+  const IN_APP = location.protocol === "tauri:" || location.hostname === "tauri.localhost";
+  const ON_MAC = /Mac/i.test(navigator.platform || navigator.userAgent);
+  const camAccess = { state: "unknown", cameras: [], deviceId: store.get("aegismesh.camera") || "", activeLabel: "" };
+
+  function blockedHelp() {
+    if (IN_APP && ON_MAC) return "macOS is blocking the camera for The Nex. Open System Settings → Privacy & Security → Camera, switch on The Nex, then reopen the app.";
+    if (IN_APP) return "Windows is blocking the camera. Open Settings → Privacy & security → Camera, switch on \"Camera access\" and \"Let desktop apps access your camera\", then press Try again.";
+    return "This window blocked the camera. Click the camera icon in the address bar, choose Allow, then press Try again. Some built-in preview browsers never allow cameras: open this page in Chrome, Edge or Safari, or use The Nex app.";
+  }
+
+  const CAM_STATES = {
+    unknown: ["", "Camera not used yet", "Press Allow camera; you are asked once. Video is analysed in this window only."],
+    prompt: ["", "Camera not allowed yet", "Press Allow camera; you are asked once. Video is analysed in this window only."],
+    asking: ["busy", "Waiting for your answer…", "Choose Allow in the camera prompt."],
+    granted: ["ok", "Camera allowed", "Video is analysed in this window only; it is never recorded, stored or sent."],
+    denied: ["bad", "Camera blocked", null],
+    missing: ["bad", "No camera found", "Connect a camera, then press Try again. The simulated camera and the self-test work without one."],
+    busy: ["bad", "Camera busy", "Another app (a video call?) is using the camera. Close it, then press Try again."],
+    unsupported: ["bad", "No camera access in this window", "Cameras need a secure page. Open AegisMesh in The Nex app or in Chrome, Edge or Safari."],
+  };
+
+  function setCamAccess(next) {
+    camAccess.state = next;
+    const [tone, title, text] = CAM_STATES[next] || CAM_STATES.unknown;
+    $("cam-state").dataset.tone = tone;
+    $("cam-state-title").textContent = title;
+    $("cam-state-text").textContent = next === "granted" && camAccess.activeLabel
+      ? `Using ${camAccess.activeLabel}. ${text}`
+      : text || blockedHelp();
+    const allow = $("cam-allow");
+    allow.hidden = next === "granted";
+    allow.disabled = next === "asking";
+    allow.textContent = ["denied", "missing", "busy"].includes(next) ? "Try again" : "Allow camera";
+  }
+
+  function cameraProblem(error) {
+    const name = error && error.name;
+    if (name === "NotAllowedError" || name === "SecurityError" || name === "PermissionDeniedError") return "denied";
+    if (name === "NotFoundError" || name === "OverconstrainedError" || name === "DevicesNotFoundError") return "missing";
+    if (name === "NotReadableError" || name === "TrackStartError" || name === "AbortError") return "busy";
+    return null;
+  }
+
+  function cameraConstraints(deviceId) {
+    const video = { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } };
+    if (deviceId) video.deviceId = { exact: deviceId };
+    return { video, audio: false };
+  }
+
+  async function openCamera() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setCamAccess("unsupported");
+      throw new Error(`${CAM_STATES.unsupported[1]}. ${CAM_STATES.unsupported[2]}`);
+    }
+    const before = camAccess.state;
+    if (before !== "granted") setCamAccess("asking");
+    let stream = null;
+    let failure = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(cameraConstraints(camAccess.deviceId));
+    } catch (error) {
+      failure = error;
+    }
+    if (!stream && camAccess.deviceId && cameraProblem(failure) === "missing") {
+      // The camera picked last time is gone (unplugged): use the default one instead.
+      camAccess.deviceId = "";
+      store.set("aegismesh.camera", "");
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(cameraConstraints(""));
+      } catch (error) {
+        failure = error;
+      }
+    }
+    if (!stream) {
+      const problem = cameraProblem(failure);
+      if (!problem) {
+        setCamAccess(before === "asking" ? "unknown" : before);
+        throw failure;
+      }
+      setCamAccess(problem);
+      throw new Error(`${$("cam-state-title").textContent}. ${$("cam-state-text").textContent}`);
+    }
+    const track = stream.getVideoTracks()[0];
+    camAccess.activeLabel = (track && track.label) || "";
+    if (track) {
+      // stop() never fires "ended", so this only runs when the camera really goes away.
+      track.addEventListener("ended", () => {
+        if (cam.stream === stream) stopCamera();
+        if (signs.stream === stream) stopSigns();
+        setCamAccess("missing");
+        toast("The camera was disconnected.", true);
+      });
+    }
+    setCamAccess("granted");
+    listCameras();
+    return stream;
+  }
+
+  async function listCameras() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+    let devices = [];
+    try {
+      devices = await navigator.mediaDevices.enumerateDevices();
+    } catch (e) {
+      return;
+    }
+    const cameras = devices.filter((d) => d.kind === "videoinput");
+    camAccess.cameras = cameras;
+    const labelled = cameras.some((c) => c.label);
+    const pick = $("cam-pick");
+    pick.innerHTML = cameras.map((c, i) => `<option value="${esc(c.deviceId)}">${esc(c.label || `Camera ${i + 1}`)}</option>`).join("");
+    const active = cameras.find((c) => c.label && c.label === camAccess.activeLabel);
+    const chosen = cameras.find((c) => c.deviceId === camAccess.deviceId) || active;
+    if (chosen) pick.value = chosen.deviceId;
+    // Camera names are only visible once the camera has been allowed, so a picker before that
+    // would be a list of "Camera 1, Camera 2".
+    $("cam-pick-wrap").hidden = cameras.length < 2 || !labelled;
+  }
+
+  async function watchCameraPermission() {
+    let status = null;
+    try {
+      status = await navigator.permissions.query({ name: "camera" });
+    } catch (e) {
+      status = null;
+    }
+    const apply = () => {
+      if (!status) setCamAccess("unknown");
+      else if (status.state === "granted") setCamAccess("granted");
+      else if (status.state === "denied") setCamAccess("denied");
+      else setCamAccess("prompt");
+      listCameras();
+    };
+    apply();
+    if (status) status.onchange = apply;
+  }
+
+  async function allowCamera() {
+    const stream = await openCamera();
+    // Asking was the point; each camera card opens the camera itself when it starts.
+    for (const track of stream.getTracks()) track.stop();
+    toast("Camera allowed. Start the camera tap test or Start watching for emergency signs.");
+  }
+
+  async function switchCamera() {
+    camAccess.deviceId = $("cam-pick").value;
+    store.set("aegismesh.camera", camAccess.deviceId);
+    if (cam.stream && !cam.synthetic) await startCamera("real");
+    else if (signs.stream) {
+      stopSigns();
+      await startSigns();
+    }
+  }
+
+  function setTip(id, text) {
+    const el = $(id);
+    if (el.textContent !== (text || "")) el.textContent = text || "";
+    el.hidden = !text;
+  }
+
   async function startCamera(kind) {
     stopCamera();
     if (signs.stream) stopSigns();
     let stream;
     if (kind === "real") {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("This window has no camera access.");
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
-          audio: false,
-        });
-      } catch (error) {
-        const name = error && error.name;
-        if (name === "NotAllowedError" || name === "SecurityError") throw new Error("Camera permission was denied. Allow it in the prompt or in system privacy settings, or use the simulated camera.");
-        if (name === "NotFoundError" || name === "OverconstrainedError") throw new Error("No camera found. Use the simulated camera or the self-test instead.");
-        if (name === "NotReadableError") throw new Error("The camera is busy in another app. Close it and try again.");
-        throw error;
-      }
+      stream = await openCamera();
     } else {
       cam.synthetic = new SyntheticCamera();
       stream = cam.synthetic.stream;
@@ -582,6 +749,7 @@
     cam.recording = false;
     $("cam-video").srcObject = null;
     $("countdown").hidden = true;
+    setTip("cam-tip", null);
     setCameraUi(false);
   }
 
@@ -797,18 +965,12 @@
   async function startSigns() {
     if (cam.stream) stopCamera();
     await loadVision();
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("This window has no camera access.");
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } }, audio: false });
-    } catch (error) {
-      const name = error && error.name;
-      if (name === "NotAllowedError" || name === "SecurityError") throw new Error("Camera permission was denied. Allow it in the prompt or in system privacy settings.");
-      if (name === "NotFoundError" || name === "OverconstrainedError") throw new Error("No camera found.");
-      if (name === "NotReadableError") throw new Error("The camera is busy in another app. Close it and try again.");
-      throw error;
-    }
+    const stream = await openCamera();
     signs.stream = stream;
+    signs.lastSeen = performance.now();
+    signs.lastTip = 0;
+    signs.fpsFrames = 0;
+    signs.fpsSince = performance.now();
     signs.watcher = new window.AegisSigns.SignWatcher({ enabled: signs.enabled, customs: signs.customs });
     const video = $("sign-video");
     video.srcObject = stream;
@@ -829,6 +991,8 @@
     const overlay = $("sign-overlay");
     overlay.getContext("2d").clearRect(0, 0, overlay.width, overlay.height);
     hud("");
+    setTip("sign-tip", null);
+    if (vision.hand) setVisionStatus(`On-device vision ready (${vision.delegate}); nothing is sent anywhere`, "ok");
     setSignUi(false);
   }
 
@@ -878,6 +1042,16 @@
       face: faceResult && faceResult.faceBlendshapes && faceResult.faceBlendshapes[0] ? faceResult.faceBlendshapes[0].categories : null,
     };
     drawSignOverlay(video, handResult, faceResult);
+    if (frame.hands.length || frame.face) signs.lastSeen = now;
+    signs.fpsFrames++;
+    if (now - signs.lastTip > 700) {
+      const fps = (signs.fpsFrames * 1000) / Math.max(1, now - signs.fpsSince);
+      signs.fpsFrames = 0;
+      signs.fpsSince = now;
+      signs.lastTip = now;
+      setVisionStatus(`Watching on this device (${vision.delegate}, ${fps.toFixed(0)} fps); nothing is sent anywhere`, "ok");
+      setTip("sign-tip", signTip(video, frame, now, fps));
+    }
     if (signs.teaching) {
       collectTeaching(frame, now);
       return;
@@ -889,6 +1063,39 @@
       if (!$("sign-discreet").checked) hud(describeStatus(status));
     }
     for (const event of events) onSignTriggered(event);
+  }
+
+  const lumaCanvas = document.createElement("canvas");
+  lumaCanvas.width = 32;
+  lumaCanvas.height = 24;
+  const lumaCtx = lumaCanvas.getContext("2d", { willReadFrequently: true });
+
+  function frameBrightness(video) {
+    lumaCtx.drawImage(video, 0, 0, 32, 24);
+    const data = lumaCtx.getImageData(0, 0, 32, 24).data;
+    let sum = 0;
+    for (let i = 0; i < data.length; i += 4) sum += (data[i] * 77 + data[i + 1] * 150 + data[i + 2] * 29) >> 8;
+    return sum / (data.length / 4);
+  }
+
+  // The most useful single piece of advice for the current frame, or null when all is well:
+  // the things that make signs go unrecognised are light, distance and framing.
+  function signTip(video, frame, now, fps) {
+    const brightness = frameBrightness(video);
+    if (brightness < TOO_DARK) return "Too dark to see signs reliably: turn on a light or face a window.";
+    if (brightness > TOO_BRIGHT) return "The picture is washed out: move away from a bright window or lamp behind you.";
+    if (now - signs.lastSeen > 2500) return "No hand or face in view: face the camera from about an arm's length away.";
+    const hand = frame.hands[0];
+    if (hand) {
+      let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+      for (const p of hand.landmarks) {
+        x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y);
+      }
+      if (x0 < 0.01 || y0 < 0.01 || x1 > 0.99 || y1 > 0.99) return "Part of your hand is outside the picture: keep the whole hand in view.";
+      if (Math.max(y1 - y0, (x1 - x0) * frame.aspect) < 0.15) return "Your hand looks small to the camera: bring it a little closer.";
+    }
+    if (fps < 10) return `Recognition is slow on this computer (${fps.toFixed(0)} fps): hold each sign a little longer, or close other heavy apps.`;
+    return null;
   }
 
   function describeStatus(status) {
@@ -1239,6 +1446,12 @@
     $("cal-build").addEventListener("click", (e) => guarded(e.currentTarget, "Building…", buildProfile));
     $("cal-reset").addEventListener("click", resetProfile);
 
+    // Not guarded(): the camera state sets this button's label ("Try again") and visibility.
+    $("cam-allow").addEventListener("click", () => allowCamera().catch((error) => toast(errorText(error), true)));
+    $("cam-pick").addEventListener("change", () => switchCamera().catch((error) => toast(errorText(error), true)));
+    if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+      navigator.mediaDevices.addEventListener("devicechange", listCameras);
+    }
     $("cam-start").addEventListener("click", (e) => guarded(e.currentTarget, "Starting…", () => startCamera("real")));
     $("cam-synthetic").addEventListener("click", (e) => guarded(e.currentTarget, "Starting…", () => startCamera("synthetic")));
     $("cam-stop").addEventListener("click", stopCamera);
@@ -1289,6 +1502,7 @@
     wire();
     drawTaps($("tap-timeline"), []);
     setCameraUi(false);
+    watchCameraPermission();
     updateCalibration();
     if (!connected()) {
       const banner = $("banner");

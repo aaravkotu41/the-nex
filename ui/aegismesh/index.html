@@ -74,6 +74,22 @@
       </div>
     </section>
 
+    <section class="card wide cam-access" id="card-camaccess">
+      <div class="cam-state" id="cam-state" data-tone="">
+        <span class="dot" aria-hidden="true"></span>
+        <div>
+          <b id="cam-state-title">Camera</b>
+          <span id="cam-state-text">Checking camera access…</span>
+        </div>
+      </div>
+      <div class="row wrap cam-actions">
+        <label class="inline" id="cam-pick-wrap" hidden>Camera
+          <select id="cam-pick" aria-label="Which camera"></select>
+        </label>
+        <button class="btn primary" id="cam-allow">Allow camera</button>
+      </div>
+    </section>
+
     <section class="card wide" id="card-camera">
       <div class="card-head">
         <h2>Camera tap test</h2>
@@ -93,6 +109,7 @@
             <button class="btn ghost" id="cam-stop" disabled>Stop</button>
             <button class="btn ghost" id="cam-selftest" title="Runs a simulated hand through the camera pipeline frame by frame">Self-test</button>
           </div>
+          <p class="tip" id="cam-tip" role="status" hidden></p>
           <canvas id="cam-energy" class="timeline" height="120"></canvas>
           <div class="row wrap">
             <button class="btn primary" id="cam-record" disabled>Record</button>
@@ -128,6 +145,7 @@
             </label>
           </div>
           <div class="vision-status" id="vision-status"><span class="dot"></span><span id="vision-text">On-device vision not loaded yet</span></div>
+          <p class="tip" id="sign-tip" role="status" hidden></p>
           <ul class="sign-list" id="sign-list"></ul>
           <div class="teach">
             <h3>Teach your own sign or expression</h3>
