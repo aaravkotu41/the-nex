@@ -47,21 +47,42 @@ anomalies, import count, risky APIs (injection, keylogging, downloading, credent
 signature presence, appended data, packer section names, resources, .NET and Mach-O.
 
 **How it is trained** (`scripts/train_onnx.py`, runs in CI):
-- benign: `data/benign_pe_features.csv`, features of 14,515 real Windows programs (system
-  files, .NET assemblies, installed apps, unsigned developer tools) from
-  `scripts/build_dataset.py`, plus synthetic installers and macOS programs;
+- benign: `data/benign_pe_features.csv`, features of 20,872 real Windows programs (system
+  files, .NET assemblies, machine-wide and per-user apps, unsigned developer tools) from
+  `scripts/build_dataset.py`, each with an anonymous number for its application, plus
+  synthetic installers and macOS programs;
 - malicious: synthetic profiles of documented malware traits (packed, crypted, injectors and
   stealers, droppers, obfuscated .NET, Mac stealers). No malware is downloaded or stored;
-- signature dropout, because validly signed files are trusted and never reach the model;
-- calibrated so that at most 0.5% of held-out real programs reach the quarantine threshold.
+- signature-blind: validly signed files are trusted and never reach the model, so a signature
+  block it does see has failed verification, and anyone can staple one on. The network has no
+  connection to that input at all;
+- trained against free disguises: junk appended to the file and extra harmless imports;
+- an ensemble of five small networks, exported as one graph;
+- tested on whole applications it never saw, and calibrated so that about 0.5% of unseen real
+  programs reach the quarantine threshold.
 
-**Measured** (before → after this model): on 1,927 real user-installed apps it never saw,
-false positives fell from 3.27% to 0.88%; on fresh samples of the seven malware-trait
-families, detection rose from 36% to 90%. The malware figures come from synthetic profiles, so
-treat them as a regression benchmark, not a real-world detection rate. Mac programs are the
-weakest spot (no real Mac training data yet): interpreters, VMs and browsers import the same
-"risky" functions as stealers, so on macOS the model leans on packing and code structure, and
-CI checks it against the runner's own OS and third-party programs on every push.
+**Measured** (the 0.3.0 model → this one, on the same held-out data: five different sets of
+applications this model never trained on, 20,870 program scores; the 0.3.0 model had seen
+most of them):
+- clean programs flagged: 0.82% → 0.46% (at the process-kill level: 0.23% → 0.13%). The 0.3.0
+  model was calibrated for 0.5% with signatures counted in its favour, which production
+  never does;
+- malware disguised with a fake signature block, appended junk and extra imports together:
+  54% → 89% detected (fake signature alone 90% → 94%);
+- plain malware: unchanged for packed, crypted, injector and packed-Mac profiles (within 0.4
+  points), droppers 92.7% → 90.8%, and .NET 89% → 73%. That last drop is deliberate: a quarter
+  of the synthetic .NET malware is unobfuscated and has exactly the shape of an ordinary .NET
+  program, and the 0.3.0 model "caught" part of it by flagging clean .NET applications (and
+  lost all but 6% of its .NET detections to a few extra imports; this model keeps 76%).
+
+The malware figures come from synthetic profiles, so treat them as a regression benchmark, not
+a real-world detection rate. What still slips through: droppers that pad themselves to look
+like installers (62% caught with all three disguises), unobfuscated .NET malware, and anything
+over 100 MB, which is not scored at all. Mac programs are the weakest spot (no real Mac
+training data yet): interpreters, VMs and browsers import the same "risky" functions as
+stealers, so on macOS the model leans on packing and code structure, and CI checks it against
+the runner's own OS and third-party programs on every push. The fallback used when the model
+file is missing is a fixed formula that still trusts signature blocks.
 
 **Running programs:** stopping a process cannot be undone, so the AI only terminates (and
 quarantines) a newly started program at a score of 0.90 or more; between 0.65 and 0.90, and for

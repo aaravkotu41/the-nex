@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Train The Nex binary classifier (v2) and export it as a tract-compatible ONNX graph.
+"""Train The Nex binary classifier (v3) and export it as a tract-compatible ONNX graph.
 
 Data
-  benign    data/benign_pe_features.csv: ~14.5k REAL Windows programs and libraries (system
-            files, .NET assemblies, installed applications and unsigned developer tools), made
-            by scripts/build_dataset.py. Plus synthetic profiles of what a folder scan of a
-            clean machine cannot contain: installers (large appended payloads),
+  benign    data/benign_pe_features.csv: ~21k REAL Windows programs and libraries (system
+            files, .NET assemblies, machine-wide and per-user applications, unsigned developer
+            tools), made by scripts/build_dataset.py. Plus synthetic profiles of what a folder
+            scan of a clean machine cannot contain: installers (large appended payloads),
             protector-wrapped commercial software and macOS Mach-O programs.
   malicious synthetic profiles of well-documented malware traits: packed, crypted, process
             injectors / stealers / keyloggers, droppers, obfuscated .NET and Mach-O stealers.
@@ -13,17 +13,39 @@ Data
 
 Features come from scripts/thenex_features.py, which mirrors crates/the-nex-core/src/bin_ai.rs.
 
-Signature dropout: on Windows a file with a VALID signature is trusted and never scored, so in
-production the model mostly sees unsigned files. Every signed real benign program is therefore
-also trained on with its signature removed: the model has to judge the code, not the
-certificate.
+Unseen applications: every real program carries the (anonymous) number of its application.
+Whole applications are held out for the final test, so the false-positive rate printed here is
+for software the model has never seen, not for more files of programs it trained on.
 
-Calibration: after training, the output bias is lowered (if needed) so that at most
---target-fpr of held-out REAL benign programs reach the quarantine threshold. Training fails
-when held-out detection drops below --min-tpr.
+Signature blindness: a file with a VALID signature is trusted by the platform check and never
+scored, so the only signature blocks the model meets in production are ones that failed that
+check (or, on macOS, free ad-hoc signatures), and an attacker can staple one onto anything.
+The network therefore has no connection to the has_signature input at all: those first-layer
+weights are fixed at zero. The model has to judge the code; a signature block changes nothing.
 
-Graph: Gemm -> Relu -> Gemm -> Relu -> Gemm -> Sigmoid at opset 13, default domain only (no
-ai.onnx.ml); input "features" [N, 14] float32, output "probability" [N, 1] float32.
+Look-alikes: a quarter of the synthetic .NET malware is unobfuscated, and so has exactly the
+shape of an ordinary .NET program. Training on those does not teach the model to find them; it
+teaches it to flag clean .NET applications that happen to sit at the edge of normal (measured:
+half of the false positives on unseen applications were ordinary .NET files of one program).
+They are left out of training (--dotnet-lookalike 0) and kept in the held-out test, where
+the .NET detection figure therefore tops out near 75%: what these features can honestly see.
+
+Evasion training: an attacker can also grow a file for free, by appending junk after the image
+or importing extra harmless functions. A share of the PE malware profiles is trained in those
+padded forms, and the held-out test reports detection for each disguise and all three at once.
+
+Ensemble: --members small networks are trained together, each on its own random batches and
+each without one fold of the real programs. Their logits are averaged; the export folds them
+into ONE Gemm -> Relu -> Gemm -> Relu -> Gemm -> Sigmoid graph (block-diagonal weights), so the
+runtime sees the same kind of model as before.
+
+Calibration: every real training program is scored by the member that never saw its
+application. The output bias is lowered (if needed) until at most --target-fpr of them reach
+the quarantine threshold. Training fails when held-out
+detection drops below --min-tpr, or below --min-evasive-tpr with all three disguises applied.
+
+Graph: opset 13, default domain only (no ai.onnx.ml); input "features" [N, 14] float32, output
+"probability" [N, 1] float32.
 """
 
 import argparse
@@ -47,6 +69,7 @@ IR_VERSION = 7
 ALLOWED_OPS = {"Gemm", "Relu", "Sigmoid"}
 HIDDEN = (32, 16)
 THRESHOLD = 0.65  # config::AI_MALWARE_THRESHOLD
+KILL_CONFIDENCE = 0.9  # process_guard::PROCESS_KILL_CONFIDENCE
 SIGNED = tf.FEATURE_NAMES.index("has_signature")
 IS_DOTNET = tf.FEATURE_NAMES.index("is_dotnet")
 
@@ -160,10 +183,12 @@ class Synth:
             resource_bytes=resource,
         )
 
-    def dotnet(self):
-        """.NET stealers/RATs: one import by design; obfuscators and packed payloads raise entropy."""
+    def dotnet(self, lookalike=0.25):
+        """.NET stealers/RATs: one import by design; obfuscators and packed payloads raise entropy.
+        `lookalike`: the share left unobfuscated, which these features cannot tell from an
+        ordinary .NET program."""
         size = self.logu(20e3, 4e6)
-        entry_e = self.u(7.0, 7.9) if self.chance(0.75) else self.u(5.2, 6.4)
+        entry_e = self.u(5.2, 6.4) if self.chance(lookalike) else self.u(7.0, 7.9)
         return tf.profile(
             size_bytes=size, max_section_entropy=max(entry_e, self.u(4.0, 6.5)), entry_section_entropy=entry_e,
             section_count=self.weighted([2, 3], [0.3, 0.7]), import_count=1, dotnet=True,
@@ -260,78 +285,148 @@ MALICIOUS_FAMILIES = {  # name -> share of the malicious class
 # legitimate runtimes, so they are reported but not gated.
 GATED_FAMILIES = ["packed", "crypted", "injector", "dropper", "dotnet", "macho_packed"]
 SYNTHETIC_BENIGN = {"installer": 2500, "protected_app": 300, "macho_benign": 6000, "macho_runtime": 3000}
-KILL_CONFIDENCE = 0.9  # process_guard::PROCESS_KILL_CONFIDENCE
+# How much one training row of a synthetic benign family counts. Padded malware looks more like
+# an installer than plain malware does, so installers count double to keep them cleared.
+BENIGN_WEIGHT = {"installer": 2.0}
+
+
+def features_of(profiles):
+    return np.array([tf.features(p) for p in profiles], dtype=np.float32)
 
 
 def synth_rows(synth, family, n):
     make = getattr(synth, family)
-    return np.array([tf.features(make()) for _ in range(n)], dtype=np.float32)
+    return features_of([make() for _ in range(n)])
+
+
+# ---------------------------------------------------------------- disguises an attacker gets for free
+
+def pad_overlay(p, synth):
+    """Junk appended after the image: the file grows, nothing inside it changes."""
+    q = dict(p)
+    pad = p["size_bytes"] * synth.logu(0.3, 20.0)
+    q["size_bytes"] = p["size_bytes"] + pad
+    q["overlay_bytes"] = p["overlay_bytes"] + pad
+    return q
+
+
+def pad_imports(p, synth):
+    """Extra harmless functions in the import table."""
+    q = dict(p)
+    q["import_count"] = p["import_count"] + int(synth.logu(20, 400))
+    return q
+
+
+def staple_signature(p):
+    """A signature block that does not verify (copied from another file, or self-made)."""
+    q = dict(p)
+    q["signed"] = True
+    return q
+
+
+DISGUISES = ["plain", "fake signature", "padded file", "extra imports", "all three"]
+
+
+def disguised(profiles, synth):
+    """{disguise: feature rows} for held-out malware. Mach-O has no overlay to pad."""
+    out = {"plain": features_of(profiles), "fake signature": features_of([staple_signature(p) for p in profiles])}
+    macho = profiles[0]["format"] == "macho"
+    out["padded file"] = features_of([p if macho else pad_overlay(p, synth) for p in profiles])
+    out["extra imports"] = features_of([pad_imports(p, synth) for p in profiles])
+    out["all three"] = features_of([pad_imports(p if macho else pad_overlay(staple_signature(p), synth), synth)
+                                    for p in profiles])
+    return out
 
 
 # ---------------------------------------------------------------- data
 
 def load_benign(path):
+    """(categories, application numbers, feature rows). Datasets made before application numbers
+    existed get one number per row, which makes the split a plain random one."""
     if not path.is_file():
         raise SystemExit(f"{path} is missing; run scripts/build_dataset.py on a Windows machine")
     with open(path, newline="", encoding="utf-8") as fh:
         reader = csv.reader(fh)
         header = next(reader)
-        if header[1:] != tf.FEATURE_NAMES:
-            raise SystemExit(f"{path} has features {header[1:]}, expected {tf.FEATURE_NAMES}; rebuild it")
         rows = list(reader)
+    first = 2 if header[:2] == ["category", "group"] else 1
+    if header[first:] != tf.FEATURE_NAMES:
+        raise SystemExit(f"{path} has features {header[first:]}, expected {tf.FEATURE_NAMES}; rebuild it")
     categories = np.array([r[0] for r in rows])
-    x = np.array([[float(v) for v in r[1:]] for r in rows], dtype=np.float32)
-    return categories, x
+    groups = np.array([int(r[1]) for r in rows]) if first == 2 else np.arange(len(rows))
+    x = np.array([[float(v) for v in r[first:]] for r in rows], dtype=np.float32)
+    return categories, groups, x
 
 
-def signature_dropout(x):
-    signed = x[x[:, SIGNED] > 0.5].copy()
-    signed[:, SIGNED] = 0.0
-    return np.concatenate([x, signed])
+def hold_out_groups(groups, rng, share):
+    """Mask of rows whose whole application is held out (about `share` of the rows)."""
+    ids, counts = np.unique(groups, return_counts=True)
+    held = set()
+    filled = 0
+    for i in rng.permutation(len(ids)):
+        if filled + counts[i] <= len(groups) * share:
+            held.add(ids[i])
+            filled += counts[i]
+    return np.isin(groups, list(held))
 
 
 def build_sets(args, rng):
-    categories, real = load_benign(args.data)
-    order = rng.permutation(len(real))
-    n_cal = n_test = int(len(real) * 0.15)
-    test_idx, cal_idx, train_idx = order[:n_test], order[n_test:n_test + n_cal], order[n_test + n_cal:]
+    categories, groups, real = load_benign(args.data)
+    test = hold_out_groups(groups, rng, args.test_share)
+    real_train, groups_train = real[~test], groups[~test]
+    # Each ensemble member trains without one fold of the applications; the member that never saw
+    # an application is the one that scores it for calibration.
+    ids = np.unique(groups_train)
+    fold_of = dict(zip(ids, rng.integers(0, args.members, len(ids))))
+    real_fold = np.array([fold_of[g] for g in groups_train])
 
     synth = Synth(rng)
-    benign_train = [signature_dropout(real[train_idx])]
-    benign_test = {"real": (real[test_idx], categories[test_idx])}
+    benign_parts, benign_weights = [real_train], [np.ones(len(real_train), dtype=np.float32)]
+    benign_test = {"real": (real[test], categories[test])}
     for family, n in SYNTHETIC_BENIGN.items():
         rows = synth_rows(synth, family, n)
         split = int(n * 0.8)
-        benign_train.append(rows[:split])
+        benign_parts.append(rows[:split])
+        benign_weights.append(np.full(split, BENIGN_WEIGHT.get(family, 1.0), dtype=np.float32))
         benign_test[family] = (rows[split:], None)
-    benign_train = np.concatenate(benign_train)
+    benign_train = np.concatenate(benign_parts)
 
     n_mal = int(len(benign_train) * args.malicious_ratio)
     malicious_train, malicious_test = [], {}
     for family, share in MALICIOUS_FAMILIES.items():
-        n = int(n_mal * share / 0.8)
-        rows = synth_rows(synth, family, n)
-        split = int(n * 0.8)
-        malicious_train.append(rows[:split])
-        malicious_test[family] = rows[split:]
+        make = getattr(synth, family)
+        profiles = []
+        for _ in range(int(n_mal * share)):
+            p = synth.dotnet(lookalike=args.dotnet_lookalike) if family == "dotnet" else make()
+            if p["format"] != "macho":  # padding a Mac stealer makes it a Mac runtime: not trainable
+                if synth.chance(args.evasion):
+                    p = pad_overlay(p, synth)
+                if synth.chance(args.evasion):
+                    p = pad_imports(p, synth)
+            profiles.append(p)
+        malicious_train.append(features_of(profiles))
+        malicious_test[family] = disguised([make() for _ in range(int(n_mal * share / 4))], synth)
     malicious_train = np.concatenate(malicious_train)
 
     x = np.concatenate([benign_train, malicious_train])
     y = np.concatenate([np.zeros(len(benign_train)), np.ones(len(malicious_train))]).astype(np.float32)
+    w = np.concatenate(benign_weights + [np.ones(len(malicious_train), dtype=np.float32)])
     flip = rng.random(len(y)) < args.label_noise
     y[flip] = 1.0 - y[flip]
-    shuffle = rng.permutation(len(x))
-    return x[shuffle], y[shuffle].reshape(-1, 1), real[cal_idx], benign_test, malicious_test
+    # fold[i] = the member that must not train on row i (-1: every member may).
+    fold = np.full(len(x), -1)
+    fold[:len(real_train)] = real_fold
+    return x, y, w, fold, benign_test, malicious_test
 
 
-# ---------------------------------------------------------------- model
+# ---------------------------------------------------------------- model (members stacked on axis 0)
 
-def init_params(rng):
+def init_params(rng, members):
     sizes = (N_FEATURES,) + HIDDEN + (1,)
     params = []
     for fan_in, fan_out in zip(sizes[:-1], sizes[1:]):
-        params.append(rng.normal(0.0, np.sqrt(2.0 / fan_in), (fan_in, fan_out)).astype(np.float32))
-        params.append(np.zeros(fan_out, dtype=np.float32))
+        params.append(rng.normal(0.0, np.sqrt(2.0 / fan_in), (members, fan_in, fan_out)).astype(np.float32))
+        params.append(np.zeros((members, 1, fan_out), dtype=np.float32))
     return params
 
 
@@ -340,70 +435,89 @@ def sigmoid(z):
 
 
 def forward(params, x):
+    """x: [n, f] (every member scores the same rows) or [members, n, f]. Returns per-member
+    logits [members, n] and the activations."""
     w1, b1, w2, b2, w3, b3 = params
     z1 = x @ w1 + b1
     h1 = np.maximum(z1, 0.0)
     z2 = h1 @ w2 + b2
     h2 = np.maximum(z2, 0.0)
     z3 = h2 @ w3 + b3
-    return sigmoid(z3), (x, z1, h1, z2, h2, z3)
+    return z3[..., 0], (z1, h1, z2, h2)
+
+
+def member_logits(params, x, chunk=20000):
+    return np.concatenate([forward(params, x[i:i + chunk])[0] for i in range(0, len(x), chunk)], axis=1)
 
 
 def logits(params, x):
-    return forward(params, x)[1][5].ravel()
+    """The ensemble's logit: the mean of its members'."""
+    return member_logits(params, x).mean(axis=0)
 
 
-def gradients(params, x, y, weight_decay):
-    w1, _, w2, _, w3, _ = params
-    p, (x0, z1, h1, z2, h2, _) = forward(params, x)
-    n = x.shape[0]
-    dz3 = (p - y) / n
-    dw3 = h2.T @ dz3 + weight_decay * w3
-    db3 = dz3.sum(axis=0)
-    dz2 = (dz3 @ w3.T) * (z2 > 0)
-    dw2 = h1.T @ dz2 + weight_decay * w2
-    db2 = dz2.sum(axis=0)
-    dz1 = (dz2 @ w2.T) * (z1 > 0)
-    dw1 = x0.T @ dz1 + weight_decay * w1
-    db1 = dz1.sum(axis=0)
-    return [dw1, db1, dw2, db2, dw3, db3]
+def model_scores(params, x):
+    return sigmoid(logits(params, x))
 
 
-def bce(p, y):
-    p = np.clip(p, 1e-7, 1.0 - 1e-7)
-    return float(-np.mean(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)))
-
-
-def train(x, y, rng, args):
-    params = init_params(rng)
+def train(x, y, w, fold, rng, args):
+    members = args.members
+    params = init_params(rng, members)
+    params[0][:, SIGNED, :] = 0.0  # signature blindness: no connection to that input, ever
     m = [np.zeros_like(p) for p in params]
     v = [np.zeros_like(p) for p in params]
     beta1, beta2, eps = 0.9, 0.999, 1e-8
+    allowed = [np.flatnonzero(fold != k) for k in range(members)]
+    usable = min(len(a) for a in allowed)
     step = 0
     for epoch in range(1, args.epochs + 1):
         lr = args.lr * (0.5 * (1.0 + np.cos(np.pi * (epoch - 1) / args.epochs)))  # cosine decay
-        order = rng.permutation(len(x))
-        for start in range(0, len(x), args.batch_size):
-            batch = order[start:start + args.batch_size]
-            grads = gradients(params, x[batch], y[batch], args.weight_decay)
+        order = np.stack([rng.permutation(a)[:usable] for a in allowed])
+        for start in range(0, usable, args.batch_size):
+            idx = order[:, start:start + args.batch_size]  # [members, batch]
+            xb = x[idx]
+            wb = w[idx]
+            z, (z1, h1, z2, h2) = forward(params, xb)
+            w1, _, w2, _, w3, _ = params
+            dz3 = ((sigmoid(z) - y[idx]) * wb / wb.sum(axis=1, keepdims=True))[..., None]
+            dw3 = h2.transpose(0, 2, 1) @ dz3 + args.weight_decay * w3
+            db3 = dz3.sum(axis=1, keepdims=True)
+            dz2 = (dz3 @ w3.transpose(0, 2, 1)) * (z2 > 0)
+            dw2 = h1.transpose(0, 2, 1) @ dz2 + args.weight_decay * w2
+            db2 = dz2.sum(axis=1, keepdims=True)
+            dz1 = (dz2 @ w2.transpose(0, 2, 1)) * (z1 > 0)
+            dw1 = xb.transpose(0, 2, 1) @ dz1 + args.weight_decay * w1
+            dw1[:, SIGNED, :] = 0.0
+            db1 = dz1.sum(axis=1, keepdims=True)
             step += 1
-            for i, g in enumerate(grads):
+            for i, g in enumerate([dw1, db1, dw2, db2, dw3, db3]):
                 m[i] = beta1 * m[i] + (1.0 - beta1) * g
                 v[i] = beta2 * v[i] + (1.0 - beta2) * g * g
                 m_hat = m[i] / (1.0 - beta1 ** step)
                 v_hat = v[i] / (1.0 - beta2 ** step)
                 params[i] = (params[i] - lr * m_hat / (np.sqrt(v_hat) + eps)).astype(np.float32)
         if epoch % 25 == 0 or epoch == args.epochs:
-            p, _ = forward(params, x)
-            print(f"epoch {epoch:4d}  loss {bce(p, y):.4f}")
+            p = sigmoid(member_logits(params, x))
+            pc = np.clip(p, 1e-7, 1.0 - 1e-7)
+            loss = float(-np.mean(y * np.log(pc) + (1.0 - y) * np.log(1.0 - pc)))
+            print(f"epoch {epoch:4d}  loss {loss:.4f}")
     return params
 
 
-def calibrate(params, benign_cal, target_fpr):
-    """Lower the output bias until at most target_fpr of real benign calibration programs reach the
-    threshold. Returns the shift applied (0 when the model is already inside the budget)."""
+def with_signature(x, bit):
+    out = x.copy()
+    out[:, SIGNED] = bit
+    return out
+
+
+def calibrate(params, x, fold, target_fpr):
+    """Lower the output bias until at most target_fpr of the real training programs reach the
+    threshold, each scored by the member that never saw its application. Returns the shift
+    applied (0 when the model is already inside the budget)."""
+    real = fold >= 0
+    rows, member = x[real], fold[real]
+    scores = member_logits(params, rows)[member, np.arange(len(rows))]
     limit = float(np.log(THRESHOLD / (1.0 - THRESHOLD)))
-    quantile = float(np.quantile(logits(params, benign_cal), 1.0 - target_fpr))
+    quantile = float(np.quantile(scores, 1.0 - target_fpr))
     shift = max(0.0, quantile - limit + 0.05)
     params[5] = (params[5] - shift).astype(np.float32)
     return shift
@@ -415,28 +529,26 @@ def rate(scores, threshold=THRESHOLD):
     return float(np.mean(scores >= threshold)) if len(scores) else float("nan")
 
 
-def model_scores(params, x):
-    return forward(params, x)[0].ravel()
-
-
 def heuristic_scores(x):
     return np.array([tf.heuristic_score(row) for row in x.astype(np.float64)])
 
 
 def evaluate(name, score_fn, benign_test, malicious_test):
+    """Prints the held-out results and returns the gated numbers."""
     print(f"\n{name}: share of each held-out set at or above {THRESHOLD}")
     x_real, cats = benign_test["real"]
-    real_scores = score_fn(x_real)
-    fpr = rate(real_scores)
-    unsigned = x_real[:, SIGNED] < 0.5
-    print(f"  benign real programs       {fpr:7.2%} flagged   (n={len(x_real)}; unsigned only {rate(real_scores[unsigned]):.2%})")
+    # What production scores: no valid signature. A signature block that fails verification
+    # still sets the bit, so both states are reported; the model gives the same answer for both
+    # (the heuristic fallback does not).
+    unsigned_scores = score_fn(with_signature(x_real, 0.0))
+    fpr = rate(unsigned_scores)
+    fpr_signed = rate(score_fn(with_signature(x_real, 1.0)))
+    print(f"  real programs of unseen applications {fpr:7.2%} flagged   (n={len(x_real)}; "
+          f"{fpr_signed:.2%} with a signature block; {rate(unsigned_scores, KILL_CONFIDENCE):.2%} at the "
+          f"{KILL_CONFIDENCE} process-kill level)")
     for cat in sorted(set(cats)):
         mask = cats == cat
-        print(f"    {cat:24s} {rate(real_scores[mask]):7.2%}   (n={mask.sum()})")
-    stripped = x_real.copy()
-    stripped[:, SIGNED] = 0.0
-    print(f"  benign real, signature removed {rate(score_fn(stripped)):7.2%} flagged")
-    print(f"  benign real programs at the {KILL_CONFIDENCE} process-kill level {rate(real_scores, KILL_CONFIDENCE):.2%}")
+        print(f"    {cat:24s} {rate(unsigned_scores[mask]):7.2%}   (n={mask.sum()})")
     synthetic_fpr = {}
     for family in SYNTHETIC_BENIGN:
         rows, _ = benign_test[family]
@@ -444,23 +556,30 @@ def evaluate(name, score_fn, benign_test, malicious_test):
         synthetic_fpr[family] = rate(scores)
         print(f"  benign {family:20s} {synthetic_fpr[family]:7.2%} flagged   (n={len(rows)}; "
               f"{rate(scores, KILL_CONFIDENCE):.2%} at kill level)")
-    caught = []
-    for family, rows in malicious_test.items():
-        r = rate(score_fn(rows))
+    caught = {d: [0.0, 0] for d in DISGUISES}
+    for family, variants in malicious_test.items():
+        rates = {d: rate(score_fn(rows)) for d, rows in variants.items()}
+        n = len(variants["plain"])
         if family in GATED_FAMILIES:
-            caught.append((r, len(rows)))
-        print(f"  malware {family:19s} {r:7.2%} detected  (n={len(rows)}){'' if family in GATED_FAMILIES else '  [reported, not gated]'}")
-    tpr = sum(r * n for r, n in caught) / sum(n for _, n in caught)
-    print(f"  malware (gated families)   {tpr:7.2%} detected")
+            for d in DISGUISES:
+                caught[d][0] += rates[d] * n
+                caught[d][1] += n
+        print(f"  malware {family:14s} {rates['plain']:7.2%} detected  (n={n})  | "
+              + "  ".join(f"{d} {rates[d]:.1%}" for d in DISGUISES[1:])
+              + ("" if family in GATED_FAMILIES else "  [reported, not gated]"))
+    tpr = {d: a / b for d, (a, b) in caught.items()}
+    print(f"  malware (gated families) {tpr['plain']:7.2%} detected  | "
+          + "  ".join(f"{d} {tpr[d]:.1%}" for d in DISGUISES[1:]))
     # Installers and Mac programs only exist synthetically here; gate them separately.
     # (Protected apps are always signed, so on Windows they are trusted and never scored.)
     worst_synthetic = max(synthetic_fpr["installer"], synthetic_fpr["macho_benign"], synthetic_fpr["macho_runtime"])
-    return fpr, tpr, worst_synthetic
+    return {"fpr": fpr, "fpr_signed": fpr_signed, "tpr": tpr["plain"], "tpr_signed": tpr["fake signature"],
+            "tpr_evasive": tpr["all three"], "synthetic_fpr": worst_synthetic}
 
 
 def check_prototypes(name, score_fn):
     names = list(tf.PROTOTYPES)
-    x = np.array([tf.features(tf.PROTOTYPES[n][0]) for n in names], dtype=np.float32)
+    x = features_of([tf.PROTOTYPES[n][0] for n in names])
     scores = score_fn(x)
     print(f"{name} prototypes: " + "  ".join(f"{n}={s:.3f}" for n, s in zip(names, scores)))
     wrong = [n for n, s in zip(names, scores) if (s >= THRESHOLD) != tf.PROTOTYPES[n][1]]
@@ -470,10 +589,27 @@ def check_prototypes(name, score_fn):
 
 # ---------------------------------------------------------------- export
 
-def build_model(params):
+def merged(params):
+    """The ensemble as one network: member weights side by side in the first layer, on the block
+    diagonal in the second, and averaged into a single output in the third."""
     w1, b1, w2, b2, w3, b3 = params
+    members, _, h1 = w1.shape
+    h2 = w2.shape[2]
+    big_w2 = np.zeros((members * h1, members * h2), dtype=np.float32)
+    for k in range(members):
+        big_w2[k * h1:(k + 1) * h1, k * h2:(k + 1) * h2] = w2[k]
+    return [
+        np.concatenate(list(w1), axis=1), np.concatenate([b[0] for b in b1]),
+        big_w2, np.concatenate([b[0] for b in b2]),
+        (np.concatenate(list(w3), axis=0) / members).astype(np.float32),
+        np.array([float(np.mean(b3))], dtype=np.float32),
+    ]
+
+
+def build_model(params):
+    arrays = merged(params)
     initializers = [numpy_helper.from_array(a.astype(np.float32), n)
-                    for a, n in zip(params, ["W1", "B1", "W2", "B2", "W3", "B3"])]
+                    for a, n in zip(arrays, ["W1", "B1", "W2", "B2", "W3", "B3"])]
     nodes = [
         helper.make_node("Gemm", ["features", "W1", "B1"], ["dense1"], name="dense1"),
         helper.make_node("Relu", ["dense1"], ["relu1"], name="relu1"),
@@ -484,7 +620,7 @@ def build_model(params):
     ]
     graph = helper.make_graph(
         nodes,
-        "thenex_binary_classifier_v2",
+        "thenex_binary_classifier_v3",
         [helper.make_tensor_value_info("features", TensorProto.FLOAT, ["N", N_FEATURES])],
         [helper.make_tensor_value_info("probability", TensorProto.FLOAT, ["N", 1])],
         initializer=initializers,
@@ -493,8 +629,8 @@ def build_model(params):
         graph,
         opset_imports=[helper.make_opsetid("", OPSET)],
         producer_name="thenex-train",
-        producer_version="2.0",
-        doc_string="features: " + ", ".join(tf.FEATURE_NAMES),
+        producer_version="3.0",
+        doc_string=f"ensemble of {params[0].shape[0]}; features: " + ", ".join(tf.FEATURE_NAMES),
     )
     model.ir_version = IR_VERSION
     return model
@@ -523,8 +659,7 @@ def verify_against_reference(model, params, x):
     session = ReferenceEvaluator(model)
     sample = x[:512]
     (onnx_out,) = session.run(None, {"features": sample})
-    numpy_out, _ = forward(params, sample)
-    diff = float(np.max(np.abs(onnx_out - numpy_out)))
+    diff = float(np.max(np.abs(onnx_out.ravel() - model_scores(params, sample))))
     if diff > 1e-4:
         raise SystemExit(f"ONNX output diverges from training graph (max |diff| = {diff})")
     print(f"reference evaluator parity: max |diff| = {diff:.2e}")
@@ -534,47 +669,67 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    parser.add_argument("--members", type=int, default=5, help="networks in the ensemble")
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--label-noise", type=float, default=0.01)
     parser.add_argument("--malicious-ratio", type=float, default=0.9)
+    parser.add_argument("--evasion", type=float, default=0.3,
+                        help="chance that a PE malware training profile gets each padding disguise")
+    parser.add_argument("--dotnet-lookalike", type=float, default=0.0,
+                        help="share of .NET malware TRAINING profiles left unobfuscated (the test always has 25%%)")
+    parser.add_argument("--test-share", type=float, default=0.2, help="share of real programs held out, by application")
     parser.add_argument("--target-fpr", type=float, default=0.005)
     parser.add_argument("--min-tpr", type=float, default=0.90)
+    parser.add_argument("--min-evasive-tpr", type=float, default=0.80)
     parser.add_argument("--max-heuristic-fpr", type=float, default=0.03)
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
+    if args.members < 2:
+        raise SystemExit("--members must be at least 2: calibration scores each program with a member that never saw it")
 
     rng = np.random.default_rng(args.seed)
-    x, y, benign_cal, benign_test, malicious_test = build_sets(args, rng)
-    print(f"training rows: {len(x)} ({int(y.sum())} malicious), calibration rows: {len(benign_cal)}")
+    x, y, w, fold, benign_test, malicious_test = build_sets(args, rng)
+    print(f"training rows: {len(x)} ({int(y.sum())} malicious, {int((fold >= 0).sum())} real programs), "
+          f"held-out real programs: {len(benign_test['real'][0])}, ensemble of {args.members}")
 
-    params = train(x, y, rng, args)
-    shift = calibrate(params, benign_cal, args.target_fpr)
+    params = train(x, y, w, fold, rng, args)
+    shift = calibrate(params, x, fold, args.target_fpr)
     print(f"calibration: output bias lowered by {shift:.3f} for a {args.target_fpr:.2%} false-positive budget")
 
-    fpr, tpr, synth_fpr = evaluate("model", lambda rows: model_scores(params, rows), benign_test, malicious_test)
-    h_fpr, h_tpr, h_synth_fpr = evaluate("heuristic fallback", heuristic_scores, benign_test, malicious_test)
+    result = evaluate("model", lambda rows: model_scores(params, rows), benign_test, malicious_test)
+    heuristic = evaluate("heuristic fallback", heuristic_scores, benign_test, malicious_test)
     print()
     check_prototypes("model", lambda rows: model_scores(params, rows))
     check_prototypes("heuristic", heuristic_scores)
-    if tpr < args.min_tpr:
-        raise SystemExit(f"held-out detection {tpr:.2%} is below --min-tpr {args.min_tpr:.0%}")
-    if fpr > 2 * args.target_fpr:
-        raise SystemExit(f"held-out false positives {fpr:.2%} exceed twice the {args.target_fpr:.2%} budget")
-    if synth_fpr > 0.03:
-        raise SystemExit(f"model flags {synth_fpr:.2%} of synthetic benign installers or Mac programs")
-    if max(h_fpr, h_synth_fpr) > args.max_heuristic_fpr:
-        raise SystemExit(f"heuristic fallback flags {max(h_fpr, h_synth_fpr):.2%} of a benign set")
+    if result["tpr"] < args.min_tpr:
+        raise SystemExit(f"held-out detection {result['tpr']:.2%} is below --min-tpr {args.min_tpr:.0%}")
+    if result["tpr_evasive"] < args.min_evasive_tpr:
+        raise SystemExit(f"held-out detection of disguised malware {result['tpr_evasive']:.2%} is below "
+                         f"--min-evasive-tpr {args.min_evasive_tpr:.0%}")
+    # Whole applications are held out, so one unusual program (a dozen similar files) moves this
+    # figure by a few tenths of a percent; three times the budget means the calibration failed.
+    if result["fpr"] > 3 * args.target_fpr:
+        raise SystemExit(f"held-out false positives {result['fpr']:.2%} exceed three times "
+                         f"the {args.target_fpr:.2%} budget")
+    if result["fpr"] != result["fpr_signed"] or result["tpr"] != result["tpr_signed"]:
+        raise SystemExit("the model is not blind to the signature block: "
+                         f"false positives {result['fpr']:.2%} vs {result['fpr_signed']:.2%} with one, "
+                         f"detection {result['tpr']:.2%} vs {result['tpr_signed']:.2%} with one")
+    if result["synthetic_fpr"] > 0.03:
+        raise SystemExit(f"model flags {result['synthetic_fpr']:.2%} of synthetic benign installers or Mac programs")
+    if max(heuristic["fpr"], heuristic["synthetic_fpr"]) > args.max_heuristic_fpr:
+        raise SystemExit(f"heuristic fallback flags {max(heuristic['fpr'], heuristic['synthetic_fpr']):.2%} of a benign set")
 
     model = build_model(params)
     verify_graph(model)
     verify_against_reference(model, params, x)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     onnx.save(model, str(args.out))
-    print(f"wrote {args.out} ({args.out.stat().st_size} bytes)  model: {fpr:.2%} false positives, "
-          f"{tpr:.2%} detection on held-out data")
+    print(f"wrote {args.out} ({args.out.stat().st_size} bytes)  model: {result['fpr']:.2%} false positives on unseen "
+          f"applications, {result['tpr']:.2%} detection ({result['tpr_evasive']:.2%} when disguised) on held-out data")
     return 0
 
 
