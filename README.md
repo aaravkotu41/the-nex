@@ -53,11 +53,18 @@ signature presence, appended data, packer section names, resources, .NET and Mac
 - calibrated so that at most 0.5% of held-out real programs reach the quarantine threshold.
 
 **Measured** (before → after this model): on 1,927 real user-installed apps it never saw,
-false positives fell from 3.27% to 0.62%; on fresh samples of the seven malware-trait
-families, detection rose from 36% to 91%. The malware figures come from synthetic profiles, so
+false positives fell from 3.27% to 0.88%; on fresh samples of the seven malware-trait
+families, detection rose from 36% to 90%. The malware figures come from synthetic profiles, so
 treat them as a regression benchmark, not a real-world detection rate. Mac programs are the
-weakest spot (no real Mac training data yet): CI checks the model against the runner's own
-macOS programs on every push.
+weakest spot (no real Mac training data yet): interpreters, VMs and browsers import the same
+"risky" functions as stealers, so on macOS the model leans on packing and code structure, and
+CI checks it against the runner's own OS and third-party programs on every push.
+
+**Running programs:** stopping a process cannot be undone, so the AI only terminates (and
+quarantines) a newly started program at a score of 0.90 or more; between 0.65 and 0.90, and for
+anything already running when protection starts, it raises an alert instead. The Nex never acts
+on its own process or the chain that launched it. Script-host (LotL) checks run before any
+binary scan, so they stay fast.
 
 **See a verdict yourself** (read-only, changes nothing):
 

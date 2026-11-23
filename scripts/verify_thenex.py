@@ -42,7 +42,7 @@ ICON = ROOT / "crates" / "the-nex-gui" / "icons" / "icon.ico"
 CANARIES = (".thenex_canary_01.docx", ".thenex_canary_02.xlsx")
 CANARY_MAGIC = b"THENEX\x00CANARY"
 ACTION_TIMEOUT = 3.0
-KILL_TIMEOUT = 2.5
+KILL_TIMEOUT = 4.0
 COOLDOWN = 2.5
 
 

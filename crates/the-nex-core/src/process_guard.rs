@@ -4,7 +4,7 @@ use crate::logger;
 use crate::platform;
 use crate::quarantine::{self, Severity, ThreatEvent};
 use crate::status::Telemetry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::panic::{self, AssertUnwindSafe};
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -20,6 +20,35 @@ const EXIT_WAIT_ROUNDS: u32 = 15;
 const EXIT_WAIT_STEP: Duration = Duration::from_millis(200);
 const MAX_TRUST_CACHE: usize = 8192;
 const CMDLINE_LOG_LIMIT: usize = 512;
+/// AI scans per poll stop after this long; the rest wait for the next poll, so command-line
+/// (LotL) checks of new processes are never held up by binary analysis.
+const AI_SCAN_BUDGET: Duration = Duration::from_millis(250);
+const MAX_PENDING_AI: usize = 4096;
+/// Stopping a running program cannot be undone, so the binary AI needs at least this score to
+/// do it; between the configured threshold and this it only raises an alert.
+pub const PROCESS_KILL_CONFIDENCE: f32 = 0.9;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiProcessAction {
+    Ignore,
+    AlertOnly(&'static str),
+    TerminateAndQuarantine,
+}
+
+/// What to do about a running program the binary AI scored. Programs that were already running
+/// when protection started are only reported: a statistical verdict must not kill the apps
+/// someone has open the moment The Nex is installed.
+pub fn ai_process_action(score: f32, threshold: f32, preexisting: bool) -> AiProcessAction {
+    if score < threshold {
+        AiProcessAction::Ignore
+    } else if preexisting {
+        AiProcessAction::AlertOnly("already running when protection started")
+    } else if score < threshold.max(PROCESS_KILL_CONFIDENCE) {
+        AiProcessAction::AlertOnly("below the confidence needed to stop a running program")
+    } else {
+        AiProcessAction::TerminateAndQuarantine
+    }
+}
 
 pub const LOTL_PROCESSES: &[&str] = &[
     "powershell.exe",
@@ -165,6 +194,11 @@ pub struct ProcessGuard {
     /// pid -> start time, so a recycled PID is treated as a new process.
     seen: HashMap<Pid, u64>,
     trust_cache: HashMap<PathBuf, (u64, bool)>,
+    /// (pid, was already running when protection started) waiting for a binary AI scan.
+    pending_ai: VecDeque<(Pid, bool)>,
+    /// The Nex itself and the chain that launched it (shell, terminal, service manager).
+    ancestors: HashSet<Pid>,
+    primed: bool,
 }
 
 impl ProcessGuard {
@@ -180,16 +214,34 @@ impl ProcessGuard {
             sys: System::new(),
             seen: HashMap::new(),
             trust_cache: HashMap::new(),
+            pending_ai: VecDeque::new(),
+            ancestors: HashSet::new(),
+            primed: false,
         }
+    }
+
+    fn ancestor_pids(&self) -> HashSet<Pid> {
+        let mut out = HashSet::new();
+        let mut current = Some(Pid::from_u32(std::process::id()));
+        while let Some(pid) = current {
+            if !out.insert(pid) {
+                break;
+            }
+            current = self.sys.process(pid).and_then(|p| p.parent());
+        }
+        out
     }
 
     pub fn poll(&mut self) {
         if !self.cfg.engine_enabled(Engine::ProcessGuard) {
             // Forget everything so re-enabling inspects what is running at that moment.
             self.seen.clear();
+            self.pending_ai.clear();
+            self.primed = false;
             self.telemetry.processes_watched.store(0, Ordering::Relaxed);
             return;
         }
+        let first_poll = !self.primed;
         self.sys
             .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
         let mut fresh = Vec::new();
@@ -208,30 +260,62 @@ impl ProcessGuard {
         self.telemetry
             .processes_inspected
             .fetch_add(fresh.len() as u64, Ordering::Relaxed);
+        if first_poll {
+            self.ancestors = self.ancestor_pids();
+            self.primed = true;
+        }
+        // Cheap command-line checks first, for every new process, so a malicious script host
+        // is stopped within one poll; binary scans follow within a time budget.
         for pid in fresh {
-            self.inspect(pid);
+            if self.ancestors.contains(&pid) {
+                continue;
+            }
+            if !self.inspect_command(pid) {
+                self.pending_ai.push_back((pid, first_poll));
+            }
+        }
+        while self.pending_ai.len() > MAX_PENDING_AI {
+            self.pending_ai.pop_front();
+        }
+        let started = Instant::now();
+        while started.elapsed() < AI_SCAN_BUDGET {
+            let Some((pid, preexisting)) = self.pending_ai.pop_front() else {
+                break;
+            };
+            self.inspect_binary(pid, preexisting);
         }
     }
 
-    fn inspect(&mut self, pid: Pid) {
+    /// LotL command-line check. True when the process needs nothing more (handled, protected
+    /// or gone).
+    fn inspect_command(&mut self, pid: Pid) -> bool {
+        let Some(process) = self.sys.process(pid) else {
+            return true;
+        };
+        let name = process_name(process);
+        if platform::is_protected_process(pid.as_u32(), &name) {
+            return true;
+        }
+        let cmdline = command_line(process);
+        if let Some(pattern) = check_lotl_command(&name, &cmdline) {
+            self.respond_lotl(pid, &name, &cmdline, pattern);
+            return true;
+        }
+        false
+    }
+
+    fn inspect_binary(&mut self, pid: Pid, preexisting: bool) {
+        if !self.cfg.engine_enabled(Engine::BinAi) {
+            return;
+        }
         let Some(process) = self.sys.process(pid) else {
             return;
         };
         let name = process_name(process);
-        if platform::is_protected_process(pid.as_u32(), &name) {
+        let Some(exe) = process.exe().map(Path::to_path_buf) else {
             return;
-        }
-        let cmdline = command_line(process);
-        let exe = process.exe().map(Path::to_path_buf);
-        if let Some(pattern) = check_lotl_command(&name, &cmdline) {
-            self.respond_lotl(pid, &name, &cmdline, pattern);
-            return;
-        }
-        if let Some(exe) = exe {
-            if self.cfg.engine_enabled(Engine::BinAi) {
-                self.scan_executable(pid, &name, &exe);
-            }
-        }
+        };
+        self.scan_executable(pid, &name, &exe, preexisting);
     }
 
     fn respond_lotl(&mut self, pid: Pid, name: &str, cmdline: &str, pattern: &str) {
@@ -275,14 +359,15 @@ impl ProcessGuard {
         trusted
     }
 
-    fn scan_executable(&mut self, pid: Pid, name: &str, exe: &Path) {
+    fn scan_executable(&mut self, pid: Pid, name: &str, exe: &Path, preexisting: bool) {
         if !exe.is_file() || self.is_trusted(exe) {
             return;
         }
         let Some(score) = self.scanner.scan_file(exe) else {
             return;
         };
-        if score < self.cfg.ai_threshold {
+        let decision = ai_process_action(score, self.cfg.ai_threshold, preexisting);
+        if decision == AiProcessAction::Ignore {
             return;
         }
         let details = format!(
@@ -290,23 +375,36 @@ impl ProcessGuard {
             pid.as_u32(),
             self.scanner.explain(exe, score, self.cfg.ai_threshold)
         );
-        let action = if self.cfg.is_dry_run() {
-            "DRY_RUN: would terminate process and quarantine executable".to_string()
-        } else {
-            let killed = self.kill_all_with_exe(exe);
-            self.wait_for_exit(&killed);
-            let quarantined =
-                match quarantine::quarantine_file(exe, &self.cfg, "MALWARE_AI_PROCESS", &details) {
+        let (severity, action) = match decision {
+            AiProcessAction::Ignore => return,
+            AiProcessAction::AlertOnly(why) => (Severity::High, format!("ALERT_ONLY: {why}")),
+            AiProcessAction::TerminateAndQuarantine if self.cfg.is_dry_run() => (
+                Severity::Critical,
+                "DRY_RUN: would terminate process and quarantine executable".to_string(),
+            ),
+            AiProcessAction::TerminateAndQuarantine => {
+                let killed = self.kill_all_with_exe(exe);
+                self.wait_for_exit(&killed);
+                let quarantined = match quarantine::quarantine_file(
+                    exe,
+                    &self.cfg,
+                    "MALWARE_AI_PROCESS",
+                    &details,
+                ) {
                     Ok(meta) => format!("QUARANTINED id={}", meta.id),
                     Err(e) => format!("QUARANTINE_FAILED: {e}"),
                 };
-            format!("TERMINATED {} process(es); {quarantined}", killed.len())
+                (
+                    Severity::Critical,
+                    format!("TERMINATED {} process(es); {quarantined}", killed.len()),
+                )
+            }
         };
         quarantine::record_event(
             &self.cfg,
             ThreatEvent::new(
                 "MALWARE_AI_PROCESS",
-                Severity::Critical,
+                severity,
                 exe.display().to_string(),
                 action,
                 details,
@@ -322,6 +420,7 @@ impl ProcessGuard {
                 .exe()
                 .is_some_and(|candidate| platform::path_key(candidate) == target);
             if same_image
+                && !self.ancestors.contains(pid)
                 && !platform::is_protected_process(pid.as_u32(), &process_name(process))
                 && process.kill()
             {
@@ -365,6 +464,31 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ai_stops_only_new_programs_with_high_confidence() {
+        assert_eq!(ai_process_action(0.5, 0.65, false), AiProcessAction::Ignore);
+        assert!(matches!(
+            ai_process_action(0.99, 0.65, true),
+            AiProcessAction::AlertOnly(_)
+        ));
+        assert!(matches!(
+            ai_process_action(0.8, 0.65, false),
+            AiProcessAction::AlertOnly(_)
+        ));
+        assert_eq!(
+            ai_process_action(0.95, 0.65, false),
+            AiProcessAction::TerminateAndQuarantine
+        );
+        assert_eq!(
+            ai_process_action(0.92, 0.95, false),
+            AiProcessAction::Ignore
+        );
+        assert_eq!(
+            ai_process_action(0.97, 0.95, false),
+            AiProcessAction::TerminateAndQuarantine
+        );
+    }
 
     #[test]
     fn flags_encoded_and_download_cradles() {

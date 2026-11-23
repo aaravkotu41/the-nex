@@ -661,19 +661,23 @@ pub fn features_in_range(features: &FeatureVector) -> bool {
 
 /// Fallback used when the ONNX model is missing: logistic regression over the same features,
 /// fitted on the training data. Identical to HEURISTIC_* in scripts/thenex_features.py.
-const HEURISTIC_BIAS: f64 = -16.0;
+const HEURISTIC_BIAS: f64 = -15.5;
 const HEURISTIC_WEIGHTS: [f64; FEATURE_COUNT] = [
-    -2.0, 16.5, 7.5, -6.5, 7.5, 1.0, -6.0, 19.0, -2.5, -0.5, 1.0, 2.0, -1.5, -2.5,
+    -1.5, 15.0, 8.5, -7.0, 8.0, 1.5, -7.0, 24.0, -2.0, -0.5, 1.0, 2.5, -2.0, 1.0,
 ];
+/// Interpreters, VMs and browsers on macOS import most of the "risky" symbols, so on Mach-O
+/// they count for much less (weight on is_macho * suspicious_import_ratio).
+const HEURISTIC_MACHO_RISKY: f64 = -17.0;
 
 /// Deterministic logistic score over the same features, used when the model is missing.
 pub fn heuristic_score(features: &FeatureVector) -> f32 {
-    let z = HEURISTIC_WEIGHTS
+    let linear = HEURISTIC_WEIGHTS
         .iter()
         .zip(features)
         .fold(HEURISTIC_BIAS, |z, (weight, value)| {
             z + weight * f64::from(*value)
         });
+    let z = linear + HEURISTIC_MACHO_RISKY * f64::from(features[13]) * f64::from(features[7]);
     (1.0 / (1.0 + (-z).exp())) as f32
 }
 

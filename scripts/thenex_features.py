@@ -118,14 +118,17 @@ def features(p):
 
 # Fallback scorer used when the ONNX model is missing: logistic regression over the same
 # features, fitted on the training data (weights rounded to 0.5; packer names nudged to +1 so a
-# packer always counts against a file) with the bias set for ~0.2% false positives on held-out
+# packer always counts against a file) with the bias set for ~0.15% false positives on held-out
 # real programs. Mirrors bin_ai.rs::HEURISTIC_BIAS / HEURISTIC_WEIGHTS; keep them identical.
-HEURISTIC_BIAS = -16.0
-HEURISTIC_WEIGHTS = [-2.0, 16.5, 7.5, -6.5, 7.5, 1.0, -6.0, 19.0, -2.5, -0.5, 1.0, 2.0, -1.5, -2.5]
+HEURISTIC_BIAS = -15.5
+HEURISTIC_WEIGHTS = [-1.5, 15.0, 8.5, -7.0, 8.0, 1.5, -7.0, 24.0, -2.0, -0.5, 1.0, 2.5, -2.0, 1.0]
+# Interpreters, VMs and browsers on macOS import most of the "risky" symbols, so on Mach-O
+# those count for much less (weight on is_macho * suspicious_import_ratio).
+HEURISTIC_MACHO_RISKY = -17.0
 
 
 def heuristic_score(f):
-    z = HEURISTIC_BIAS + sum(w * v for w, v in zip(HEURISTIC_WEIGHTS, f))
+    z = HEURISTIC_BIAS + sum(w * v for w, v in zip(HEURISTIC_WEIGHTS, f)) + HEURISTIC_MACHO_RISKY * f[13] * f[7]
     return 1.0 / (1.0 + math.exp(-z))
 
 

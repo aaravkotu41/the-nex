@@ -283,7 +283,7 @@ jobs:
         if: ${{ !cancelled() && steps.dmg.outcome == 'success' }}
         run: |
           BIN=target/macos/TheNex.app/Contents/MacOS
-          python scripts/check_feature_parity.py --binary "$BIN/the-nex" --extra "$BIN/the-nex" --extra "$BIN/the-nex-gui" --max-fpr 0.05
+          python scripts/check_feature_parity.py --binary "$BIN/the-nex" --extra "$BIN/the-nex" --extra "$BIN/the-nex-gui" --max-fpr 0.05 --max-fpr-third-party 0.05
 
       - uses: actions/upload-artifact@v7
         if: always()
