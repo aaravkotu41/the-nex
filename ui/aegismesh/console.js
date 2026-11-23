@@ -58,11 +58,16 @@
     if (!t) throw new Error("Open AegisMesh from The Nex or the AegisMesh desktop app to run the simulation.");
     return t.core.invoke("aegismesh", { op, request });
   }
-  // Canvas colours (match console.css).
-  const INK = {
+  // Canvas colours (match console.css), one set per theme.
+  const INK_DARK = {
     grid: "rgba(140,160,255,0.14)", label: "#8E99C2", fg: "#EEF1FF", ok: "#2EE6C5", bad: "#FF5C7A",
-    info: "#6E9BFF", warn: "rgba(255,193,77,0.75)", group: "rgba(110,155,255,0.5)",
+    info: "#6E9BFF", warn: "rgba(255,193,77,0.75)", group: "rgba(110,155,255,0.5)", ghost: "rgba(150,165,220,0.28)",
   };
+  const INK_LIGHT = {
+    grid: "rgba(35,50,110,0.12)", label: "#56607E", fg: "#111832", ok: "#0B9F8C", bad: "#DC3550",
+    info: "#3366F0", warn: "rgba(199,122,6,0.8)", group: "rgba(51,102,240,0.45)", ghost: "rgba(60,80,140,0.22)",
+  };
+  let INK = document.documentElement.dataset.theme === "light" ? INK_LIGHT : INK_DARK;
   const errorText = (e) => (e && e.message) || String(e);
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const pct = (x, digits = 1) => `${(x * 100).toFixed(digits)}%`;
@@ -153,7 +158,7 @@
     if (viewer.failed) { showStill(form); return; }
     if (!viewer.loading) {
       viewer.loading = import("./wearable3d.js")
-        .then((m) => m.createWearableViewer($("form-art")))
+        .then((m) => m.createWearableViewer($("form-art"), { light: document.documentElement.dataset.theme === "light" }))
         .then((api) => { viewer.api = api; return api; });
     }
     viewer.loading
@@ -208,6 +213,7 @@
 
   function renderProfile() {
     const p = state.profile;
+    if (!state.taps.length) drawTaps($("tap-timeline"), []);
     const total = (p.min_total_ms + p.max_total_ms) / 2;
     const pause = Math.min((burstGap(p) + p.max_pause_ms) / 2, 1400);
     const scale = 260 / (total * p.repeats + pause * (p.repeats - 1));
@@ -295,6 +301,17 @@
     ctx.fillStyle = accepted === null ? INK.fg : accepted ? INK.ok : INK.bad;
     for (const t of taps) {
       ctx.beginPath(); ctx.arc(x(t), height / 2, 6, 0, Math.PI * 2); ctx.fill();
+    }
+    if (!taps.length && state.profile) {
+      // Nothing tapped yet: show the rhythm to match as faint dots.
+      ctx.fillStyle = INK.ghost;
+      ctx.strokeStyle = INK.ghost;
+      for (const t of perform(state.profile, 300)) {
+        ctx.beginPath(); ctx.arc(x(t), height / 2, 6, 0, Math.PI * 2); ctx.stroke();
+      }
+      ctx.fillStyle = INK.label;
+      ctx.font = "12px system-ui, sans-serif";
+      ctx.fillText("Tap the pad: your taps appear here. Rings = the rhythm to match.", 14, 20);
     }
   }
 
@@ -561,6 +578,17 @@
     ctx.fillStyle = INK.label;
     ctx.font = "11px ui-monospace, Consolas, monospace";
     ctx.fillText(cam.recording ? "recording motion" : "live motion in the box", 8, 14);
+    if (now - (cam.lastStats || 0) > 400 && cam.live.length > 2) {
+      cam.lastStats = now;
+      const recent = cam.live.filter((s) => now - s.t < 2000);
+      const fps = recent.length > 1 ? (recent.length - 1) / ((recent[recent.length - 1].t - recent[0].t) / 1000) : 0;
+      setStat("stat-fps", `${fps.toFixed(0)} fps`, fps >= 20 ? "good" : fps >= 12 ? "warn" : "bad");
+      const last = cam.live[cam.live.length - 1].energy;
+      setStat("stat-motion", last < 2 ? "still" : last < 8 ? "small" : "moving", last >= 8 ? "good" : "");
+      const b = cam.analyze && cam.analyze.brightness;
+      if (cam.synthetic) setStat("stat-light", "n/a");
+      else if (b !== null && b !== undefined) setStat("stat-light", b < TOO_DARK ? "too dark" : b > TOO_BRIGHT ? "too bright" : "good", b < TOO_DARK || b > TOO_BRIGHT ? "warn" : "good");
+    }
   }
 
   function drawEnergyResult(samples, onsets, accepted) {
@@ -590,7 +618,41 @@
     ctx.fillText(`${onsets.taps_ms.length} taps · threshold ${onsets.threshold.toFixed(1)} · ${onsets.fps.toFixed(0)} fps`, 8, height - 8);
   }
 
+  function setCamStep(step) {
+    for (const li of $("cam-steps").children) {
+      const n = Number(li.dataset.step);
+      li.classList.toggle("done", n < step);
+      li.classList.toggle("current", n === step);
+    }
+  }
+
+  function setStat(id, text, tone = "") {
+    const holder = $(id);
+    holder.textContent = text;
+    holder.className = tone;
+  }
+
+  function resetCamStats() {
+    for (const id of ["stat-fps", "stat-motion", "stat-light", "stat-taps"]) setStat(id, "—");
+  }
+
+  function drawEnergyIdle() {
+    const { ctx, width, height } = sizeCanvas($("cam-energy"));
+    ctx.clearRect(0, 0, width, height);
+    ctx.strokeStyle = INK.grid;
+    ctx.setLineDash([4, 6]);
+    ctx.beginPath(); ctx.moveTo(10, height - 26); ctx.lineTo(width - 10, height - 26); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = INK.label;
+    ctx.font = "12.5px system-ui, sans-serif";
+    ctx.fillText("Motion inside the box is drawn here once the camera is on.", 14, 26);
+    ctx.fillText("Each tap shows as a spike above the dashed line.", 14, 46);
+  }
+
   function setCameraUi(on) {
+    setCamStep(cam.result ? 4 : cam.recording ? 3 : on ? 2 : 1);
+    renderCamFacts();
+    if (!on) resetCamStats();
     $("cam-start").disabled = false;
     $("cam-synthetic").disabled = false;
     $("cam-stop").disabled = !on;
@@ -624,6 +686,38 @@
     unsupported: ["bad", "No camera access in this window", "Cameras need a secure page. Open AegisMesh in The Nex app or in Chrome, Edge or Safari."],
   };
 
+  const PERMISSION_TEXT = {
+    unknown: "not asked yet", prompt: "not asked yet", asking: "asking you…", granted: "allowed",
+    denied: "blocked", missing: "no camera", busy: "in use elsewhere", unsupported: "not available here",
+  };
+
+  function activeVideoTrack() {
+    for (const stream of [cam.stream, signs.stream]) {
+      const track = stream && stream.getVideoTracks()[0];
+      if (track && track.readyState === "live") return { track, user: stream === cam.stream ? "Camera tap test" : "Emergency signs" };
+    }
+    return null;
+  }
+
+  function renderCamFacts() {
+    const holder = $("cam-facts");
+    if (!holder) return;
+    const active = activeVideoTrack();
+    const settings = active && active.track.getSettings ? active.track.getSettings() : {};
+    const simulated = Boolean(active && cam.synthetic && active.user === "Camera tap test");
+    const video = settings.width
+      ? `${settings.width}×${settings.height}${settings.frameRate ? ` · ${Math.round(settings.frameRate)} fps` : ""}`
+      : "—";
+    const named = camAccess.activeLabel || (camAccess.cameras[0] && camAccess.cameras[0].label) || "";
+    const facts = [
+      ["Permission", PERMISSION_TEXT[camAccess.state] || camAccess.state, camAccess.state === "granted" ? "on" : ""],
+      ["In use by", active ? active.user : "nothing (camera off)", active ? "on" : "off"],
+      ["Camera", simulated ? "simulated hand" : named || "default camera", named || simulated ? "" : "off"],
+      ["Video", simulated ? "320×240 · 30 fps" : video, video === "—" && !simulated ? "off" : ""],
+    ];
+    holder.innerHTML = facts.map(([k, v, cls]) => `<div><dt>${esc(k)}</dt><dd class="${cls}" title="${esc(v)}">${esc(v)}</dd></div>`).join("");
+  }
+
   function setCamAccess(next) {
     camAccess.state = next;
     const [tone, title, text] = CAM_STATES[next] || CAM_STATES.unknown;
@@ -636,6 +730,7 @@
     allow.hidden = next === "granted";
     allow.disabled = next === "asking";
     allow.textContent = ["denied", "missing", "busy"].includes(next) ? "Try again" : "Allow camera";
+    renderCamFacts();
   }
 
   function cameraProblem(error) {
@@ -795,7 +890,9 @@
     $("cam-video").srcObject = null;
     $("countdown").hidden = true;
     setTip("cam-tip", null);
+    cam.result = null;
     setCameraUi(false);
+    drawEnergyIdle();
   }
 
   async function showCameraResult(samples, source) {
@@ -807,6 +904,7 @@
     });
     cam.result = result;
     const onsets = result.onsets;
+    setCamStep(4);
     drawEnergyResult(samples, onsets, result.verdict.accepted);
     const expected = (state.profile.ratios.length + 1) * state.profile.repeats;
     let hint = null;
@@ -821,6 +919,8 @@
       .filter(Boolean)
       .join(" · ");
     renderVerdict($("cam-verdict"), result.verdict, extra);
+    setStat("stat-taps", `${onsets.taps_ms.length} of ${expected}`, onsets.taps_ms.length === expected ? "good" : "warn");
+    setStat("stat-fps", `${onsets.fps.toFixed(0)} fps`, onsets.fps >= 20 ? "good" : onsets.fps >= 12 ? "warn" : "bad");
     wearable.flash(result.verdict.accepted ? "ok" : "no");
     $("cam-use").disabled = onsets.taps_ms.length < 3;
   }
@@ -832,6 +932,7 @@
     cam.result = null;
     cam.recording = true;
     cam.recordStart = performance.now();
+    setCamStep(3);
     renderVerdict($("cam-verdict"), null);
     $("cam-use").disabled = true;
     $("cam-record").disabled = true;
@@ -846,7 +947,7 @@
     countdown.hidden = true;
     const stopped = !cam.recording;
     cam.recording = false;
-    if (stopped || !cam.stream) return;
+    if (stopped || !cam.stream) { setCamStep(cam.stream ? 2 : 1); return; }
     await showCameraResult(cam.samples.slice(), cam.synthetic ? "simulated camera" : "your camera");
     $("cam-record").disabled = !cam.stream;
   }
@@ -1035,6 +1136,7 @@
   }
 
   function setSignUi(on) {
+    setTimeout(renderCamFacts, 0);
     $("sign-start").disabled = on;
     $("sign-stop").disabled = !on;
     $("teach-start").disabled = Boolean(signs.teaching);
@@ -1722,6 +1824,37 @@
     window.addEventListener("pagehide", () => { stopCamera(); stopSigns(); });
   }
 
+  function applyTheme(theme) {
+    const light = theme === "light";
+    document.documentElement.dataset.theme = light ? "light" : "dark";
+    INK = light ? INK_LIGHT : INK_DARK;
+    if (viewer.api && viewer.api.setTheme) viewer.api.setTheme(light);
+    drawTaps($("tap-timeline"), state.taps);
+    if (!cam.stream && !cam.result) drawEnergyIdle();
+  }
+
+  function watchTheme() {
+    if (embedded) {
+      try {
+        const root = window.parent.document.documentElement;
+        const sync = () => applyTheme(root.dataset.theme);
+        new MutationObserver(sync).observe(root, { attributes: true, attributeFilter: ["data-theme"] });
+        sync();
+        return;
+      } catch (e) { /* cross-origin parent: keep the default */ }
+    }
+    const KEY = "thenex.theme";
+    const query = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
+    const pref = () => { try { return localStorage.getItem(KEY) || "dark"; } catch (e) { return "dark"; } };
+    const resolved = () => (pref() === "light" || (pref() === "system" && query && query.matches) ? "light" : "dark");
+    applyTheme(resolved());
+    $("theme-toggle").addEventListener("click", () => {
+      try { localStorage.setItem(KEY, document.documentElement.dataset.theme === "light" ? "dark" : "light"); } catch (e) { /* no storage */ }
+      applyTheme(resolved());
+    });
+    if (query && query.addEventListener) query.addEventListener("change", () => applyTheme(resolved()));
+  }
+
   function watchSections() {
     const links = [...document.querySelectorAll(".section-nav a")];
     const byId = new Map(links.map((a) => [a.getAttribute("href").slice(1), a]));
@@ -1744,6 +1877,9 @@
   async function init() {
     wire();
     watchSections();
+    watchTheme();
+    drawEnergyIdle();
+    setCamStep(1);
     drawTaps($("tap-timeline"), []);
     setCameraUi(false);
     watchCameraPermission();

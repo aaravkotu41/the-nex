@@ -12,11 +12,12 @@ const RED = new THREE.Color(0xff4d6d);
 const AMBER = new THREE.Color(0xffc14d);
 const IDLE_GLOW = 0.9;
 
-// How each model is turned to face the camera (radians around X, then Y).
+// How each model is turned to face the camera (radians around X, then Y). A flat model sways
+// instead of spinning, so it never shows its thin edge or its back.
 const POSE = {
   ring: { x: 0.5, y: -0.55, size: 2.15 },
   bracelet: { x: 0.55, y: -0.5, size: 2.5 },
-  clothing_tag: { x: 0.08, y: -0.38, size: 2.7 },
+  clothing_tag: { x: 0.08, y: -0.2, size: 2.7, sway: 0.42 },
 };
 
 function ringTexture() {
@@ -56,7 +57,7 @@ const easeOutBack = (t) => 1 + 2.2 * Math.pow(t - 1, 3) + 1.2 * Math.pow(t - 1, 
  * Mounts a viewer in `host` (a positioned element). Resolves once WebGL is up; rejects when the
  * device has no WebGL so the caller can show the static renders instead.
  */
-export async function createWearableViewer(host, { modelBase = "models/" } = {}) {
+export async function createWearableViewer(host, { modelBase = "models/", light = false } = {}) {
   const reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "low-power" });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -97,14 +98,17 @@ export async function createWearableViewer(host, { modelBase = "models/" } = {})
   controls.autoRotate = !reduceMotion;
   controls.autoRotateSpeed = 1.1;
   let resumeTimer = 0;
+  let idle = true;
+  const spins = () => !reduceMotion && !(current && POSE[current.form] && POSE[current.form].sway);
   controls.addEventListener("start", () => {
     controls.autoRotate = false;
+    idle = false;
     clearTimeout(resumeTimer);
     host.classList.add("grabbing");
   });
   controls.addEventListener("end", () => {
     host.classList.remove("grabbing");
-    if (!reduceMotion) resumeTimer = setTimeout(() => { controls.autoRotate = true; }, 4000);
+    resumeTimer = setTimeout(() => { idle = true; controls.autoRotate = spins(); }, 4000);
   });
 
   const stage = new THREE.Group();
@@ -174,6 +178,7 @@ export async function createWearableViewer(host, { modelBase = "models/" } = {})
     if (current) stage.remove(current.root);
     current = model;
     stage.add(model.root);
+    controls.autoRotate = idle && spins();
     swapStart = performance.now();
     wake();
   }
@@ -182,10 +187,19 @@ export async function createWearableViewer(host, { modelBase = "models/" } = {})
     return sensor.mesh.getWorldPosition(new THREE.Vector3());
   }
 
+  // On a light background an additive glow vanishes, so light mode paints ripples normally.
+  let lightMode = light;
+  function setTheme(isLight) {
+    lightMode = Boolean(isLight);
+    scene.environmentIntensity = lightMode ? 1.0 : 0.85;
+    shadow.material.opacity = lightMode ? 0.45 : 1;
+    wake();
+  }
+
   function ripple(at, colour = TEAL, scale = 1) {
     const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
       map: rippleMap, color: colour, transparent: true, depthWrite: false, depthTest: false,
-      blending: THREE.AdditiveBlending,
+      blending: lightMode ? THREE.NormalBlending : THREE.AdditiveBlending,
     }));
     sprite.position.copy(at);
     sprite.scale.setScalar(0.05);
@@ -255,6 +269,11 @@ export async function createWearableViewer(host, { modelBase = "models/" } = {})
       const pop = reduceMotion ? 1 : 0.82 + 0.18 * easeOutBack(t);
       stage.scale.setScalar(pop);
       stage.position.y = reduceMotion ? 0 : Math.sin(now / 1400) * 0.04;
+      const pose = POSE[current.form] || POSE.ring;
+      if (pose.sway && !reduceMotion) {
+        const target = idle ? pose.y + Math.sin(now / 2600) * pose.sway : current.root.rotation.y;
+        current.root.rotation.y += (target - current.root.rotation.y) * 0.08;
+      }
 
       let flashOn = 0;
       let flashColour = TEAL;
@@ -294,6 +313,7 @@ export async function createWearableViewer(host, { modelBase = "models/" } = {})
     renderer.render(scene, camera);
   }
 
+  setTheme(light);
   resize();
-  return { show, pulse, flash, renderer };
+  return { show, pulse, flash, setTheme, renderer };
 }

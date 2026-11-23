@@ -50,6 +50,20 @@ const state = {
   refreshing: false,
   pendingToggles: new Set(),
   confirm: null,
+  openEvent: null,
+  openQuarantine: null,
+};
+
+const SEARCH_PAGES = new Set(["overview", "activity", "quarantine", "canaries"]);
+const TYPE_NOTES = {
+  ZIP_BOMB: "An archive built to expand far beyond its size and exhaust the disk or memory. It was caught before anything was extracted.",
+  LOTL_SCRIPT: "A built-in tool (PowerShell, cmd, mshta, osascript…) was started the way malware uses it, for example with a hidden window, an encoded command or a download.",
+  MALWARE_AI: "The on-device AI model scored this new program as malicious. The detail line lists what it noticed.",
+  MALWARE_AI_PROCESS: "The on-device AI model scored the image of a running program as malicious.",
+  RANSOMWARE_CANARY: "A decoy file that nothing should touch was changed: the typical first sign of ransomware encrypting files.",
+  RANSOMWARE_SUSPECT: "A program changed many files in a way that looks like ransomware.",
+  QUARANTINE_RESTORE: "You restored this file from quarantine to where it was found.",
+  QUARANTINE_DELETE: "You deleted this file from quarantine for good.",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -93,6 +107,101 @@ function formatDateTime(iso) {
   const date = new Date(iso);
   return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString([], { hour12: false });
 }
+
+function sameDay(a, b) {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+}
+
+/** "20:06:24" today, "Yesterday 19:07" or "Nov 21, 19:07" before that. */
+function formatWhen(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "—";
+  const now = new Date();
+  if (sameDay(date, now)) return date.toLocaleTimeString([], { hour12: false });
+  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (sameDay(date, yesterday)) return `Yesterday ${time}`;
+  return `${date.toLocaleDateString([], { month: "short", day: "numeric" })}, ${time}`;
+}
+
+/** "40 s ago", "5 min ago", "3 h ago", "2 days ago". */
+function relativeTime(iso) {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms)) return "";
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s} s ago`;
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  const days = Math.round(s / 86400);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+
+function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = n / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
+}
+
+function folderOf(path) {
+  const text = String(path || "");
+  const cut = Math.max(text.lastIndexOf("\\"), text.lastIndexOf("/"));
+  return cut > 0 ? text.slice(0, cut) : "";
+}
+
+function severityKey(value) {
+  return String(value || "").toUpperCase();
+}
+
+function copyButton(text, label = "Copy") {
+  const button = el("button", { className: "btn btn-small", text: label, attrs: { type: "button" } });
+  button.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(text);
+      button.textContent = "Copied";
+    } catch {
+      button.textContent = "Copy failed";
+    }
+    setTimeout(() => { button.textContent = label; }, 1400);
+  });
+  return button;
+}
+
+function detailGrid(entries, note) {
+  const grid = el("dl", { className: "detail-grid" });
+  for (const [term, value, copy] of entries) {
+    const dd = el("dd", {}, [el("span", { text: value })]);
+    if (copy) dd.append(copyButton(copy));
+    grid.append(el("dt", { text: term }), dd);
+  }
+  if (note) grid.append(el("p", { className: "detail-note", text: note }));
+  return grid;
+}
+
+/** A clickable row plus its hidden detail row; `open` shows the details. */
+function expandable(cells, detail, open, onToggle, columns) {
+  const row = el("tr", { className: `expand-row${open ? " open" : ""}`, attrs: { tabindex: "0", "aria-expanded": String(open) } }, cells);
+  row.addEventListener("click", (event) => {
+    if (event.target.closest("button")) return;
+    onToggle();
+  });
+  row.addEventListener("keydown", (event) => {
+    if ((event.key === "Enter" || event.key === " ") && event.target === row) {
+      event.preventDefault();
+      onToggle();
+    }
+  });
+  if (!open) return [row];
+  const cell = el("td", { attrs: { colspan: String(columns) } }, [detail]);
+  return [row, el("tr", { className: "detail-row" }, [cell])];
+}
+
+const chevron = () => el("span", { className: "chev", attrs: { "aria-hidden": "true" } });
 
 function formatShortDate(iso) {
   const date = new Date(iso);
@@ -148,18 +257,49 @@ function actionLabel(action) {
   return word ? word.charAt(0).toUpperCase() + word.slice(1).toLowerCase() : "—";
 }
 
-function eventRow(event, withSeverity) {
-  const cells = [
-    el("td", { text: formatTime(event.timestamp), title: formatDateTime(event.timestamp) }),
+function severityBadge(severity) {
+  const key = severityKey(severity);
+  return el("span", { className: `sev ${key.toLowerCase()}`, text: key.charAt(0) + key.slice(1).toLowerCase() });
+}
+
+function eventRow(event) {
+  return el("tr", {}, [
+    el("td", { text: formatWhen(event.timestamp), title: formatDateTime(event.timestamp) }),
     el("td", {}, [el("span", { className: typeClass(event.threat_type), text: event.threat_type })]),
-  ];
-  if (withSeverity) cells.push(el("td", { text: event.severity }));
-  cells.push(
     el("td", { text: shortPath(event.target), title: event.target }),
     el("td", { text: event.details, title: event.details }),
     el("td", { text: actionLabel(event.action_taken), title: event.action_taken }),
-  );
-  return el("tr", {}, cells);
+  ]);
+}
+
+function activityRows(event) {
+  const open = state.openEvent === event.id;
+  const cells = [
+    el("td", {}, [
+      el("span", { className: "cell-main", text: formatWhen(event.timestamp) }),
+      el("span", { className: "cell-sub", text: relativeTime(event.timestamp) }),
+    ]),
+    el("td", {}, [el("span", { className: typeClass(event.threat_type), text: event.threat_type })]),
+    el("td", { className: "sans" }, [severityBadge(event.severity)]),
+    el("td", { title: event.target }, [
+      el("span", { className: "cell-main", text: fileName(event.target) }),
+      el("span", { className: "cell-sub", text: folderOf(event.target) || "—" }),
+    ]),
+    el("td", { text: event.details, title: event.details }),
+    el("td", { className: "sans", text: actionLabel(event.action_taken), title: event.action_taken }),
+    el("td", {}, [chevron()]),
+  ];
+  const detail = detailGrid([
+    ["When", `${formatDateTime(event.timestamp)} (${relativeTime(event.timestamp)})`],
+    ["Target", event.target, event.target],
+    ["Detail", event.details],
+    ["Action taken", event.action_taken],
+    ["Event ID", event.id, event.id],
+  ], TYPE_NOTES[event.threat_type]);
+  return expandable(cells, detail, open, () => {
+    state.openEvent = open ? null : event.id;
+    loadEvents().catch(() => {});
+  }, 7);
 }
 
 function setSwitch(button, checked) {
@@ -212,6 +352,19 @@ function renderDashboard(d) {
   $("service-text").textContent = online
     ? `Service Active · ${(d.daemon.memory_mb || 0).toFixed(1)} MB`
     : "Daemon Offline";
+
+  const topDot = $("top-status-dot");
+  const topText = $("top-status-text");
+  if (!online) {
+    topDot.className = "dot bad";
+    topText.textContent = "Service offline";
+  } else if (d.dry_run) {
+    topDot.className = "dot warn";
+    topText.textContent = "Dry run · detect only";
+  } else {
+    topDot.className = "dot ok";
+    topText.textContent = `Protected · ${protectionScore(d).score}`;
+  }
 
   const protection = $("protection-dot");
   if (!online) {
@@ -353,8 +506,15 @@ async function loadChart(force) {
       }
     }
   }
+  const byType = new Map();
+  for (const event of events) {
+    if (String(event.severity || "").toLowerCase() === "low") continue;
+    if (Date.parse(event.timestamp) < days[0].start) continue;
+    byType.set(event.threat_type, (byType.get(event.threat_type) || 0) + 1);
+  }
+  renderChartFacts(days, byType);
   const max = Math.max(1, ...days.map((d) => d.critical + d.high + d.other));
-  replaceIfChanged($("threat-chart"), JSON.stringify(days), () => days.map((d) => {
+  replaceIfChanged($("threat-chart"), JSON.stringify(days), () => days.map((d, index) => {
     const total = d.critical + d.high + d.other;
     const stack = el("div", { className: "bar-stack" });
     for (const kind of ["critical", "high", "other"]) {
@@ -363,15 +523,51 @@ async function loadChart(force) {
       seg.style.height = `${(d[kind] / max) * 100}%`;
       stack.append(seg);
     }
-    return el("div", { className: "bar-col", title: `${d.label}: ${total} threat${total === 1 ? "" : "s"}` }, [
-      el("b", { className: "mono", text: total ? String(total) : "" }),
+    return el("div", { className: `bar-col${index === days.length - 1 ? " today" : ""}`, title: `${d.label}: ${total} threat${total === 1 ? "" : "s"}` }, [
+      el("b", { className: total ? "mono" : "mono zero", text: String(total) }),
       stack,
       el("span", { text: d.label }),
     ]);
   }));
 }
 
+const TYPE_COLOURS = {
+  ZIP_BOMB: "linear-gradient(90deg, #FF5FA2, #FF5C7A)",
+  RANSOMWARE_CANARY: "linear-gradient(90deg, #FF5FA2, #FF5C7A)",
+  RANSOMWARE_SUSPECT: "linear-gradient(90deg, #FF5FA2, #FF5C7A)",
+  MALWARE_AI: "linear-gradient(90deg, #9B6BFF, #6E7BFF)",
+  MALWARE_AI_PROCESS: "linear-gradient(90deg, #9B6BFF, #6E7BFF)",
+  LOTL_SCRIPT: "linear-gradient(90deg, #FFD27A, #FFB547)",
+};
+
+function renderChartFacts(days, byType) {
+  const totals = days.map((d) => d.critical + d.high + d.other);
+  const week = totals.reduce((a, b) => a + b, 0);
+  const critical = days.reduce((a, d) => a + d.critical, 0);
+  const busiest = totals.indexOf(Math.max(...totals));
+  const facts = [
+    [count(week), "threats this week"],
+    [count(totals[totals.length - 1]), "today"],
+    [count(critical), "critical"],
+    [week ? days[busiest].label : "—", week ? `busiest day (${totals[busiest]})` : "busiest day"],
+  ];
+  replaceIfChanged($("chart-facts"), JSON.stringify(facts), () => facts.map(([value, label]) => el("div", {}, [
+    el("b", { text: value }),
+    el("span", { text: label }),
+  ])));
+  const rows = [...byType.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const top = rows.length ? rows[0][1] : 1;
+  replaceIfChanged($("by-type"), JSON.stringify(rows), () => (rows.length ? rows.map(([type, n]) => {
+    const bar = el("i");
+    bar.style.setProperty("--w", `${Math.max(6, (n / top) * 100)}%`);
+    if (TYPE_COLOURS[type]) bar.style.setProperty("--bar", TYPE_COLOURS[type]);
+    return el("li", { title: TYPE_NOTES[type] || type }, [el("span", { text: type }), el("b", { text: String(n) }), bar]);
+  }) : [el("li", { className: "none", text: "No threats in the last 7 days." })]));
+}
+
 function renderOffline(reason) {
+  $("top-status-dot").className = "dot bad";
+  $("top-status-text").textContent = "Unprotected";
   $("service-dot").className = "dot";
   $("service-text").textContent = "Daemon Offline";
   $("protection-dot").className = "dot bad";
@@ -418,27 +614,83 @@ function quarantineButton(action, label, id) {
     className: action === "delete" ? "btn btn-small btn-danger" : "btn btn-small",
     text: armed ? `Confirm ${label.toLowerCase()}` : label,
   });
-  button.addEventListener("click", () => quarantineAction(action, id));
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    quarantineAction(action, id);
+  });
   return button;
+}
+
+const FILE_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9.5 12.5l5 5M14.5 12.5l-5 5"/></svg>';
+
+function quarantineRows(q) {
+  const open = state.openQuarantine === q.id;
+  const icon = el("span", { className: "file-icon" });
+  icon.innerHTML = FILE_ICON;
+  const cells = [
+    el("td", { title: q.original_path }, [
+      el("div", { className: "file-cell" }, [icon, el("span", {}, [
+        el("span", { className: "cell-main", text: fileName(q.original_path) }),
+        el("span", { className: "cell-sub", text: folderOf(q.original_path) || "—" }),
+      ])]),
+    ]),
+    el("td", { title: q.details }, [
+      el("span", { className: typeClass(q.threat_type), text: q.threat_type }),
+      el("span", { className: "cell-sub", text: q.details }),
+    ]),
+    el("td", { text: formatBytes(q.size) }),
+    el("td", { title: formatDateTime(q.quarantined_at) }, [
+      el("span", { className: "cell-main", text: formatShortDate(q.quarantined_at) }),
+      el("span", { className: "cell-sub", text: relativeTime(q.quarantined_at) }),
+    ]),
+    el("td", { className: "right" }, [
+      el("div", { className: "button-group", attrs: { style: "justify-content:flex-end;align-items:center" } }, [
+        quarantineButton("restore", "Restore", q.id),
+        quarantineButton("delete", "Delete", q.id),
+        chevron(),
+      ]),
+    ]),
+  ];
+  const detail = detailGrid([
+    ["Found at", q.original_path, q.original_path],
+    ["Why", q.details],
+    ["Size", `${formatBytes(q.size)} (${count(q.size)} bytes)`],
+    ["SHA-256", q.sha256, q.sha256],
+    ["Quarantined", `${formatDateTime(q.quarantined_at)} (${relativeTime(q.quarantined_at)})`],
+    ["Stored as", q.quarantined_path],
+    ["Quarantine ID", q.id],
+  ], `${TYPE_NOTES[q.threat_type] ? `${TYPE_NOTES[q.threat_type]} ` : ""}The file is locked away and cannot run. Restore puts it back where it was found; Delete removes it for good.`);
+  return expandable(cells, detail, open, () => {
+    state.openQuarantine = open ? null : q.id;
+    renderQuarantine();
+  }, 5);
+}
+
+function renderQuarantineFacts(all) {
+  const total = all.reduce((sum, q) => sum + (Number(q.size) || 0), 0);
+  const newest = all.reduce((best, q) => (!best || q.quarantined_at > best.quarantined_at ? q : best), null);
+  const types = new Map();
+  for (const q of all) types.set(q.threat_type, (types.get(q.threat_type) || 0) + 1);
+  const top = [...types.entries()].sort((a, b) => b[1] - a[1])[0];
+  const facts = [
+    [count(all.length), `file${all.length === 1 ? "" : "s"} held`],
+    [formatBytes(total), "total size"],
+    [newest ? relativeTime(newest.quarantined_at) : "—", "last file stopped"],
+    [top ? top[0] : "—", top ? `most common (${top[1]})` : "most common threat"],
+  ];
+  replaceIfChanged($("quarantine-facts"), JSON.stringify(facts), () => facts.map(([value, label]) => el("div", {}, [
+    el("b", { className: "mono", text: value }),
+    el("span", { text: label }),
+  ])));
 }
 
 function renderQuarantine() {
   const records = state.quarantine.filter((q) => matchesQuery(q.id, q.original_path, q.sha256, q.threat_type, q.details));
-  const signature = JSON.stringify(records.map((q) => [q.id, confirming("restore", q.id), confirming("delete", q.id)]));
-  replaceIfChanged($("quarantine-rows"), signature, () => records.map((q) => el("tr", {}, [
-    el("td", { text: formatShortDate(q.quarantined_at), title: formatDateTime(q.quarantined_at) }),
-    el("td", { text: fileName(q.original_path), title: q.original_path }),
-    el("td", {}, [el("span", { className: typeClass(q.threat_type), text: q.threat_type, title: q.details })]),
-    el("td", { text: `${q.sha256.slice(0, 16)}…`, title: q.sha256 }),
-    el("td", { className: "right" }, [
-      el("div", { className: "button-group", attrs: { style: "justify-content:flex-end" } }, [
-        quarantineButton("restore", "Restore", q.id),
-        quarantineButton("delete", "Delete", q.id),
-      ]),
-    ]),
-  ])));
+  const signature = JSON.stringify([state.openQuarantine, records.map((q) => [q.id, confirming("restore", q.id), confirming("delete", q.id)])]);
+  replaceIfChanged($("quarantine-rows"), signature, () => records.flatMap(quarantineRows));
+  renderQuarantineFacts(state.quarantine);
   $("quarantine-empty").hidden = records.length > 0;
-  $("quarantine-count").textContent = `${state.quarantine.length} file${state.quarantine.length === 1 ? "" : "s"}`;
+  $("quarantine-count").textContent = `${state.quarantine.length} file${state.quarantine.length === 1 ? "" : "s"} · click a row for details`;
 }
 
 async function quarantineAction(action, id) {
@@ -461,12 +713,22 @@ async function quarantineAction(action, id) {
 async function loadEvents() {
   const overview = await call("get_events", { limit: OVERVIEW_EVENTS, query: state.query || null, severity: "ALL" });
   const eventsSignature = (events) => events.map((e) => `${e.id}|${e.timestamp}`).join(",");
-  replaceIfChanged($("overview-events"), eventsSignature(overview), () => overview.map((e) => eventRow(e, false)));
+  replaceIfChanged($("overview-events"), eventsSignature(overview), () => overview.map((e) => eventRow(e)));
   $("overview-empty").hidden = overview.length > 0;
   if (state.page === "activity") {
-    const all = await call("get_events", { limit: 1000, query: state.query || null, severity: state.severity });
-    replaceIfChanged($("activity-events"), eventsSignature(all), () => all.map((e) => eventRow(e, true)));
-    $("activity-empty").hidden = all.length > 0;
+    const all = await call("get_events", { limit: 1000, query: state.query || null, severity: "ALL" });
+    const counts = { ALL: all.length, CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+    for (const e of all) counts[severityKey(e.severity)] = (counts[severityKey(e.severity)] || 0) + 1;
+    for (const [key, value] of Object.entries(counts)) {
+      const holder = $(`count-${key}`);
+      if (holder) holder.textContent = count(value);
+    }
+    const shown = state.severity === "ALL" ? all : all.filter((e) => severityKey(e.severity) === state.severity);
+    $("activity-range").textContent = all.length
+      ? `Newest ${relativeTime(all[0].timestamp)} · oldest ${formatWhen(all[all.length - 1].timestamp)} · click a row for details`
+      : "";
+    replaceIfChanged($("activity-events"), `${eventsSignature(shown)}|${state.openEvent}`, () => shown.flatMap(activityRows));
+    $("activity-empty").hidden = shown.length > 0;
   }
 }
 
@@ -495,7 +757,7 @@ async function refresh(force) {
 
 async function busy(buttonId, label, work) {
   const button = $(buttonId);
-  const original = button.textContent;
+  const original = button.innerHTML; // static markup (label and icon), restored as it was
   button.dataset.busy = "1";
   button.disabled = true;
   button.textContent = label;
@@ -506,7 +768,7 @@ async function busy(buttonId, label, work) {
   } finally {
     delete button.dataset.busy;
     button.disabled = false;
-    button.textContent = original;
+    button.innerHTML = original;
     await refresh(true);
   }
 }
@@ -517,6 +779,7 @@ function showPage(page) {
   for (const section of document.querySelectorAll(".page")) section.classList.toggle("active", section.id === `page-${page}`);
   $("page-title").textContent = PAGE_TITLES[page];
   $("page-sub").textContent = page === "overview" ? greeting() : PAGE_SUBS[page] || "";
+  $("search-box").hidden = !SEARCH_PAGES.has(page);
   // The AegisMesh console loads on first visit only (it can open the camera).
   const frame = $("aegismesh-frame");
   if (page === "aegismesh" && frame && !frame.getAttribute("src")) frame.setAttribute("src", "aegismesh/index.html");
@@ -661,15 +924,18 @@ function cyberHexCss() {
   return `url("data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}")`;
 }
 
-// Deep navy with blue, violet and teal glows and two soft light streaks.
-function auroraCss() {
+// Deep navy (or, in light mode, pale sky) with blue, violet and teal glows and two soft
+// light streaks.
+function auroraCss(light) {
+  const base = light ? ["#F7F9FF", "#EEF2FC", "#E6ECFA"] : ["#0C1333", "#070A1B", "#04060E"];
+  const glow = light ? [".45", ".38", ".30", ".16"] : [".55", ".5", ".26", ".16"];
   const svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1600 900' preserveAspectRatio='xMidYMid slice'>" +
     "<defs>" +
-    "<linearGradient id='bg' x1='0' y1='0' x2='.4' y2='1'><stop offset='0' stop-color='#0C1333'/><stop offset='.55' stop-color='#070A1B'/><stop offset='1' stop-color='#04060E'/></linearGradient>" +
-    "<radialGradient id='g1' cx='8%' cy='0%' r='55%'><stop offset='0' stop-color='#4F7BFF' stop-opacity='.55'/><stop offset='1' stop-color='#4F7BFF' stop-opacity='0'/></radialGradient>" +
-    "<radialGradient id='g2' cx='96%' cy='8%' r='48%'><stop offset='0' stop-color='#9B6BFF' stop-opacity='.5'/><stop offset='1' stop-color='#9B6BFF' stop-opacity='0'/></radialGradient>" +
-    "<radialGradient id='g3' cx='82%' cy='100%' r='50%'><stop offset='0' stop-color='#2EE6C5' stop-opacity='.26'/><stop offset='1' stop-color='#2EE6C5' stop-opacity='0'/></radialGradient>" +
-    "<radialGradient id='g4' cx='12%' cy='96%' r='40%'><stop offset='0' stop-color='#FF5FA2' stop-opacity='.16'/><stop offset='1' stop-color='#FF5FA2' stop-opacity='0'/></radialGradient>" +
+    `<linearGradient id='bg' x1='0' y1='0' x2='.4' y2='1'><stop offset='0' stop-color='${base[0]}'/><stop offset='.55' stop-color='${base[1]}'/><stop offset='1' stop-color='${base[2]}'/></linearGradient>` +
+    `<radialGradient id='g1' cx='8%' cy='0%' r='55%'><stop offset='0' stop-color='${light ? "#9DB8FF" : "#4F7BFF"}' stop-opacity='${glow[0]}'/><stop offset='1' stop-color='#4F7BFF' stop-opacity='0'/></radialGradient>` +
+    `<radialGradient id='g2' cx='96%' cy='8%' r='48%'><stop offset='0' stop-color='${light ? "#CBB4FF" : "#9B6BFF"}' stop-opacity='${glow[1]}'/><stop offset='1' stop-color='#9B6BFF' stop-opacity='0'/></radialGradient>` +
+    `<radialGradient id='g3' cx='82%' cy='100%' r='50%'><stop offset='0' stop-color='${light ? "#8EEBD9" : "#2EE6C5"}' stop-opacity='${glow[2]}'/><stop offset='1' stop-color='#2EE6C5' stop-opacity='0'/></radialGradient>` +
+    `<radialGradient id='g4' cx='12%' cy='96%' r='40%'><stop offset='0' stop-color='${light ? "#FFB3D1" : "#FF5FA2"}' stop-opacity='${glow[3]}'/><stop offset='1' stop-color='#FF5FA2' stop-opacity='0'/></radialGradient>` +
     "<linearGradient id='s1' x1='0' x2='1'><stop offset='0' stop-color='#5B8CFF' stop-opacity='0'/><stop offset='.45' stop-color='#7A6BFF' stop-opacity='.85'/><stop offset='.75' stop-color='#C46BFF' stop-opacity='.6'/><stop offset='1' stop-color='#C46BFF' stop-opacity='0'/></linearGradient>" +
     "<linearGradient id='s2' x1='0' x2='1'><stop offset='0' stop-color='#2EE6C5' stop-opacity='0'/><stop offset='.5' stop-color='#4FC3FF' stop-opacity='.7'/><stop offset='1' stop-color='#5B8CFF' stop-opacity='0'/></linearGradient>" +
     "<filter id='w' x='-20%' y='-50%' width='140%' height='200%'><feGaussianBlur stdDeviation='26'/></filter>" +
@@ -689,8 +955,13 @@ function auroraCss() {
 }
 
 const PRESETS = [
-  { id: "aurora", label: "Midnight Aurora", css: auroraCss() },
-  { id: "matte", label: "Matte Dark", css: "none", swatch: "linear-gradient(135deg, #141A2E 0%, #060914 100%)" },
+  { id: "aurora", label: "Aurora", css: () => auroraCss(isLight()) },
+  {
+    id: "matte",
+    label: "Matte",
+    css: "none",
+    swatch: () => (isLight() ? "linear-gradient(135deg, #FFFFFF 0%, #E6ECFA 100%)" : "linear-gradient(135deg, #141A2E 0%, #060914 100%)"),
+  },
   { id: "crimson", label: "Crimson Abyss", css: CRIMSON_CSS },
   { id: "cyberhex", label: "Cyber Hex", css: cyberHexCss() },
 ];
@@ -735,10 +1006,12 @@ function imageSource(source) {
   return null;
 }
 
+const resolve = (value) => (typeof value === "function" ? value() : value);
+
 function wallpaperCss(source) {
   if (source.startsWith("preset:")) {
     const preset = PRESETS.find((p) => p.id === source.slice(7));
-    return preset ? preset.css : "none";
+    return preset ? resolve(preset.css) : "none";
   }
   const src = imageSource(source);
   return src ? cssUrl(src) : "none";
@@ -926,7 +1199,7 @@ function applyWallpaperFile(file) {
 function buildPresetChips() {
   $("wallpaper-presets").replaceChildren(...PRESETS.map((preset) => {
     const swatch = el("span", { className: "swatch" });
-    swatch.style.backgroundImage = preset.swatch || preset.css;
+    swatch.style.backgroundImage = resolve(preset.swatch) || resolve(preset.css);
     const chip = el("button", { className: "preset", attrs: { type: "button", "data-preset": preset.id, "aria-pressed": "false" } }, [
       swatch,
       el("span", { text: preset.label }),
@@ -973,6 +1246,53 @@ function wireAppearance() {
   });
 }
 
+/* ---- Theme: dark, light or match the system ---------------------------------------------- */
+
+const THEME_KEY = "thenex.theme";
+const lightQuery = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
+
+function themePref() {
+  try {
+    const value = localStorage.getItem(THEME_KEY);
+    return value === "light" || value === "system" ? value : "dark";
+  } catch {
+    return "dark";
+  }
+}
+
+function isLight() {
+  const pref = themePref();
+  return pref === "light" || (pref === "system" && Boolean(lightQuery && lightQuery.matches));
+}
+
+function applyTheme() {
+  document.documentElement.dataset.theme = isLight() ? "light" : "dark";
+  for (const button of document.querySelectorAll("[data-theme-choice]")) {
+    button.setAttribute("aria-pressed", String(button.dataset.themeChoice === themePref()));
+  }
+  // The app draws its preset wallpapers in a light and a dark version.
+  if (!look.previewUrl) applyAppearance(look.current, wallpaperCss(look.current.wallpaper_source));
+  buildPresetChips();
+  updateAppearanceControls();
+}
+
+function setTheme(pref) {
+  try {
+    localStorage.setItem(THEME_KEY, pref);
+  } catch {
+    /* storage disabled: the choice lasts until the window closes */
+  }
+  applyTheme();
+}
+
+function wireTheme() {
+  $("theme-toggle").addEventListener("click", () => setTheme(isLight() ? "dark" : "light"));
+  for (const button of document.querySelectorAll("[data-theme-choice]")) {
+    button.addEventListener("click", () => setTheme(button.dataset.themeChoice));
+  }
+  if (lightQuery && lightQuery.addEventListener) lightQuery.addEventListener("change", () => { if (themePref() === "system") applyTheme(); });
+}
+
 async function initAppearance() {
   wireAppearance();
   const start = normalizeAppearance(readMirror() || DEFAULT_APPEARANCE);
@@ -988,6 +1308,7 @@ async function initAppearance() {
 
 wire();
 $("page-sub").textContent = greeting();
-initAppearance();
+wireTheme();
+initAppearance().then(applyTheme);
 refresh(true);
 setInterval(() => refresh(false), REFRESH_MS);
