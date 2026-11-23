@@ -58,6 +58,11 @@
     if (!t) throw new Error("Open AegisMesh from The Nex or the AegisMesh desktop app to run the simulation.");
     return t.core.invoke("aegismesh", { op, request });
   }
+  // Canvas colours (match console.css).
+  const INK = {
+    grid: "rgba(140,160,255,0.14)", label: "#8E99C2", fg: "#EEF1FF", ok: "#2EE6C5", bad: "#FF5C7A",
+    info: "#6E9BFF", warn: "rgba(255,193,77,0.75)", group: "rgba(110,155,255,0.5)",
+  };
   const errorText = (e) => (e && e.message) || String(e);
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const pct = (x, digits = 1) => `${(x * 100).toFixed(digits)}%`;
@@ -126,10 +131,44 @@
 
   // ---------------------------------------------------------------- form factor + profile
 
-  const FORM_ART = {
-    ring: '<svg viewBox="0 0 110 90"><ellipse cx="55" cy="50" rx="30" ry="30" fill="none" stroke="currentColor" stroke-width="9"/><rect x="43" y="13" width="24" height="12" rx="4" fill="currentColor"/></svg>',
-    bracelet: '<svg viewBox="0 0 110 90"><ellipse cx="55" cy="47" rx="44" ry="24" fill="none" stroke="currentColor" stroke-width="8"/><rect x="40" y="13" width="30" height="20" rx="6" fill="#111317" stroke="currentColor" stroke-width="3"/></svg>',
-    clothing_tag: '<svg viewBox="0 0 110 90"><path d="M30 18h40l14 14v40H30z" fill="none" stroke="currentColor" stroke-width="6" stroke-linejoin="round"/><circle cx="72" cy="30" r="5" fill="currentColor"/><path d="M40 52h34M40 62h22" stroke="currentColor" stroke-width="4" stroke-linecap="round"/></svg>',
+  const FORM_INFO = {
+    ring: "A titanium smart ring. Press your thumb against your finger in the rhythm: the ring feels it, and nobody sees a phone.",
+    bracelet: "A silicone band with an aluminium module. Tap the band with two fingers, even under a sleeve.",
+    clothing_tag: "A woven tag sewn into clothing, with a piezo sensor behind the fabric. Tap it through your clothes.",
+  };
+  const still = (form) => `models/${form}.webp`;
+
+  // 3D wearable (wearable3d.js, three.js). Falls back to the Blender renders without WebGL.
+  const viewer = { api: null, loading: null, failed: false };
+
+  function showStill(form) {
+    const img = $("form-still");
+    img.src = still(form);
+    img.alt = `${form.replace("_", " ")} (render)`;
+    img.hidden = false;
+    $("stage-hint").textContent = "3D view needs WebGL: showing a still render";
+  }
+
+  function showWearable(form) {
+    if (viewer.failed) { showStill(form); return; }
+    if (!viewer.loading) {
+      viewer.loading = import("./wearable3d.js")
+        .then((m) => m.createWearableViewer($("form-art")))
+        .then((api) => { viewer.api = api; return api; });
+    }
+    viewer.loading
+      .then((api) => api.show(form))
+      .catch((error) => {
+        console.warn("3D wearable unavailable:", error);
+        viewer.failed = true;
+        showStill(state.form);
+      });
+  }
+
+  /** Lights the wearable's dots: pulse(i) for a tap, flash("ok" | "no" | "sos") for a result. */
+  const wearable = {
+    pulse(i) { if (viewer.api) viewer.api.pulse(i); },
+    flash(kind) { if (viewer.api) viewer.api.flash(kind); },
   };
 
   function defaultProfile(form) {
@@ -150,18 +189,21 @@
       button.type = "button";
       button.setAttribute("role", "radio");
       button.setAttribute("aria-checked", String(spec.form === state.form));
-      button.textContent = spec.label;
+      button.innerHTML = `<img src="${still(spec.form)}" alt="" loading="lazy"><span>${esc(spec.label)}</span>`;
       button.addEventListener("click", () => selectForm(spec.form));
       holder.appendChild(button);
     }
     const spec = state.defaults.forms.find((f) => f.form === state.form) || state.defaults.forms[0];
-    $("form-art").innerHTML = FORM_ART[spec.form] || "";
+    $("form-name").textContent = spec.label;
+    $("form-blurb").textContent = FORM_INFO[spec.form] || "";
     $("form-specs").innerHTML = [
-      ["Tap surface", spec.tap_surface],
-      ["Sensor", spec.sensor],
-      ["Battery", `${spec.battery_mah} mAh`],
-      ["Radio range", `~${spec.radio_range_m} m (simulated BLE)`],
-    ].map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
+      ["Battery", `<b>${esc(spec.battery_mah)}</b> mAh`],
+      ["Radio range", `<b>~${esc(spec.radio_range_m)}</b> m <span class="muted">simulated BLE</span>`],
+      ["Tap surface", esc(spec.tap_surface)],
+      ["Sensor", esc(spec.sensor)],
+    ].map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${v}</dd></div>`).join("");
+    if (viewer.failed) showStill(spec.form);
+    else showWearable(spec.form);
   }
 
   function renderProfile() {
@@ -230,8 +272,8 @@
     ctx.clearRect(0, 0, width, height);
     const span = Math.max(4000, (taps.length ? taps[taps.length - 1] : 0) + 600);
     const x = (t) => 12 + (t / span) * (width - 24);
-    ctx.strokeStyle = "#22252C";
-    ctx.fillStyle = "#8A90A0";
+    ctx.strokeStyle = INK.grid;
+    ctx.fillStyle = INK.label;
     ctx.font = "11px ui-monospace, Consolas, monospace";
     for (let s = 0; s <= span; s += 1000) {
       ctx.beginPath(); ctx.moveTo(x(s), 8); ctx.lineTo(x(s), height - 18); ctx.stroke();
@@ -239,7 +281,7 @@
     }
     if (state.profile && taps.length) {
       const gap = burstGap(state.profile);
-      ctx.strokeStyle = "rgba(110,168,254,0.45)";
+      ctx.strokeStyle = INK.group;
       ctx.lineWidth = 2;
       let start = taps[0];
       for (let i = 1; i <= taps.length; i++) {
@@ -250,7 +292,7 @@
       }
       ctx.lineWidth = 1;
     }
-    ctx.fillStyle = accepted === null ? "#E7E9EE" : accepted ? "#3DD6B0" : "#FF6B6B";
+    ctx.fillStyle = accepted === null ? INK.fg : accepted ? INK.ok : INK.bad;
     for (const t of taps) {
       ctx.beginPath(); ctx.arc(x(t), height / 2, 6, 0, Math.PI * 2); ctx.fill();
     }
@@ -271,6 +313,7 @@
     }
     state.lastTap = now;
     state.taps.push(Math.round((now - state.tapOrigin) * 10) / 10);
+    wearable.pulse(state.taps.length - 1);
     const pad = $("tap-pad");
     pad.classList.add("hit");
     setTimeout(() => pad.classList.remove("hit"), 90);
@@ -282,6 +325,7 @@
     if (!state.taps.length) { toast("Tap the rhythm on the pad first."); return; }
     const verdict = await api("classify", { taps_ms: state.taps, profile: state.profile });
     renderVerdict($("tap-verdict"), verdict);
+    wearable.flash(verdict.accepted ? "ok" : "no");
     drawTaps($("tap-timeline"), state.taps, verdict.accepted);
   }
 
@@ -295,6 +339,7 @@
       const wait = t - (performance.now() - state.tapOrigin);
       if (wait > 0) await sleep(wait);
       state.taps.push(t);
+      wearable.pulse(state.taps.length - 1);
       state.lastTap = performance.now();
       pad.classList.add("hit");
       setTimeout(() => pad.classList.remove("hit"), 90);
@@ -504,7 +549,7 @@
     ctx.clearRect(0, 0, width, height);
     const span = 8000;
     const max = Math.max(12, ...cam.live.map((s) => s.energy));
-    ctx.strokeStyle = cam.recording ? "#FF6B6B" : "#6EA8FE";
+    ctx.strokeStyle = cam.recording ? INK.bad : INK.info;
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     cam.live.forEach((s, i) => {
@@ -513,7 +558,7 @@
       if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
     });
     ctx.stroke();
-    ctx.fillStyle = "#8A90A0";
+    ctx.fillStyle = INK.label;
     ctx.font = "11px ui-monospace, Consolas, monospace";
     ctx.fillText(cam.recording ? "recording motion" : "live motion in the box", 8, 14);
   }
@@ -526,21 +571,21 @@
     const max = Math.max(onsets.threshold * 1.4, ...samples.map((s) => s.energy));
     const x = (t) => 6 + (t / span) * (width - 12);
     const y = (e) => height - 6 - (e / max) * (height - 16);
-    ctx.strokeStyle = "rgba(245,181,71,0.7)";
+    ctx.strokeStyle = INK.warn;
     ctx.setLineDash([4, 4]);
     ctx.beginPath(); ctx.moveTo(0, y(onsets.threshold)); ctx.lineTo(width, y(onsets.threshold)); ctx.stroke();
     ctx.setLineDash([]);
-    ctx.strokeStyle = "#6EA8FE";
+    ctx.strokeStyle = INK.info;
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     samples.forEach((s, i) => (i === 0 ? ctx.moveTo(x(s.t_ms), y(s.energy)) : ctx.lineTo(x(s.t_ms), y(s.energy))));
     ctx.stroke();
-    ctx.fillStyle = accepted ? "#3DD6B0" : "#FF6B6B";
+    ctx.fillStyle = accepted ? INK.ok : INK.bad;
     for (const t of onsets.taps_ms) {
       ctx.beginPath(); ctx.arc(x(t), 12, 5, 0, Math.PI * 2); ctx.fill();
       ctx.fillRect(x(t) - 0.5, 16, 1, height - 22);
     }
-    ctx.fillStyle = "#8A90A0";
+    ctx.fillStyle = INK.label;
     ctx.font = "11px ui-monospace, Consolas, monospace";
     ctx.fillText(`${onsets.taps_ms.length} taps · threshold ${onsets.threshold.toFixed(1)} · ${onsets.fps.toFixed(0)} fps`, 8, height - 8);
   }
@@ -776,6 +821,7 @@
       .filter(Boolean)
       .join(" · ");
     renderVerdict($("cam-verdict"), result.verdict, extra);
+    wearable.flash(result.verdict.accepted ? "ok" : "no");
     $("cam-use").disabled = onsets.taps_ms.length < 3;
   }
 
@@ -1232,7 +1278,7 @@
     const connections = (vision.V && vision.V.HandLandmarker.HAND_CONNECTIONS) || [];
     ctx.lineWidth = 3;
     for (const landmarks of handResult.landmarks || []) {
-      ctx.strokeStyle = "rgba(61,214,176,0.9)";
+      ctx.strokeStyle = "rgba(46,230,197,0.9)";
       ctx.beginPath();
       for (const c of connections) {
         const a = landmarks[c.start];
@@ -1242,7 +1288,7 @@
         ctx.lineTo(b.x * w, b.y * h);
       }
       ctx.stroke();
-      ctx.fillStyle = "#E7E9EE";
+      ctx.fillStyle = INK.fg;
       for (const p of landmarks) {
         ctx.beginPath();
         ctx.arc(p.x * w, p.y * h, 3.5, 0, Math.PI * 2);
@@ -1374,7 +1420,10 @@
     const item = document.createElement("li");
     item.textContent = `${when} · ${event.name} recognised → sending silent SOS (simulation)…`;
     $("sign-log").prepend(item);
-    if (!$("sign-discreet").checked) hud(`${event.name}: silent SOS sent (simulation)`);
+    if (!$("sign-discreet").checked) {
+      hud(`${event.name}: silent SOS sent (simulation)`);
+      wearable.flash("sos");
+    }
     try {
       const outcome = await api("simulate_mesh", {
         form: state.form,
@@ -1455,12 +1504,12 @@
   }
 
   const OUTCOME_COLOURS = {
-    stored: "#6EA8FE",
-    duplicate: "#555b68",
-    ttl_exhausted: "#F5B547",
-    sos_delivered: "#3DD6B0",
-    wellness_discarded: "#8A90A0",
-    rejected: "#FF6B6B",
+    stored: "#6E9BFF",
+    duplicate: "#4A5378",
+    ttl_exhausted: "#FFC14D",
+    sos_delivered: "#2EE6C5",
+    wellness_discarded: "#8E99C2",
+    rejected: "#FF5C7A",
   };
 
   async function runMesh() {
@@ -1523,7 +1572,7 @@
         const from = pos(event.from);
         const to = pos(event.to);
         const g = svg("g", { class: "packet" }, root);
-        svg("circle", { r: event.outcome === "sos_delivered" ? 8 : 5, fill: OUTCOME_COLOURS[event.outcome] || "#E7E9EE" }, g);
+        svg("circle", { r: event.outcome === "sos_delivered" ? 8 : 5, fill: OUTCOME_COLOURS[event.outcome] || INK.fg }, g);
         g.style.transform = `translate(${from.x}px, ${from.y}px)`;
         packets.push({ g, to, event });
       }
@@ -1673,8 +1722,28 @@
     window.addEventListener("pagehide", () => { stopCamera(); stopSigns(); });
   }
 
+  function watchSections() {
+    const links = [...document.querySelectorAll(".section-nav a")];
+    const byId = new Map(links.map((a) => [a.getAttribute("href").slice(1), a]));
+    const seen = new Map();
+    const io = new IntersectionObserver((entries) => {
+      for (const entry of entries) seen.set(entry.target.id, entry.isIntersecting ? entry.intersectionRatio : 0);
+      let best = null;
+      for (const id of byId.keys()) {
+        const ratio = seen.get(id) || 0;
+        if (ratio > 0 && (best === null || ratio > (seen.get(best) || 0))) best = id;
+      }
+      if (best) for (const [id, a] of byId) a.classList.toggle("active", id === best);
+    }, { threshold: [0, 0.25, 0.5, 0.75, 1], rootMargin: "-60px 0px -35% 0px" });
+    for (const id of byId.keys()) {
+      const section = $(id);
+      if (section) io.observe(section);
+    }
+  }
+
   async function init() {
     wire();
+    watchSections();
     drawTaps($("tap-timeline"), []);
     setCameraUi(false);
     watchCameraPermission();

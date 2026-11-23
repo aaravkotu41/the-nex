@@ -28,7 +28,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; TheNex/0.2; wallpaper fetch)";
 
 /// Built-in wallpapers, drawn by the frontend (no image files).
-pub const PRESETS: &[&str] = &["matte", "crimson", "cyberhex"];
+pub const PRESETS: &[&str] = &["aurora", "matte", "crimson", "cyberhex"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -46,10 +46,10 @@ pub struct Appearance {
 impl Default for Appearance {
     fn default() -> Self {
         Self {
-            wallpaper_source: "preset:matte".to_string(),
-            bg_dim: 0.65,
-            card_blur: 14.0,
-            card_alpha: 0.72,
+            wallpaper_source: "preset:aurora".to_string(),
+            bg_dim: 0.2,
+            card_blur: 18.0,
+            card_alpha: 0.62,
         }
     }
 }
@@ -566,12 +566,14 @@ mod tests {
             card_alpha: f64::NAN,
         }
         .sanitized();
-        assert_eq!(wild.wallpaper_source, "preset:matte");
+        assert_eq!(wild.wallpaper_source, "preset:aurora");
         assert_eq!(
             (wild.bg_dim, wild.card_blur, wild.card_alpha),
-            (0.9, 0.0, 0.72)
+            (0.9, 0.0, 0.62)
         );
         for ok in [
+            "preset:aurora",
+            "preset:matte",
             "preset:crimson",
             "preset:cyberhex",
             "url:https://example.com/a.jpg",

@@ -17,8 +17,10 @@ and ransomware canary files, with a Tauri desktop dashboard.
   Simulation only: no radio, network or emergency service is ever used. Its camera watch
   recognises emergency hand signs (the Signal for Help) and facial expressions, plus signs you
   teach it, with Google MediaPipe models run on-device (`scripts/fetch_vision_models.py` pins and
-  verifies them; the page blocks every off-device connection). Recogniser tests:
-  `node scripts/test_signs.js`.
+  verifies them, and three.js for the 3D wearable viewer; the page blocks every off-device
+  connection). Recogniser tests: `node scripts/test_signs.js`. The ring, bracelet and clothing-tag
+  models (`ui/aegismesh/models/`, GLB plus a still render each) are built in Blender by
+  `scripts/models/build_wearables.py`; run it again after changing a model.
 - `packaging/windows/installer.nsi`: Windows installer; `packaging/macos/`: app bundle, DMG and pkg
 - `scripts/`: icon and model generation, live verifier, developer install scripts
 

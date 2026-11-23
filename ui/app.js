@@ -15,6 +15,21 @@ const PAGE_TITLES = {
   settings: "Settings",
   aegismesh: "AegisMesh",
 };
+const PAGE_SUBS = {
+  engines: "Four local engines. Nothing leaves this computer.",
+  activity: "Everything the engines saw and did, newest first.",
+  quarantine: "Files that were stopped. Restore or delete them here.",
+  canaries: "Decoy files that reveal ransomware the moment they change.",
+  settings: "Background service, watched folders and the look of the app.",
+  aegismesh: "Silent SOS simulation: wearables, tap rhythms, emergency signs and the relay mesh.",
+};
+
+function greeting() {
+  const now = new Date();
+  const hour = now.getHours();
+  const part = hour < 5 ? "Good night" : hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
+  return `${part} · ${now.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" })}`;
+}
 const TOGGLE_FIELDS = {
   zip_bomb: "zip_bomb_enabled",
   bin_ai: "bin_ai_enabled",
@@ -501,6 +516,7 @@ function showPage(page) {
   for (const item of document.querySelectorAll(".nav-item")) item.classList.toggle("active", item.dataset.page === page);
   for (const section of document.querySelectorAll(".page")) section.classList.toggle("active", section.id === `page-${page}`);
   $("page-title").textContent = PAGE_TITLES[page];
+  $("page-sub").textContent = page === "overview" ? greeting() : PAGE_SUBS[page] || "";
   // The AegisMesh console loads on first visit only (it can open the camera).
   const frame = $("aegismesh-frame");
   if (page === "aegismesh" && frame && !frame.getAttribute("src")) frame.setAttribute("src", "aegismesh/index.html");
@@ -589,11 +605,14 @@ function wire() {
 /* ---- Appearance: wallpaper layer + glass theme ------------------------------------------- */
 
 const APPEARANCE_KEY = "thenex.appearance";
-const DEFAULT_APPEARANCE = Object.freeze({ wallpaper_source: "preset:matte", bg_dim: 0.65, card_blur: 14, card_alpha: 0.72 });
+const DEFAULT_APPEARANCE = Object.freeze({ wallpaper_source: "preset:aurora", bg_dim: 0.2, card_blur: 18, card_alpha: 0.62 });
+// Before 0.3.1 the default was Matte Dark; a look still exactly on that old default was never
+// customised, so it moves to the new default.
+const OLD_DEFAULT = Object.freeze({ wallpaper_source: "preset:matte", bg_dim: 0.65, card_blur: 14, card_alpha: 0.72 });
 const MAX_WALLPAPER_BYTES = 25 * 1024 * 1024;
 const WALLPAPER_FILE_NAME = /\.(png|jpe?g|webp|gif)$/i;
 const WALLPAPER_MIME = /^image\/(png|jpeg|webp|gif)$/;
-const VALID_SOURCE = /^(preset:(matte|crimson|cyberhex)|url:https?:\/\/\S+|file:wallpaper-[A-Za-z0-9-]+\.(png|jpe?g|webp|gif))$/i;
+const VALID_SOURCE = /^(preset:(aurora|matte|crimson|cyberhex)|url:https?:\/\/\S+|file:wallpaper-[A-Za-z0-9-]+\.(png|jpe?g|webp|gif))$/i;
 const SAVE_DELAY_MS = 350;
 const IMAGE_TIMEOUT_MS = 20000;
 
@@ -642,8 +661,36 @@ function cyberHexCss() {
   return `url("data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}")`;
 }
 
+// Deep navy with blue, violet and teal glows and two soft light streaks.
+function auroraCss() {
+  const svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1600 900' preserveAspectRatio='xMidYMid slice'>" +
+    "<defs>" +
+    "<linearGradient id='bg' x1='0' y1='0' x2='.4' y2='1'><stop offset='0' stop-color='#0C1333'/><stop offset='.55' stop-color='#070A1B'/><stop offset='1' stop-color='#04060E'/></linearGradient>" +
+    "<radialGradient id='g1' cx='8%' cy='0%' r='55%'><stop offset='0' stop-color='#4F7BFF' stop-opacity='.55'/><stop offset='1' stop-color='#4F7BFF' stop-opacity='0'/></radialGradient>" +
+    "<radialGradient id='g2' cx='96%' cy='8%' r='48%'><stop offset='0' stop-color='#9B6BFF' stop-opacity='.5'/><stop offset='1' stop-color='#9B6BFF' stop-opacity='0'/></radialGradient>" +
+    "<radialGradient id='g3' cx='82%' cy='100%' r='50%'><stop offset='0' stop-color='#2EE6C5' stop-opacity='.26'/><stop offset='1' stop-color='#2EE6C5' stop-opacity='0'/></radialGradient>" +
+    "<radialGradient id='g4' cx='12%' cy='96%' r='40%'><stop offset='0' stop-color='#FF5FA2' stop-opacity='.16'/><stop offset='1' stop-color='#FF5FA2' stop-opacity='0'/></radialGradient>" +
+    "<linearGradient id='s1' x1='0' x2='1'><stop offset='0' stop-color='#5B8CFF' stop-opacity='0'/><stop offset='.45' stop-color='#7A6BFF' stop-opacity='.85'/><stop offset='.75' stop-color='#C46BFF' stop-opacity='.6'/><stop offset='1' stop-color='#C46BFF' stop-opacity='0'/></linearGradient>" +
+    "<linearGradient id='s2' x1='0' x2='1'><stop offset='0' stop-color='#2EE6C5' stop-opacity='0'/><stop offset='.5' stop-color='#4FC3FF' stop-opacity='.7'/><stop offset='1' stop-color='#5B8CFF' stop-opacity='0'/></linearGradient>" +
+    "<filter id='w' x='-20%' y='-50%' width='140%' height='200%'><feGaussianBlur stdDeviation='26'/></filter>" +
+    "<filter id='n' x='-10%' y='-50%' width='120%' height='200%'><feGaussianBlur stdDeviation='2.2'/></filter>" +
+    "</defs>" +
+    "<rect width='1600' height='900' fill='url(#bg)'/>" +
+    "<rect width='1600' height='900' fill='url(#g1)'/><rect width='1600' height='900' fill='url(#g2)'/>" +
+    "<rect width='1600' height='900' fill='url(#g3)'/><rect width='1600' height='900' fill='url(#g4)'/>" +
+    "<g fill='none' stroke-linecap='round'>" +
+    "<path d='M-120 760C260 560 620 860 980 600S1500 260 1760 300' stroke='url(#s1)' stroke-width='90' opacity='.35' filter='url(#w)'/>" +
+    "<path d='M-120 760C260 560 620 860 980 600S1500 260 1760 300' stroke='url(#s1)' stroke-width='3' opacity='.8' filter='url(#n)'/>" +
+    "<path d='M-120 800C300 620 640 900 1000 650S1520 330 1760 360' stroke='url(#s1)' stroke-width='1.5' opacity='.55' filter='url(#n)'/>" +
+    "<path d='M-80 880C360 720 760 820 1120 700S1500 560 1720 520' stroke='url(#s2)' stroke-width='70' opacity='.22' filter='url(#w)'/>" +
+    "<path d='M-80 880C360 720 760 820 1120 700S1500 560 1720 520' stroke='url(#s2)' stroke-width='2' opacity='.6' filter='url(#n)'/>" +
+    "</g></svg>";
+  return `url("data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}")`;
+}
+
 const PRESETS = [
-  { id: "matte", label: "Default Matte Dark", css: "none", swatch: "linear-gradient(135deg, #17191E 0%, #0A0B0D 100%)" },
+  { id: "aurora", label: "Midnight Aurora", css: auroraCss() },
+  { id: "matte", label: "Matte Dark", css: "none", swatch: "linear-gradient(135deg, #141A2E 0%, #060914 100%)" },
   { id: "crimson", label: "Crimson Abyss", css: CRIMSON_CSS },
   { id: "cyberhex", label: "Cyber Hex", css: cyberHexCss() },
 ];
@@ -655,8 +702,12 @@ function clampNumber(value, low, high, fallback) {
   return Number.isFinite(number) ? Math.min(high, Math.max(low, number)) : fallback;
 }
 
+function isOldDefault(a) {
+  return a && Object.keys(OLD_DEFAULT).every((key) => a[key] === OLD_DEFAULT[key]);
+}
+
 function normalizeAppearance(value) {
-  const a = value && typeof value === "object" ? value : {};
+  const a = value && typeof value === "object" ? (isOldDefault(value) ? DEFAULT_APPEARANCE : value) : {};
   const source = typeof a.wallpaper_source === "string" && VALID_SOURCE.test(a.wallpaper_source)
     ? a.wallpaper_source
     : DEFAULT_APPEARANCE.wallpaper_source;
@@ -936,6 +987,7 @@ async function initAppearance() {
 }
 
 wire();
+$("page-sub").textContent = greeting();
 initAppearance();
 refresh(true);
 setInterval(() => refresh(false), REFRESH_MS);

@@ -9,11 +9,14 @@
   <link rel="stylesheet" href="console.css">
 </head>
 <body>
+  <div class="aurora" aria-hidden="true"></div>
   <header class="top">
     <div class="brand">
-      <svg viewBox="0 0 32 32" aria-hidden="true">
-        <path fill-rule="evenodd" fill="currentColor" d="M16 3.5 26.5 7 26 16.5 22.5 23 16 28.5 9.5 23 6 16.5 5.5 7z M16 7.4 9.2 9.7 9.6 16.1 12.2 20.9 16 24.3 19.8 20.9 22.4 16.1 22.8 9.7z M16 11.2 19.3 15.4 16 19.6 12.7 15.4z"/>
-      </svg>
+      <span class="brand-mark">
+        <svg viewBox="0 0 32 32" aria-hidden="true">
+          <path fill-rule="evenodd" fill="currentColor" d="M16 3.5 26.5 7 26 16.5 22.5 23 16 28.5 9.5 23 6 16.5 5.5 7z M16 7.4 9.2 9.7 9.6 16.1 12.2 20.9 16 24.3 19.8 20.9 22.4 16.1 22.8 9.7z M16 11.2 19.3 15.4 16 19.6 12.7 15.4z"/>
+        </svg>
+      </span>
       <div>
         <strong>AegisMesh</strong>
         <span>Silent SOS for everyday wearables</span>
@@ -24,29 +27,45 @@
     </div>
   </header>
 
+  <nav class="section-nav" aria-label="Sections">
+    <a href="#card-form" class="active">Wearable</a>
+    <a href="#card-tap">Tap rhythm</a>
+    <a href="#card-camera">Camera test</a>
+    <a href="#card-signs">Emergency signs</a>
+    <a href="#card-bench">Benchmark</a>
+    <a href="#card-mesh">Mesh</a>
+    <a href="#card-audit">Privacy</a>
+    <span class="sim-chip" title="Radios, relays, the responder and GNSS are in-memory models. Nothing contacts an emergency service."><span class="dot"></span>Simulation</span>
+  </nav>
+
   <div class="banner" id="banner" hidden></div>
   <div class="toast" id="toast" role="status" hidden></div>
 
   <main class="grid">
-    <section class="card" id="card-form">
-      <div class="card-head">
-        <h2>Wearable form factor</h2>
+    <section class="card wide wear-card" id="card-form">
+      <div class="wear-stage" id="form-art">
+        <div class="stage-glow" aria-hidden="true"></div>
+        <img class="wear-still" id="form-still" alt="" hidden>
+        <div class="stage-hint" id="stage-hint">Drag to turn · tap the pad below and watch the lights</div>
+        <div class="form-picker" id="forms" role="radiogroup" aria-label="Form factor"></div>
       </div>
-      <div class="segmented" id="forms" role="radiogroup" aria-label="Form factor"></div>
-      <div class="form-body">
-        <div class="form-art" id="form-art" aria-hidden="true"></div>
-        <dl class="specs" id="form-specs"></dl>
+      <div class="wear-info">
+        <span class="eyebrow">Wearable form factor</span>
+        <h2 class="wear-name" id="form-name">Ring</h2>
+        <p class="wear-blurb" id="form-blurb"></p>
+        <dl class="spec-tiles" id="form-specs"></dl>
+        <div class="profile" id="profile"></div>
       </div>
-      <div class="profile" id="profile"></div>
     </section>
 
     <section class="card" id="card-tap">
       <div class="card-head">
-        <h2>Tap rhythm calibration</h2>
+        <h2><span class="ico teal"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.5"/><path d="M12 5.5a6.5 6.5 0 0 1 6.5 6.5M5.5 12A6.5 6.5 0 0 1 12 5.5M12 2a10 10 0 0 1 10 10M2 12A10 10 0 0 1 12 2"/></svg></span>Tap rhythm calibration</h2>
         <button class="btn ghost small" id="tap-demo">Show me the rhythm</button>
       </div>
       <div class="tap-row">
         <button class="tap-pad" id="tap-pad" aria-label="Tap pad: click, touch or press Space for each tap">
+          <span class="tap-rings" aria-hidden="true"></span>
           <span>Tap here</span>
           <small>click, touch or Space</small>
         </button>
@@ -74,7 +93,10 @@
       </div>
     </section>
 
-    <section class="card wide cam-access" id="card-camaccess">
+    <section class="card cam-access" id="card-camaccess">
+      <div class="card-head">
+        <h2><span class="ico blue"><svg viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="2.5"/><path d="m16 10.5 5-3v9l-5-3"/></svg></span>Camera</h2>
+      </div>
       <div class="cam-state" id="cam-state" data-tone="">
         <span class="dot" aria-hidden="true"></span>
         <div>
@@ -88,18 +110,23 @@
         </label>
         <button class="btn primary" id="cam-allow">Allow camera</button>
       </div>
+      <ul class="cam-promises">
+        <li>Analysed on this device, frame by frame</li>
+        <li>Never recorded, stored or sent</li>
+        <li>Used by the tap test and emergency signs</li>
+      </ul>
     </section>
 
     <section class="card wide" id="card-camera">
       <div class="card-head">
-        <h2>Camera tap test</h2>
+        <h2><span class="ico violet"><svg viewBox="0 0 24 24"><path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V11m0-6a1.5 1.5 0 0 1 3 0v6m0-4.5a1.5 1.5 0 0 1 3 0V14c0 3.9-2.6 7-6.4 7-3 0-4.6-1.6-5.8-4L3.3 13.8a1.5 1.5 0 0 1 2.6-1.5L8 15"/></svg></span>Camera tap test</h2>
         <span class="muted">Tests the recogniser without a wearable: the camera sees your taps.</span>
       </div>
       <div class="camera-row">
         <div class="viewport" id="viewport">
           <video id="cam-video" playsinline muted></video>
           <div class="roi" id="roi"><span>tap inside this box</span></div>
-          <div class="cam-empty" id="cam-empty">Camera off</div>
+          <div class="cam-empty" id="cam-empty"><span>Camera off</span></div>
           <div class="countdown" id="countdown" hidden></div>
         </div>
         <div class="camera-side">
@@ -126,14 +153,14 @@
 
     <section class="card wide" id="card-signs">
       <div class="card-head">
-        <h2>Emergency signs</h2>
+        <h2><span class="ico pink"><svg viewBox="0 0 24 24"><path d="M12 3 20 6v6c0 4.5-3.4 7.7-8 9-4.6-1.3-8-4.5-8-9V6z"/><path d="M12 8v5M12 16h.01"/></svg></span>Emergency signs</h2>
         <span class="muted">Look at a camera and make a hand sign or a facial expression to send the silent SOS.</span>
       </div>
       <div class="signs-row">
         <div class="viewport" id="sign-viewport">
           <video id="sign-video" playsinline muted></video>
           <canvas id="sign-overlay" class="overlay"></canvas>
-          <div class="cam-empty" id="sign-empty">Camera off</div>
+          <div class="cam-empty" id="sign-empty"><span>Camera off</span></div>
           <div class="hud" id="sign-hud" hidden></div>
         </div>
         <div class="signs-side">
@@ -167,7 +194,7 @@
 
     <section class="card" id="card-bench">
       <div class="card-head">
-        <h2>Recogniser benchmark</h2>
+        <h2><span class="ico amber"><svg viewBox="0 0 24 24"><path d="M4 18a8 8 0 1 1 16 0"/><path d="m12 18 4.5-6"/><path d="M12 18h.01"/></svg></span>Recogniser benchmark</h2>
         <button class="btn small" id="bench-run">Run 2,000 attempts</button>
       </div>
       <div id="bench-body" class="muted">Measures how often the current rhythm is recognised and how often walking, typing and random bumps would trigger a false SOS.</div>
@@ -175,7 +202,7 @@
 
     <section class="card" id="card-zero">
       <div class="card-head">
-        <h2>Zeroization timer</h2>
+        <h2><span class="ico red"><svg viewBox="0 0 24 24"><circle cx="12" cy="13.5" r="7"/><path d="M12 10v3.5l2.2 2.2M9.5 3h5M12 3v3.5"/></svg></span>Zeroization timer</h2>
         <button class="btn small" id="zero-run">Dispatch and wipe</button>
       </div>
       <div id="zero-body"></div>
@@ -184,7 +211,7 @@
 
     <section class="card wide" id="card-mesh">
       <div class="card-head">
-        <h2>Ephemeral mesh hop simulator</h2>
+        <h2><span class="ico teal"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="5" r="2"/><circle cx="19" cy="12" r="2"/><circle cx="12" cy="19" r="2"/><path d="m6.5 10.5 4-4M13.5 6.5l4 4M17.5 13.5l-4 4M10.5 17.5l-4-4"/></svg></span>Ephemeral mesh hop simulator</h2>
         <div class="row wrap">
           <label class="inline">Relays <input id="mesh-relays" type="range" min="1" max="8" value="4"><output id="mesh-relays-out">4</output></label>
           <label class="inline">TTL <input id="mesh-ttl" type="range" min="1" max="10" value="6"><output id="mesh-ttl-out">6</output></label>
@@ -202,7 +229,7 @@
 
     <section class="card wide" id="card-audit">
       <div class="card-head">
-        <h2>Privacy and anti-spyware audit</h2>
+        <h2><span class="ico green"><svg viewBox="0 0 24 24"><path d="M12 3 20 6v6c0 4.5-3.4 7.7-8 9-4.6-1.3-8-4.5-8-9V6z"/><path d="m8.5 12 2.5 2.5 4.5-5"/></svg></span>Privacy and anti-spyware audit</h2>
         <button class="btn small" id="audit-run">Run audit</button>
       </div>
       <ul class="checks columns" id="audit-list"></ul>
