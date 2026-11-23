@@ -423,6 +423,13 @@ async fn uninstall_service() -> Result<String, String> {
     .await
 }
 
+/// The embedded AegisMesh console (ui/aegismesh) calls this through the parent window.
+/// Every operation is a local, in-memory simulation in aegismesh-core.
+#[tauri::command]
+async fn aegismesh(op: String, request: serde_json::Value) -> Result<serde_json::Value, String> {
+    aegismesh_core::console::handle(&op, &request)
+}
+
 fn main() {
     tauri::Builder::default()
         .register_uri_scheme_protocol(appearance::WALLPAPER_SCHEME, |ctx, request| {
@@ -443,7 +450,8 @@ fn main() {
             appearance::save_appearance,
             appearance::resolve_wallpaper_url,
             appearance::download_wallpaper,
-            appearance::save_wallpaper_file
+            appearance::save_wallpaper_file,
+            aegismesh
         ])
         .run(tauri::generate_context!())
         .expect("failed to start The Nex desktop app");

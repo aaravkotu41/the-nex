@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AegisMesh",
+  "version": "0.2.0",
+  "identifier": "com.aegismesh.console",
+  "build": {
+    "frontendDist": "../../ui/aegismesh"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "AegisMesh Simulation Console",
+        "width": 1240,
+        "height": 840,
+        "minWidth": 980,
+        "minHeight": 640,
+        "center": true,
+        "resizable": true,
+        "theme": "Dark",
+        "backgroundColor": "#0A0B0D"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"]
+  }
+}

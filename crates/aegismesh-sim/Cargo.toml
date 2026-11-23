@@ -1,0 +1,15 @@
+[package]
+name = "aegismesh-sim"
+description = "AegisMesh simulation harness: silent tap-to-relay delivery and memory wipe, all in memory"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aegismesh-sim"
+path = "src/main.rs"
+
+[dependencies]
+aegismesh-core.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

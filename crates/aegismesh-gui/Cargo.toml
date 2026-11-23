@@ -1,0 +1,18 @@
+[package]
+name = "aegismesh-gui"
+description = "AegisMesh simulation console (Tauri v2, plain HTML/CSS/JS frontend in ui/aegismesh)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aegismesh-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+aegismesh-core.workspace = true
+tauri.workspace = true
+serde_json.workspace = true

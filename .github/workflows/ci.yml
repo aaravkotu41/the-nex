@@ -127,6 +127,11 @@ jobs:
           python -m pip install --disable-pip-version-check pefile
           python scripts/check_feature_parity.py --binary target\release\the-nex.exe --extra target\release\the-nex.exe --extra target\release\the-nex-gui.exe --extra target\TheNexSetup.exe
 
+      # Every AegisMesh scenario for every form factor, in a sandbox that must stay empty.
+      - name: AegisMesh simulation verification
+        if: ${{ !cancelled() && steps.release.outcome == 'success' }}
+        run: python scripts/verify_aegismesh.py --skip-build --skip-tests
+
       # Installs for real on the runner (silent), checks the service is up, then uninstalls.
       - name: Installer smoke test (install, verify, uninstall)
         if: ${{ !cancelled() && steps.installer.outcome == 'success' }}
@@ -182,6 +187,15 @@ jobs:
             target/release/the-nex-gui.exe
             thenex_model.onnx
             crates/the-nex-gui/icons/icon.ico
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && steps.release.outcome == 'success' }}
+        with:
+          name: aegismesh-windows-x64
+          path: |
+            target/release/aegismesh-sim.exe
+            target/release/aegismesh-gui.exe
           if-no-files-found: error
 
       - uses: actions/upload-artifact@v7
@@ -244,6 +258,12 @@ jobs:
       - name: Live end-to-end verification
         if: ${{ !cancelled() && steps.dmg.outcome == 'success' }}
         run: python scripts/verify_thenex.py --skip-build
+
+      - name: AegisMesh simulation verification
+        if: ${{ !cancelled() && steps.check.outcome == 'success' }}
+        run: |
+          cargo build --release -p aegismesh-sim --locked
+          python scripts/verify_aegismesh.py --skip-build --skip-tests
 
       # The Mach-O side is trained on synthetic profiles only, so this run on real macOS
       # programs is its reality check (no pefile parity on macOS: there are no PE files here).

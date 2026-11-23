@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Generate The Nex icons with the standard library only (no Pillow).
+"""Generate app icons with the standard library only (no Pillow).
 
-Writes crates/the-nex-gui/icons/{icon.png, 32x32.png, 128x128.png, icon.ico, icon.icns}:
-a white geometric "N" on a matte #0A0B0D rounded square. Edges are anti-aliased with exact
-horizontal coverage per scanline, so the 16 px tray size stays crisp.
+Writes <crate>/icons/{icon.png, 32x32.png, 128x128.png, icon.ico, icon.icns} on a matte #0A0B0D
+rounded square: The Nex's white geometric "N" (default) or, with --variant aegismesh, the
+AegisMesh shield. Edges are anti-aliased with exact horizontal coverage per scanline, so the
+16 px tray size stays crisp.
 """
 
 import argparse
@@ -14,7 +15,6 @@ import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUT = ROOT / "crates" / "the-nex-gui" / "icons"
 
 BACKGROUND = (10, 11, 13)
 FOREGROUND = (255, 255, 255)
@@ -23,17 +23,28 @@ VERTICAL_SAMPLES = 4
 # Same outline as the sidebar logo in ui/index.html (32-unit grid).
 MONOGRAM = [(7, 26), (7, 6), (11.2, 6), (21, 19.4), (21, 6), (25, 6), (25, 26), (20.8, 26), (11, 12.6), (11, 26)]
 ICO_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
+# Shield outline with a beacon at its centre (even-odd fill: outline minus hole plus core).
+SHIELD = [
+    [(16, 3.5), (26.5, 7), (26, 16.5), (22.5, 23), (16, 28.5), (9.5, 23), (6, 16.5), (5.5, 7)],
+    [(16, 7.4), (22.8, 9.7), (22.4, 16.1), (19.8, 20.9), (16, 24.3), (12.2, 20.9), (9.6, 16.1), (9.2, 9.7)],
+    [(16, 11.2), (19.3, 15.4), (16, 19.6), (12.7, 15.4)],
+]
+VARIANTS = {
+    "thenex": (ROOT / "crates" / "the-nex-gui" / "icons", [MONOGRAM]),
+    "aegismesh": (ROOT / "crates" / "aegismesh-gui" / "icons", SHIELD),
+}
 
 
-def polygon_spans(points, y):
-    """Even-odd interior intervals of the polygon on horizontal line y."""
+def polygon_spans(polygons, y):
+    """Even-odd interior intervals of the polygons on horizontal line y."""
     xs = []
-    count = len(points)
-    for i in range(count):
-        x1, y1 = points[i]
-        x2, y2 = points[(i + 1) % count]
-        if (y1 <= y < y2) or (y2 <= y < y1):
-            xs.append(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
+    for points in polygons:
+        count = len(points)
+        for i in range(count):
+            x1, y1 = points[i]
+            x2, y2 = points[(i + 1) % count]
+            if (y1 <= y < y2) or (y2 <= y < y1):
+                xs.append(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
     xs.sort()
     return [(xs[i], xs[i + 1]) for i in range(0, len(xs) - 1, 2)]
 
@@ -67,9 +78,9 @@ def accumulate(coverage, spans, width, weight):
                 coverage[px] += overlap * weight
 
 
-def render(size):
+def render(size, shapes):
     scale = size / 32.0
-    points = [(x * scale, y * scale) for x, y in MONOGRAM]
+    points = [[(x * scale, y * scale) for x, y in shape] for shape in shapes]
     radius = CORNER_RADIUS * size
     weight = 1.0 / VERTICAL_SAMPLES
     rows = []
@@ -94,12 +105,12 @@ def render(size):
     return rows
 
 
-def png_bytes(size):
+def png_bytes(size, shapes):
     def chunk(kind, data):
         body = kind + data
         return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
 
-    raw = b"".join(b"\x00" + row for row in render(size))
+    raw = b"".join(b"\x00" + row for row in render(size, shapes))
     header = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)  # 8-bit RGBA, as tauri-codegen requires
     return (
         b"\x89PNG\r\n\x1a\n"
@@ -135,12 +146,15 @@ def validate_png(data, size):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate The Nex icons.")
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser = argparse.ArgumentParser(description="Generate app icons.")
+    parser.add_argument("--variant", choices=sorted(VARIANTS), default="thenex")
+    parser.add_argument("--out", type=Path)
     args = parser.parse_args()
-    args.out.mkdir(parents=True, exist_ok=True)
+    default_out, shapes = VARIANTS[args.variant]
+    out = args.out or default_out
+    out.mkdir(parents=True, exist_ok=True)
 
-    pngs = {size: png_bytes(size) for size in ICO_SIZES}
+    pngs = {size: png_bytes(size, shapes) for size in ICO_SIZES}
     for size, data in pngs.items():
         validate_png(data, size)
 
@@ -152,7 +166,7 @@ def main():
         "icon.icns": icns_bytes([(128, pngs[128]), (256, pngs[256])]),
     }
     for name, data in outputs.items():
-        target = args.out / name
+        target = out / name
         target.write_bytes(data)
         print(f"{target}  {len(data):,} B")
     return 0

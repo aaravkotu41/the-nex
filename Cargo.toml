@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/the-nex-core", "crates/the-nex-daemon", "crates/the-nex-gui"]
+members = [
+    "crates/the-nex-core",
+    "crates/the-nex-daemon",
+    "crates/the-nex-gui",
+    "crates/aegismesh-core",
+    "crates/aegismesh-sim",
+    "crates/aegismesh-gui",
+]
 
 [workspace.package]
 version = "0.2.0"
@@ -9,6 +16,7 @@ publish = false
 
 [workspace.dependencies]
 the-nex-core = { path = "crates/the-nex-core" }
+aegismesh-core = { path = "crates/aegismesh-core" }
 notify = "6"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 goblin = "0.9"
@@ -19,6 +27,9 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 notify-rust = "4"
 sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+# OS CSPRNG for AegisMesh ephemeral keys and nonces (already in the lockfile via tauri).
+getrandom = "0.2"
 windows-service = "0.7"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

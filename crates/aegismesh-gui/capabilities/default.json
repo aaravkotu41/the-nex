@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Main window: core IPC only; the one app command is aegismesh in src/main.rs.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

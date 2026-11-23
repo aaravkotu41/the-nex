@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AegisMesh Console</title>
+  <link rel="stylesheet" href="console.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" aria-hidden="true">
+        <path fill-rule="evenodd" fill="currentColor" d="M16 3.5 26.5 7 26 16.5 22.5 23 16 28.5 9.5 23 6 16.5 5.5 7z M16 7.4 9.2 9.7 9.6 16.1 12.2 20.9 16 24.3 19.8 20.9 22.4 16.1 22.8 9.7z M16 11.2 19.3 15.4 16 19.6 12.7 15.4z"/>
+      </svg>
+      <div>
+        <strong>AegisMesh</strong>
+        <span>Silent SOS for everyday wearables</span>
+      </div>
+    </div>
+    <div class="sim-badge" title="Radios, relays, the responder and GNSS are in-memory models. Nothing contacts an emergency service.">
+      <span class="dot"></span>Simulation only: no real radio, network or emergency service
+    </div>
+  </header>
+
+  <div class="banner" id="banner" hidden></div>
+  <div class="toast" id="toast" role="status" hidden></div>
+
+  <main class="grid">
+    <section class="card" id="card-form">
+      <div class="card-head">
+        <h2>Wearable form factor</h2>
+      </div>
+      <div class="segmented" id="forms" role="radiogroup" aria-label="Form factor"></div>
+      <div class="form-body">
+        <div class="form-art" id="form-art" aria-hidden="true"></div>
+        <dl class="specs" id="form-specs"></dl>
+      </div>
+      <div class="profile" id="profile"></div>
+    </section>
+
+    <section class="card" id="card-tap">
+      <div class="card-head">
+        <h2>Tap rhythm calibration</h2>
+        <button class="btn ghost small" id="tap-demo">Show me the rhythm</button>
+      </div>
+      <div class="tap-row">
+        <button class="tap-pad" id="tap-pad" aria-label="Tap pad: click, touch or press Space for each tap">
+          <span>Tap here</span>
+          <small>click, touch or Space</small>
+        </button>
+        <div class="tap-side">
+          <canvas id="tap-timeline" class="timeline" height="96"></canvas>
+          <div class="row">
+            <button class="btn primary" id="tap-test">Test rhythm</button>
+            <button class="btn" id="tap-clear">Clear</button>
+            <span class="muted mono" id="tap-count">0 taps</span>
+          </div>
+        </div>
+      </div>
+      <div class="verdict" id="tap-verdict"></div>
+      <div class="calibrate">
+        <p class="muted">Your own rhythm: tap it once (pad or camera), add it as a sample, repeat 3 times, then build.</p>
+        <div class="row wrap">
+          <input id="cal-name" type="text" maxlength="60" placeholder="Rhythm name" autocomplete="off">
+          <label class="inline">Perform
+            <select id="cal-repeats"><option value="1">once</option><option value="2" selected>twice</option><option value="3">3 times</option></select>
+          </label>
+          <button class="btn" id="cal-add">Add sample (0)</button>
+          <button class="btn primary" id="cal-build" disabled>Build profile</button>
+          <button class="btn ghost" id="cal-reset">Default rhythm</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card wide" id="card-camera">
+      <div class="card-head">
+        <h2>Camera tap test</h2>
+        <span class="muted">Tests the recogniser without a wearable: the camera sees your taps.</span>
+      </div>
+      <div class="camera-row">
+        <div class="viewport" id="viewport">
+          <video id="cam-video" playsinline muted></video>
+          <div class="roi" id="roi"><span>tap inside this box</span></div>
+          <div class="cam-empty" id="cam-empty">Camera off</div>
+          <div class="countdown" id="countdown" hidden></div>
+        </div>
+        <div class="camera-side">
+          <div class="row wrap">
+            <button class="btn primary" id="cam-start">Start camera</button>
+            <button class="btn" id="cam-synthetic">Simulated camera</button>
+            <button class="btn ghost" id="cam-stop" disabled>Stop</button>
+            <button class="btn ghost" id="cam-selftest" title="Runs a simulated hand through the camera pipeline frame by frame">Self-test</button>
+          </div>
+          <canvas id="cam-energy" class="timeline" height="120"></canvas>
+          <div class="row wrap">
+            <button class="btn primary" id="cam-record" disabled>Record</button>
+            <label class="inline">Sensitivity
+              <input id="cam-sens" type="range" min="3" max="9" step="0.5" value="5">
+            </label>
+            <button class="btn ghost" id="cam-use" disabled>Use as calibration sample</button>
+          </div>
+          <div class="verdict" id="cam-verdict"></div>
+          <p class="hint">Hold one hand inside the box and tap your fingers against your palm at a relaxed pace (about 3 taps a second). Frames are analysed in this window as brightness changes only; video is never recorded, stored or sent.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" id="card-bench">
+      <div class="card-head">
+        <h2>Recogniser benchmark</h2>
+        <button class="btn small" id="bench-run">Run 2,000 attempts</button>
+      </div>
+      <div id="bench-body" class="muted">Measures how often the current rhythm is recognised and how often walking, typing and random bumps would trigger a false SOS.</div>
+    </section>
+
+    <section class="card" id="card-zero">
+      <div class="card-head">
+        <h2>Zeroization timer</h2>
+        <button class="btn small" id="zero-run">Dispatch and wipe</button>
+      </div>
+      <div id="zero-body"></div>
+      <div class="frames" id="frames"></div>
+    </section>
+
+    <section class="card wide" id="card-mesh">
+      <div class="card-head">
+        <h2>Ephemeral mesh hop simulator</h2>
+        <div class="row wrap">
+          <label class="inline">Relays <input id="mesh-relays" type="range" min="1" max="8" value="4"><output id="mesh-relays-out">4</output></label>
+          <label class="inline">TTL <input id="mesh-ttl" type="range" min="1" max="10" value="6"><output id="mesh-ttl-out">6</output></label>
+          <label class="inline"><input id="mesh-redundant" type="checkbox" checked> Extra paths</label>
+          <label class="inline"><input id="mesh-late" type="checkbox" checked> Responder in range late</label>
+          <button class="btn primary small" id="mesh-run">Run</button>
+        </div>
+      </div>
+      <svg id="mesh-svg" class="mesh" viewBox="0 0 1000 190" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Mesh relay simulation"></svg>
+      <div class="mesh-foot">
+        <div class="stats" id="mesh-stats"></div>
+        <ul class="checks" id="mesh-checks"></ul>
+      </div>
+    </section>
+
+    <section class="card wide" id="card-audit">
+      <div class="card-head">
+        <h2>Privacy and anti-spyware audit</h2>
+        <button class="btn small" id="audit-run">Run audit</button>
+      </div>
+      <ul class="checks columns" id="audit-list"></ul>
+    </section>
+  </main>
+
+  <script src="console.js"></script>
+</body>
+</html>

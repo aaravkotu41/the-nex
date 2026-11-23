@@ -13,6 +13,7 @@ const PAGE_TITLES = {
   quarantine: "Quarantine",
   canaries: "Canaries",
   settings: "Settings",
+  aegismesh: "AegisMesh",
 };
 const TOGGLE_FIELDS = {
   zip_bomb: "zip_bomb_enabled",
@@ -415,6 +416,9 @@ function showPage(page) {
   for (const item of document.querySelectorAll(".nav-item")) item.classList.toggle("active", item.dataset.page === page);
   for (const section of document.querySelectorAll(".page")) section.classList.toggle("active", section.id === `page-${page}`);
   $("page-title").textContent = PAGE_TITLES[page];
+  // The AegisMesh console loads on first visit only (it can open the camera).
+  const frame = $("aegismesh-frame");
+  if (page === "aegismesh" && frame && !frame.getAttribute("src")) frame.setAttribute("src", "aegismesh/index.html");
   refresh(true);
 }
 

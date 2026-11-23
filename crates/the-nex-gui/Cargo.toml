@@ -14,6 +14,7 @@ tauri-build.workspace = true
 
 [dependencies]
 the-nex-core.workspace = true
+aegismesh-core.workspace = true
 tauri.workspace = true
 serde.workspace = true
 serde_json.workspace = true

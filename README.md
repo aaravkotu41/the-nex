@@ -12,6 +12,9 @@ and ransomware canary files, with a Tauri desktop dashboard.
 - `crates/the-nex-core`: detection engines, quarantine, platform layer
 - `crates/the-nex-daemon`: the `the-nex` service / CLI (`--help` lists every mode)
 - `crates/the-nex-gui`: Tauri v2 desktop app; its frontend is the plain HTML/CSS/JS in `ui/`
+- `crates/aegismesh-*`: AegisMesh silent-SOS wearable simulation (core library, `aegismesh-sim`
+  CLI, `aegismesh-gui` console; the console is also the AegisMesh page of The Nex app).
+  Simulation only: no radio, network or emergency service is ever used.
 - `packaging/windows/installer.nsi`: Windows installer; `packaging/macos/`: app bundle, DMG and pkg
 - `scripts/`: icon and model generation, live verifier, developer install scripts
 
