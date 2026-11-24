@@ -1041,7 +1041,7 @@ mod tray {
                     .tail
                     .poll()
                     .into_iter()
-                    .filter(|e| ALERT_TYPES.contains(&e.threat_type.as_str()))
+                    .filter(|e| !e.quiet && ALERT_TYPES.contains(&e.threat_type.as_str()))
                     .collect();
                 state.alerts += fresh.len() as u64;
                 if let Some(last) = fresh.last() {

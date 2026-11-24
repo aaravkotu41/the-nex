@@ -42,14 +42,18 @@ fn status_text() -> String {
 
 fn scan_text(report: Result<the_nex_core::engine::QuickScanReport, String>) -> String {
     match report {
-        // Errors can hold long paths; keep the menu narrow (full text is in the dashboard).
-        Err(e) if e.chars().count() > 48 => {
+        // Errors can hold long paths; cap the menu width (full text is in the dashboard).
+        Err(e) if e.chars().count() > 90 => {
             format!(
                 "Last scan failed: {}…",
-                e.chars().take(48).collect::<String>()
+                e.chars().take(90).collect::<String>()
             )
         }
         Err(e) => format!("Last scan failed: {e}"),
+        Ok(r) if !r.unreadable.is_empty() => format!(
+            "Last scan: macOS blocked {} folder(s) · open The Nex",
+            r.unreadable.len()
+        ),
         Ok(r) if r.findings.is_empty() => format!(
             "Last scan: no threats · {} files · {:.1} s",
             r.files_scanned,
@@ -72,6 +76,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "open", "Open The Nex", true, None::<&str>)?,
             &scan,
+            &MenuItem::with_id(app, "fullscan", "Full Scan", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "activity", "Activity", true, None::<&str>)?,
             &MenuItem::with_id(app, "quarantine", "Quarantine", true, None::<&str>)?,
@@ -98,7 +103,9 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "open" => show_main(app),
             "scan" => quick_scan(app, &scan, &status, &last_scan),
-            page @ ("activity" | "quarantine" | "settings") => open_main(app, Some(page)),
+            page @ ("activity" | "quarantine" | "settings" | "fullscan") => {
+                open_main(app, Some(page))
+            }
             "quit" => app.exit(0),
             _ => {}
         })
@@ -117,7 +124,11 @@ fn quick_scan(
     let (app, scan, status, last_scan) =
         (app.clone(), scan.clone(), status.clone(), last_scan.clone());
     std::thread::spawn(move || {
-        let _ = last_scan.set_text(scan_text(crate::quick_scan(false)));
+        let result = crate::quick_scan(false);
+        // A scan started from the dashboard is still running: keep the previous result line.
+        if result.as_ref().err().map(String::as_str) != Some(crate::SCAN_BUSY) {
+            let _ = last_scan.set_text(scan_text(result));
+        }
         let _ = status.set_text(status_text());
         let _ = scan.set_text("Quick Scan");
         let _ = scan.set_enabled(true);
@@ -156,9 +167,17 @@ fn open_main(app: &AppHandle, page: Option<&str>) {
     if let Some(page) = page {
         config.url = WebviewUrl::App(format!("index.html#{page}").into());
     }
-    if let Ok(window) = WebviewWindowBuilder::from_config(app, &config).and_then(|b| b.build()) {
+    match WebviewWindowBuilder::from_config(app, &config).and_then(|b| b.build()) {
         // From Accessory the app is not frontmost; set_focus on the window activates it.
-        let _ = window.set_focus();
+        Ok(window) => {
+            let _ = window.set_focus();
+        }
+        Err(e) => {
+            // No window: go back to being a menu-bar app instead of an empty Dock icon.
+            eprintln!("The Nex could not reopen its window: {e}");
+            IN_MENU_BAR.store(true, Ordering::SeqCst);
+            let _ = app.set_activation_policy(ActivationPolicy::Accessory);
+        }
     }
 }
 

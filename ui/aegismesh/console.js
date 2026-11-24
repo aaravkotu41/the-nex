@@ -889,7 +889,7 @@
 
   async function startCamera(kind) {
     stopCamera();
-    if (signs.stream) stopSigns();
+    if (signs.stream || signs.starting) stopSigns();
     let stream;
     if (kind === "real") {
       stream = await openCamera();
@@ -1191,24 +1191,40 @@
     el.textContent = text || "";
   }
 
-  async function startSigns() {
-    if (cam.stream) stopCamera();
-    await loadVision();
-    const stream = await openCamera();
-    signs.stream = stream;
-    signs.lastSeen = performance.now();
-    signs.lastTip = 0;
-    signs.fpsFrames = 0;
-    signs.fpsSince = performance.now();
-    signs.watcher = new window.AegisSigns.SignWatcher({ enabled: signs.enabled, customs: activeCustoms() });
-    const video = $("sign-video");
-    video.srcObject = stream;
-    await video.play();
-    setSignUi(true);
-    scheduleSignFrame();
+  // Starting takes a few seconds (the vision models, then the camera). One start at a time and
+  // never over a running watch: a second stream would replace the first in `signs.stream` and
+  // leave that camera on with nothing able to stop it. Callers that arrive mid-start (a
+  // trigger's Test, Teach it) wait for the start already under way.
+  function startSigns() {
+    if (signs.stream) return Promise.resolve();
+    if (signs.starting) return signs.starting;
+    const run = (signs.startRun = (signs.startRun || 0) + 1);
+    signs.starting = (async () => {
+      if (cam.stream) stopCamera();
+      await loadVision();
+      const stream = await openCamera();
+      if (run !== signs.startRun) {
+        // Stopped while it was starting: close the camera that has just opened.
+        for (const track of stream.getTracks()) track.stop();
+        return;
+      }
+      signs.stream = stream;
+      signs.lastSeen = performance.now();
+      signs.lastTip = 0;
+      signs.fpsFrames = 0;
+      signs.fpsSince = performance.now();
+      signs.watcher = new window.AegisSigns.SignWatcher({ enabled: signs.enabled, customs: activeCustoms() });
+      const video = $("sign-video");
+      video.srcObject = stream;
+      await video.play();
+      setSignUi(true);
+      scheduleSignFrame();
+    })().finally(() => { signs.starting = null; });
+    return signs.starting;
   }
 
   function stopSigns() {
+    signs.startRun = (signs.startRun || 0) + 1; // a start still under way must not switch the camera on
     const video = $("sign-video");
     if (signs.usesVideoCallback && signs.frameHandle && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(signs.frameHandle);
     else if (signs.frameHandle) cancelAnimationFrame(signs.frameHandle);
@@ -1326,6 +1342,7 @@
     const info = signInfo(target);
     if (!info || signs.teaching) return;
     if (!signs.stream) await startSigns();
+    if (!signs.stream) return; // the start was stopped (camera test opened, page closing)
     // A fresh watcher, so the cool-down of an earlier trigger cannot hide this one; the tested
     // sign counts even if it is switched off for normal watching.
     freshWatcher(target.startsWith("custom:") ? [] : [target], target.startsWith("custom:") ? target.slice(7) : null);
@@ -1535,6 +1552,7 @@
       return;
     }
     if (!signs.stream) await startSigns();
+    if (!signs.stream) return; // the start was stopped (camera test opened, page closing)
     signs.test = null;
     $("sign-test").innerHTML = "";
     const replacing = !improving && signs.customs.some((m) => m.name.toLowerCase() === name.toLowerCase());
@@ -2035,7 +2053,11 @@
     $("cam-use").addEventListener("click", () => addSample(cam.result ? cam.result.onsets.taps_ms : []));
     $("cam-selftest").addEventListener("click", (e) => guarded(e.currentTarget, "Testing…", cameraSelfTest));
 
-    $("sign-start").addEventListener("click", (e) => guarded(e.currentTarget, "Starting…", startSigns));
+    // guarded() re-enables the button when it finishes; put it back in step with the watch.
+    $("sign-start").addEventListener("click", async (e) => {
+      await guarded(e.currentTarget, "Starting…", startSigns);
+      setSignUi(Boolean(signs.stream));
+    });
     $("sign-stop").addEventListener("click", stopSigns);
     $("teach-start").addEventListener("click", () => startTeaching().catch((error) => toast(errorText(error), true)));
     $("sign-discreet").addEventListener("change", () => { if ($("sign-discreet").checked && !signs.test && !signs.teaching) hud(""); });

@@ -52,6 +52,10 @@ pub struct ThreatEvent {
     pub target: String,
     pub action_taken: String,
     pub details: String,
+    /// Recorded without a desktop notification (one finding among many in a full scan; the
+    /// scan's own summary event is the alert).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quiet: bool,
 }
 
 impl ThreatEvent {
@@ -70,6 +74,7 @@ impl ThreatEvent {
             target: target.into(),
             action_taken: action_taken.into(),
             details: details.into(),
+            quiet: false,
         }
     }
 
@@ -172,6 +177,10 @@ pub fn append_event(cfg: &AppConfig, event: &ThreatEvent) -> io::Result<()> {
 }
 
 pub fn record_event(cfg: &AppConfig, event: ThreatEvent) {
+    let event = ThreatEvent {
+        quiet: event.quiet || cfg.quiet_events,
+        ..event
+    };
     let summary = format!(
         "{} [{}] target={} action={} details={}",
         event.threat_type,
@@ -192,7 +201,7 @@ pub fn record_event(cfg: &AppConfig, event: ThreatEvent) {
             cfg.events_log.display()
         ));
     }
-    if cfg.interactive {
+    if cfg.interactive && !event.quiet {
         platform::send_desktop_notification_async(
             &notification_title(&event),
             &notification_body(&event),

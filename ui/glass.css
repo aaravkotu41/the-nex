@@ -31,7 +31,7 @@
 :root[data-glass="mac"] #bg-wallpaper { background: rgba(var(--scrim-rgb), 0.88) var(--wallpaper) center / cover no-repeat; }
 :root[data-glass="mac"] #bg-scrim { background: rgba(var(--scrim-rgb), var(--bg-dim)); }
 
-:root[data-glass="mac"] :is(.panel, .stat, .aegis-tile, .scan-sheet, .notice, .search, .icon-btn, .top-status, .service-icon, .login-card, .account) {
+:root[data-glass="mac"] :is(.panel, .stat, .aegis-tile, .scan-sheet, .notice, .search, .icon-btn, .top-status, .service-icon, .login-card, .account, .nav, .scan-full) {
   background: var(--glass);
   -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
   box-shadow: var(--glass-shadow), inset 0 0 0 1px var(--glass-edge), inset 0 1px 0 var(--glass-hi);
@@ -43,7 +43,7 @@
 :root[data-glass="mac"] .search kbd, :root[data-glass="mac"] .search-icon { background: var(--chip); }
 
 /* Nav: inactive pills stay clear, active stays solid ink. */
-:root[data-glass="mac"] .nav-item:hover { background: var(--glass); }
+:root[data-glass="mac"] .nav-item:hover { background: var(--chip); }
 :root[data-glass="mac"] .nav-item.active { background: var(--ink); color: var(--on-ink); }
 
 /* Mint hero + login hero keep their glass recipe, slightly more see-through. */

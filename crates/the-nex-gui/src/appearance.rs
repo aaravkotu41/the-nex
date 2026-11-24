@@ -76,7 +76,7 @@ impl Appearance {
             wallpaper_source,
             bg_dim: finite_or(self.bg_dim, defaults.bg_dim).clamp(0.0, 0.9),
             card_blur: finite_or(self.card_blur, defaults.card_blur).clamp(0.0, 24.0),
-            card_alpha: finite_or(self.card_alpha, defaults.card_alpha).clamp(0.3, 0.95),
+            card_alpha: finite_or(self.card_alpha, defaults.card_alpha).clamp(0.3, 1.0),
         }
     }
 }

@@ -16,9 +16,10 @@ use std::path::{Path, PathBuf};
 use the_nex_core::bin_ai::BinaryAiScanner;
 use the_nex_core::canary;
 use the_nex_core::config::{AppConfig, Engine, RuntimeToggles, ZipLimits};
-use the_nex_core::engine::{self, QuickScanReport};
+use the_nex_core::engine::{self, QuickScanReport, ScanKind};
 use the_nex_core::platform;
 use the_nex_core::quarantine::{self, QuarantineMeta, Severity, ThreatEvent};
+use the_nex_core::scan_jobs::{self, ScanProgress};
 use the_nex_core::status::{self, CanaryStatus, EngineStatus};
 
 const EVENT_TAIL_BYTES: u64 = 4 * 1024 * 1024;
@@ -345,13 +346,60 @@ static SCAN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Shared by the `run_quick_scan` command and the macOS menu bar; blocks until the scan ends.
 /// Only one scan runs at a time. A `remote` caller never triggers an admin prompt.
+const SCAN_BUSY: &str = scan_jobs::BUSY;
+const QUICK_SCAN_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The running service does on-demand scans itself: no password prompt, and on macOS it is the
+/// process that holds Full Disk Access.
+fn service_scans(cfg: &AppConfig) -> bool {
+    fresh_status(cfg).is_some() && scan_jobs::available(cfg)
+}
+
+/// Whole-disk, report-only scan. Returns at once; the UI follows `scan_progress`.
+#[tauri::command]
+async fn start_full_scan() -> Result<(), String> {
+    blocking(|| {
+        let cfg = config();
+        if !service_scans(&cfg) {
+            return Err(
+                "A full scan is run by the background service. Install or restart it in Settings, then try again."
+                    .to_string(),
+            );
+        }
+        scan_jobs::request(&cfg, ScanKind::Full)
+    })
+    .await
+}
+
+/// Live progress of the service's current scan; `running` is false once it stops updating.
+#[tauri::command]
+fn scan_progress() -> Option<ScanProgress> {
+    scan_jobs::read_progress(&config()).map(|p| ScanProgress {
+        running: p.is_live(),
+        ..p
+    })
+}
+
+#[tauri::command]
+fn cancel_scan() -> Result<(), String> {
+    scan_jobs::request_cancel(&config())
+}
+
+#[tauri::command]
+fn last_full_scan() -> Option<QuickScanReport> {
+    engine::read_scan_report(&config(), ScanKind::Full)
+}
+
 fn quick_scan(remote: bool) -> Result<QuickScanReport, String> {
     let _guard = match SCAN_LOCK.try_lock() {
         Ok(guard) => guard,
-        Err(std::sync::TryLockError::WouldBlock) => return Err("A scan is already running".into()),
+        Err(std::sync::TryLockError::WouldBlock) => return Err(SCAN_BUSY.into()),
         Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
     };
     let cfg = config();
+    if service_scans(&cfg) {
+        return scan_jobs::request_and_wait(&cfg, ScanKind::Quick, QUICK_SCAN_WAIT);
+    }
     if writable(&cfg.quarantine_dir) && writable(&cfg.log_dir) {
         let scanner =
             BinaryAiScanner::load(&cfg.model_path).with_max_scan_bytes(cfg.max_ai_scan_bytes);
@@ -528,7 +576,11 @@ fn main() {
             appearance::save_wallpaper_file,
             aegismesh,
             camera_access,
-            open_camera_settings
+            open_camera_settings,
+            start_full_scan,
+            scan_progress,
+            cancel_scan,
+            last_full_scan
         ])
         .build(tauri::generate_context!())
         .expect("failed to start The Nex desktop app");

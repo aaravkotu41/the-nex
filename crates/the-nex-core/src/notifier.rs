@@ -117,7 +117,8 @@ fn deliver(events: &[ThreatEvent], events_path: &std::path::Path) {
 pub fn run_notifier(cfg: &AppConfig, shutdown: Arc<AtomicBool>) {
     let mut tail = EventTail::new(cfg.events_log.clone());
     while !shutdown.load(Ordering::SeqCst) {
-        let events = tail.poll();
+        let mut events = tail.poll();
+        events.retain(|e| !e.quiet);
         // A tray icon in this session already toasts alerts; stay quiet to avoid duplicates.
         if !events.is_empty() && !platform::tray_is_running() {
             deliver(&events, &cfg.events_log);

@@ -448,6 +448,8 @@ function renderDashboard(d) {
   }
   setCount($("stat-scanned"), d.scanned);
   setCount($("stat-threats"), d.threats_detected);
+  // In dry run nothing is stopped: say what actually happened.
+  $("stat-threats-sub").textContent = d.dry_run ? "detected (dry run)" : "stopped so far";
   setCount($("stat-quarantined"), d.quarantined);
   $("stat-cpu").textContent = online ? `${(d.daemon.cpu_percent || 0).toFixed(1)}%` : "—";
   renderScore(d);
@@ -661,7 +663,7 @@ function renderOffline(reason) {
   $("service-state").className = "pill status red";
   $("service-state").textContent = "Unavailable";
   renderToggles(null, false);
-  for (const id of ["quick-scan", "verify-canaries", "install-service", "uninstall-service"]) $(id).disabled = true;
+  for (const id of ["quick-scan", "full-scan", "verify-canaries", "install-service", "uninstall-service"]) $(id).disabled = true;
 }
 
 function matchesQuery(...fields) {
@@ -838,7 +840,7 @@ async function refresh(force) {
     if (seq !== refreshSeq) return;
     state.dashboard = dashboard;
     renderDashboard(state.dashboard);
-    for (const id of ["quick-scan", "verify-canaries", "install-service"]) {
+    for (const id of ["quick-scan", "full-scan", "verify-canaries", "install-service"]) {
       if (!$(id).dataset.busy) $(id).disabled = false;
     }
     await loadEvents();
@@ -899,14 +901,9 @@ async function runQuickScan() {
   clearTimeout(scanUi.hideTimer);
   const button = $("quick-scan");
   button.classList.add("scanning");
-  button.dataset.busy = "1"; // the 2 s refresh leaves a busy button alone
-  button.disabled = true;
   button.querySelector(".scan-label").textContent = "Scanning…";
-  $("hero").classList.add("scanning");
+  beginScan();
   const sheet = $("scan-sheet");
-  $("scan-findings").replaceChildren();
-  $("scan-view").hidden = true;
-  $("scan-close").hidden = true;
   const roots = (state.dashboard && state.dashboard.watched_dirs) || [];
   setScanSheet("running", "Quick scan running", roots.length ? `Checking ${roots[0]}…` : "Checking your watched folders…");
   sheet.hidden = false;
@@ -935,38 +932,143 @@ async function runQuickScan() {
   clearInterval(scanUi.ticker);
 
   button.classList.remove("scanning");
-  delete button.dataset.busy;
-  button.disabled = false;
   button.querySelector(".scan-label").textContent = "Quick Scan";
-  $("hero").classList.remove("scanning");
-  state.scanning = false;
-  $("scan-close").hidden = false;
-
-  if (failure) {
-    setScanSheet("error", "The scan could not run", errorText(failure));
-  } else {
-    const threats = report.findings.length;
-    const seconds = ((report.duration_ms || 0) / 1000).toFixed(1);
-    $("scan-time").textContent = `${seconds} s`;
-    const folders = report.roots.length;
-    const notes = [
-      `${count(report.files_scanned)} of ${count(report.files_examined)} files inspected in ${seconds} s across ${folders} folder${folders === 1 ? "" : "s"}`,
-      report.dry_run ? "dry run: nothing was moved" : "",
-      report.truncated ? "stopped at the file limit" : "",
-    ].filter(Boolean).join(" · ");
-    if (threats) {
-      setScanSheet("bad", `Scan found ${threats} threat${threats === 1 ? "" : "s"}`, notes);
-      $("scan-findings").replaceChildren(...report.findings.slice(0, 5).map((f) => el("li", {}, [
-        el("span", { className: typeClass(f.threat_type), text: f.threat_type }),
-        el("span", { text: `${fileName(f.path)} · ${f.detail}`, title: f.path }),
-      ])));
-      $("scan-view").hidden = false;
-    } else {
-      setScanSheet("ok", "Scan complete: no threats found", notes);
-      scanUi.hideTimer = setTimeout(hideScanSheet, 9000);
-    }
-  }
+  endScan();
+  if (failure) setScanSheet("error", "The scan could not run", errorText(failure));
+  else showScanReport(report);
   await refresh(true);
+}
+
+// Both scan buttons are locked for the length of either scan.
+function beginScan() {
+  for (const id of ["quick-scan", "full-scan"]) {
+    $(id).dataset.busy = "1"; // the 2 s refresh leaves a busy button alone
+    $(id).disabled = true;
+  }
+  $("hero").classList.add("scanning");
+  $("scan-findings").replaceChildren();
+  for (const id of ["scan-view", "scan-close", "scan-cancel"]) $(id).hidden = true;
+}
+
+function endScan() {
+  for (const id of ["quick-scan", "full-scan"]) {
+    delete $(id).dataset.busy;
+    $(id).disabled = false;
+  }
+  $("hero").classList.remove("scanning");
+  $("scan-cancel").hidden = true;
+  $("scan-close").hidden = false;
+  state.scanning = false;
+}
+
+function scanDuration(ms) {
+  const seconds = (ms || 0) / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)} s`;
+  return `${Math.floor(seconds / 60)} min ${Math.round(seconds % 60)} s`;
+}
+
+function showScanReport(report) {
+  const full = Boolean(report.full);
+  const name = full ? "Full scan" : "Scan";
+  const threats = report.findings.length;
+  const took = scanDuration(report.duration_ms);
+  $("scan-time").textContent = took;
+  const folders = report.roots.length;
+  const notes = [
+    `${count(report.files_scanned)} of ${count(report.files_examined)} files inspected in ${took} across ${folders} folder${folders === 1 ? "" : "s"}`,
+    full ? "report only: nothing was moved" : report.dry_run ? "dry run: nothing was moved" : "",
+    report.cloud_skipped ? `${count(report.cloud_skipped)} cloud-only items skipped (not downloaded)` : "",
+    report.truncated ? "stopped at the file limit" : "",
+  ].filter(Boolean).join(" · ");
+  // Folders macOS would not let the scanner open: never report those as clean.
+  const blocked = (report.unreadable || []).map(fileName);
+  const listed = blocked.slice(0, 3).join(", ") + (blocked.length > 3 ? ` and ${blocked.length - 3} more` : "");
+  const blockedNote = blocked.length
+    ? `macOS blocked ${listed}. In System Settings > Privacy & Security > Full Disk Access, switch on The Nex's service (the-nex), then scan again.`
+    : "";
+  if (threats) {
+    const title = full
+      ? `Full scan flagged ${threats} file${threats === 1 ? "" : "s"} to review`
+      : `Scan found ${threats} threat${threats === 1 ? "" : "s"}`;
+    setScanSheet("bad", report.cancelled ? `${title} before it was cancelled` : title, [notes, blockedNote].filter(Boolean).join(" · "));
+    $("scan-findings").replaceChildren(...report.findings.slice(0, 5).map((f) => el("li", {}, [
+      el("span", { className: typeClass(f.threat_type), text: f.threat_type }),
+      el("span", { text: `${fileName(f.path)} · ${f.detail}`, title: f.path }),
+    ])));
+    $("scan-view").hidden = false;
+  } else if (report.cancelled) {
+    setScanSheet("error", `${name} cancelled`, `${notes} · nothing flagged so far`);
+  } else if (blocked.length) {
+    setScanSheet("error", `${name} could not read ${blocked.length} folder${blocked.length === 1 ? "" : "s"}`, [blockedNote, full ? notes : ""].filter(Boolean).join(" "));
+  } else {
+    setScanSheet("ok", `${name} complete: no threats found`, notes);
+    scanUi.hideTimer = setTimeout(hideScanSheet, 9000);
+  }
+}
+
+// The background service runs the full scan; this follows its progress file once a second.
+// `since` is when it was asked for (0 when re-attaching to a scan already under way).
+const FULL_SCAN_START_GRACE_MS = 20000;
+
+async function followFullScan(since) {
+  state.scanning = true;
+  clearTimeout(scanUi.hideTimer);
+  beginScan();
+  setScanSheet("running", "Full scan running", "Asking the background service…");
+  $("scan-sheet").hidden = false;
+  $("scan-cancel").hidden = false;
+  $("scan-cancel").disabled = false;
+  const watchStart = Date.now();
+  // The report only counts if it finished after this scan began: the one from an earlier run is
+  // still on disk. `began` is when it was asked for, then the start time the service reports.
+  let began = since ? since - 2000 : 0;
+  let seen = false;
+  let outcome = null;
+  let failure = null;
+  while (!outcome && !failure) {
+    await sleep(1000);
+    const progress = await call("scan_progress").catch(() => null);
+    const ours = progress && progress.kind === "full";
+    if (ours && progress.running) {
+      seen = true;
+      began = new Date(progress.started_at).getTime();
+      $("scan-time").textContent = scanDuration(Date.now() - began);
+      $("scan-detail").textContent = `${count(progress.files_examined)} files checked · ${count(progress.findings)} flagged · ${shortPath(progress.current)}`;
+      continue;
+    }
+    const report = await call("last_full_scan").catch(() => null);
+    const finished = report && report.finished_at ? new Date(report.finished_at).getTime() : 0;
+    if (report && began && finished >= began) outcome = report;
+    else if (seen) failure = "The background service stopped before the scan finished. Check that it is running (Settings), then try again.";
+    else if (Date.now() - watchStart > FULL_SCAN_START_GRACE_MS) failure = "The background service did not start the scan. Check that it is running (Settings), then try again.";
+  }
+  endScan();
+  if (failure) setScanSheet("error", "The full scan could not run", failure);
+  else showScanReport(outcome);
+  await refresh(true);
+}
+
+async function runFullScan() {
+  if (state.scanning) return;
+  state.scanning = true;
+  try {
+    await call("start_full_scan");
+  } catch (error) {
+    state.scanning = false;
+    $("scan-findings").replaceChildren();
+    $("scan-view").hidden = true;
+    setScanSheet("error", "The full scan could not run", errorText(error));
+    $("scan-close").hidden = false;
+    $("scan-sheet").hidden = false;
+    return;
+  }
+  await followFullScan(Date.now());
+}
+
+// A full scan outlives the window: pick it up again when the dashboard opens.
+async function resumeFullScan() {
+  const progress = await call("scan_progress").catch(() => null);
+  if (progress && progress.kind === "full" && progress.running && !state.scanning) followFullScan(0);
 }
 
 function showPage(page) {
@@ -980,18 +1082,46 @@ function showPage(page) {
   $("page-title").textContent = PAGE_TITLES[page];
   $("page-sub").textContent = page === "overview" ? greeting() : PAGE_SUBS[page] || "";
   $("search-box").hidden = !SEARCH_PAGES.has(page);
-  // The AegisMesh console loads when visited and unloads when left: three.js, MediaPipe and the
-  // camera hold a lot of memory, and the camera turns off with it.
-  const frame = $("aegismesh-frame");
-  const CONSOLE = "aegismesh/index.html";
-  const loaded = frame && frame.getAttribute("src") === CONSOLE;
-  if (page !== "aegismesh" && loaded) frame.setAttribute("src", "about:blank");
-  if (page === "aegismesh" && frame && !loaded) {
-    // Ask macOS for the camera (its popup) while the console loads.
-    frame.setAttribute("src", CONSOLE);
-    checkCamera();
-  }
+  showAegis(page === "aegismesh");
   refresh(true);
+}
+
+// The AegisMesh console (three.js, MediaPipe) holds a lot of memory, so it loads when visited
+// and unloads after two minutes away; a short detour keeps unsaved rhythm samples and results.
+const AEGIS_CONSOLE = "aegismesh/index.html";
+const AEGIS_UNLOAD_MS = 120000;
+let aegisUnloadTimer = null;
+
+function showAegis(active) {
+  const frame = $("aegismesh-frame");
+  if (!frame) return;
+  const loaded = frame.getAttribute("src") === AEGIS_CONSOLE;
+  clearTimeout(aegisUnloadTimer);
+  // While its camera is on, the hidden page stays rendered (invisible, inert): a display:none
+  // frame gets no video frames, which would freeze an SOS watch.
+  const watching = !active && loaded && cameraInUse(frame);
+  $("page-aegismesh").classList.toggle("watching", watching);
+  frame.inert = watching;
+  if (active && !loaded) {
+    // Ask macOS for the camera (its popup) while the console loads.
+    frame.setAttribute("src", AEGIS_CONSOLE);
+    checkCamera();
+  } else if (!active && loaded) {
+    aegisUnloadTimer = setTimeout(() => {
+      if (cameraInUse(frame)) return showAegis(false); // watch still on: look again later
+      $("page-aegismesh").classList.remove("watching");
+      frame.inert = false;
+      frame.setAttribute("src", "about:blank");
+    }, AEGIS_UNLOAD_MS);
+  }
+}
+
+function cameraInUse(frame) {
+  try {
+    return [...frame.contentDocument.querySelectorAll("video")].some((v) => v.srcObject && v.srcObject.active);
+  } catch {
+    return false;
+  }
 }
 
 async function checkCamera() {
@@ -1086,6 +1216,12 @@ function wire() {
   });
 
   $("quick-scan").addEventListener("click", runQuickScan);
+  $("full-scan").addEventListener("click", runFullScan);
+  $("scan-cancel").addEventListener("click", () => {
+    $("scan-cancel").disabled = true;
+    $("scan-title").textContent = "Cancelling…";
+    call("cancel_scan").catch((error) => notice(errorText(error), true));
+  });
   $("scan-close").addEventListener("click", hideScanSheet);
   $("scan-view").addEventListener("click", () => { hideScanSheet(); openActivity(); });
   $("verify-canaries").addEventListener("click", () => busy("verify-canaries", "Verifying…", async () => {
@@ -1547,7 +1683,8 @@ async function initAppearance() {
 
 let refreshTimer = null;
 function openMenuPage(page) {
-  if (page === "activity") openActivity();
+  if (page === "fullscan") runFullScan();
+  else if (page === "activity") openActivity();
   else if (["quarantine", "settings"].includes(page)) showPage(page);
 }
 
@@ -1560,6 +1697,7 @@ function startDashboard() {
   wireTheme();
   initAppearance().then(applyTheme);
   refresh(true);
+  resumeFullScan();
   refreshTimer = setInterval(() => refresh(false), REFRESH_MS);
   const events = window.__TAURI__ && window.__TAURI__.event;
   if (events) {
@@ -1567,6 +1705,8 @@ function startDashboard() {
     events.listen("menubar://navigate", (e) => openMenuPage(e.payload));
     // A window the menu bar just rebuilt names its page in the address instead.
     openMenuPage(location.hash.slice(1));
+    // One-shot: a reload (sign-out, lost session) must not land on that page again.
+    if (location.hash) history.replaceState(null, "", location.pathname + location.search);
     events.listen("menubar://refresh", () => refresh(true));
   }
 }

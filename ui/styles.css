@@ -92,21 +92,26 @@ h1, h2, h3 { margin: 0; }
 
 .topbar { display: flex; align-items: center; gap: 20px; padding: 18px 0 10px; }
 .brand { display: flex; align-items: center; gap: 10px; flex: none; }
+/* The app icon in small: the gyro bot on its dark tile, the same in both themes. */
 .logo-tile {
-  display: grid; place-items: center; width: 52px; height: 36px; border-radius: 18px;
-  background: var(--mint); color: #0E0F0E;
+  display: grid; place-items: center; width: 40px; height: 40px; border-radius: 12px;
+  background: linear-gradient(#262A26, #090A09); color: #FFFFFF;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
 }
-.logo-tile .logo { width: 22px; height: 22px; }
+.logo-tile .logo { width: 28px; height: 28px; }
+.logo-hub { fill: #7CEB8E; }
 .brand-text { font-size: 17px; font-weight: 600; letter-spacing: -0.01em; }
 
-.nav { display: flex; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none; flex: 1; }
+/* A bar of its own so the tabs stay readable over any wallpaper; the 4 px padding also keeps
+   the scroll container from clipping focus rings. */
+.nav { display: flex; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none; flex: 0 1 auto; margin-right: auto; padding: 4px; border-radius: 16px; background: var(--surface); box-shadow: inset 0 0 0 1px var(--line); }
 .nav::-webkit-scrollbar { display: none; }
 .nav-item {
   display: inline-flex; align-items: center; gap: 6px; flex: none;
   padding: 9px 16px; border: 0; border-radius: 12px; background: transparent; cursor: pointer;
   font-size: 15px; color: var(--text); transition: background 150ms ease, color 150ms ease;
 }
-.nav-item:hover { background: var(--surface); }
+.nav-item:hover { background: var(--chip); }
 .nav-item.active { background: var(--ink); color: var(--on-ink); }
 .nav-item .badge {
   min-width: 18px; padding: 0 5px; border-radius: 9px; background: var(--red); color: #fff;
@@ -120,6 +125,12 @@ h1, h2, h3 { margin: 0; }
   border-radius: 14px; background: var(--surface); box-shadow: inset 0 0 0 1px var(--line);
 }
 .search:focus-within { box-shadow: inset 0 0 0 1.5px var(--ink); }
+/* An icon until used, so the nav row always fits (widths below are measured, see scripts). */
+.search { flex: none; width: 44px; padding: 0 4px; overflow: hidden; cursor: pointer; transition: width 180ms ease; }
+.search kbd { display: none; }
+.search:focus-within, .search:has(input:not(:placeholder-shown)) { width: 180px; padding-right: 12px; cursor: text; }
+/* While the search box is open it borrows the account chip's space. */
+.topbar-actions:has(.search:not([hidden]):focus-within, .search:not([hidden]) input:not(:placeholder-shown)) .account { display: none; }
 .search-icon { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 11px; background: var(--chip); }
 .search-icon svg { width: 16px; height: 16px; stroke-width: 2.2; }
 .search input { flex: 1; min-width: 0; height: 100%; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; font-size: 14px; padding-left: 6px; }
@@ -151,6 +162,8 @@ h1, h2, h3 { margin: 0; }
 #page-sub { margin: 0 0 4px; color: var(--muted); font-size: 14px; }
 #page-sub:empty { display: none; }
 #page-title { font-size: clamp(38px, 4.4vw, 62px); font-weight: 500; line-height: 1; letter-spacing: -0.035em; }
+/* Focused by script after sign-in so screen readers start here; it is not a control. */
+#page-title:focus { outline: none; }
 .title-actions { display: flex; align-items: center; gap: 10px; flex: none; }
 .top-status {
   display: inline-flex; align-items: center; gap: 10px; height: 44px; padding: 0 16px;
@@ -453,10 +466,15 @@ h1, h2, h3 { margin: 0; }
 #appearance-status.ok { color: var(--green); }
 #appearance-status.error { color: var(--red); }
 
-#page-aegismesh { flex: 1; min-height: 600px; }
-.aegis-frame { flex: 1; width: 100%; min-height: 640px; border: 0; border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow), inset 0 0 0 1px var(--line); }
+/* The console scrolls inside its frame, so the frame fills the page exactly: a taller frame
+   made the page scroll too and carried the console's own section bar out of view. */
+#page-aegismesh.active { height: 100%; min-height: 0; }
+/* Camera on while another page shows: keep the frame laid out in the viewport but unseen. */
+#page-aegismesh.watching:not(.active) { display: flex; position: fixed; inset: 0; z-index: -2; opacity: 0; pointer-events: none; }
+.aegis-frame { flex: 1; width: 100%; min-height: 0; border: 0; border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow), inset 0 0 0 1px var(--line); }
 
 /* ---- quick scan ----------------------------------------------------------------------- */
+.scan-full { height: 44px; padding: 0 18px; border-radius: 14px; }
 .scan-btn .spinner { display: none; }
 .scan-btn.scanning .scan-icon { display: none; }
 .scan-btn.scanning .spinner { display: inline-block; width: 15px; height: 15px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent; animation: spin 700ms linear infinite; }
@@ -484,6 +502,8 @@ h1, h2, h3 { margin: 0; }
 .scan-copy { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .scan-copy b { font-size: 17px; font-weight: 500; }
 #scan-detail { color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* An error explains what to do next, so it wraps instead of being cut off. */
+.scan-sheet[data-state="error"] #scan-detail { white-space: normal; }
 .scan-progress { position: relative; height: 8px; margin-top: 6px; border-radius: 4px; overflow: hidden; background: repeating-linear-gradient(90deg, var(--hatch) 0 1.5px, transparent 1.5px 5px); }
 .scan-progress i { position: absolute; top: 0; bottom: 0; width: 35%; border-radius: inherit; background: var(--ink); animation: indeterminate 1.3s ease-in-out infinite; }
 .scan-sheet[data-state="ok"] .scan-progress i, .scan-sheet[data-state="bad"] .scan-progress i, .scan-sheet[data-state="error"] .scan-progress i { left: 0; width: 100%; animation: none; }
@@ -515,14 +535,22 @@ h1, h2, h3 { margin: 0; }
 }
 
 /* ---- narrower windows (the app's minimum is 960 px) ----------------------------------- */
-@media (max-width: 1380px) {
-  .service-chip { display: none; }
-  .search { width: 210px; }
+/* Top bar tiers: each drops something before the nav would clip (measured with a long name and
+   a quarantine badge). The service chip repeats the status chip beside the page title. */
+.service-chip { display: none; }
+@media (max-width: 1599px) {
+  .account-name { display: none; }
+}
+@media (max-width: 1359px) {
+  .brand-text { display: none; }
+  .nav-item { padding: 9px 12px; font-size: 14px; }
+}
+@media (max-width: 1199px) {
+  .topbar { flex-wrap: wrap; }
+  .topbar-actions { margin-left: auto; }
+  .nav { order: 3; }
 }
 @media (max-width: 1220px) {
-  .brand-text, .search kbd { display: none; }
-  .search { width: 180px; }
-  .nav-item { padding: 9px 12px; font-size: 14px; }
   .overview-split { grid-template-columns: minmax(0, 1fr); }
   .engines-panel { position: static; }
   .engine-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -530,7 +558,7 @@ h1, h2, h3 { margin: 0; }
 @media (max-width: 1060px) {
   .app { padding: 0 18px; }
   .topbar { flex-wrap: wrap; }
-  .nav { order: 3; flex-basis: 100%; }
+  .nav { order: 3; }
   .overview-top, .chart-body, .settings-grid { grid-template-columns: minmax(0, 1fr); }
   .hero { grid-template-columns: minmax(0, 1fr) 180px; }
   .sev-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -548,7 +576,8 @@ h1, h2, h3 { margin: 0; }
     linear-gradient(160deg, #E9FBEC, #B8F2C3);
   box-shadow: var(--shadow), inset 0 0 0 1px rgba(255, 255, 255, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.9);
 }
-.login-hero .logo-tile { background: #0E0F0E; color: #7CEB8E; }
+.login-hero .logo-tile { width: 48px; height: 48px; border-radius: 14px; }
+.login-hero .logo-tile .logo { width: 34px; height: 34px; }
 .login-name { margin: 0 0 10px; font-size: clamp(38px, 5vw, 64px); font-weight: 500; line-height: 1; letter-spacing: -0.035em; }
 .login-line { margin: 0; max-width: 30ch; font-size: 17px; line-height: 1.45; color: #2A2C2A; }
 .login-card {
@@ -574,7 +603,6 @@ h1, h2, h3 { margin: 0; }
 .avatar { position: relative; display: grid; place-items: center; flex: none; width: 28px; height: 28px; border-radius: 50%; overflow: hidden; background: var(--mint); color: #0E0F0E; font-size: 12px; font-weight: 600; }
 .avatar img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .account-name { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; color: var(--ink); }
-@media (max-width: 1220px) { .account-name { max-width: 90px; } }
 .sheet-dialog { max-width: 420px; padding: 22px 24px; border: 0; border-radius: var(--radius); background: rgb(var(--surface-rgb)); color: var(--ink); box-shadow: var(--shadow), inset 0 0 0 1px var(--line); }
 .sheet-dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
 .sheet-dialog h2 { margin: 0 0 8px; font-size: 17px; font-weight: 500; }

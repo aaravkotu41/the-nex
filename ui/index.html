@@ -36,7 +36,7 @@
   <main class="login" id="login">
     <section class="login-hero" aria-hidden="false">
       <span class="logo-tile">
-        <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="16" cy="16" r="11.5"/><ellipse cx="16" cy="16" rx="11.5" ry="4.6" transform="rotate(35 16 16)"/><ellipse cx="16" cy="16" rx="11.5" ry="4.6" transform="rotate(-35 16 16)"/></g><circle cx="16" cy="16" r="3" fill="currentColor"/></svg>
+        <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor"><circle cx="16" cy="16" r="13" stroke-width="2"/><g stroke-width="1.7"><ellipse cx="16" cy="16" rx="11" ry="4.5" transform="rotate(35 16 16)"/><ellipse cx="16" cy="16" rx="11" ry="4.5" transform="rotate(-35 16 16)"/></g></g><circle class="logo-hub" cx="16" cy="16" r="2.9"/></svg>
       </span>
       <div>
         <p class="login-name">The Nex</p>
@@ -60,7 +60,7 @@
     <header class="topbar">
       <div class="brand">
         <span class="logo-tile">
-          <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="16" cy="16" r="11.5"/><ellipse cx="16" cy="16" rx="11.5" ry="4.6" transform="rotate(35 16 16)"/><ellipse cx="16" cy="16" rx="11.5" ry="4.6" transform="rotate(-35 16 16)"/></g><circle cx="16" cy="16" r="3" fill="currentColor"/></svg>
+          <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor"><circle cx="16" cy="16" r="13" stroke-width="2"/><g stroke-width="1.7"><ellipse cx="16" cy="16" rx="11" ry="4.5" transform="rotate(35 16 16)"/><ellipse cx="16" cy="16" rx="11" ry="4.5" transform="rotate(-35 16 16)"/></g></g><circle class="logo-hub" cx="16" cy="16" r="2.9"/></svg>
         </span>
         <span class="brand-text">The Nex</span>
       </div>
@@ -110,6 +110,7 @@
         </div>
         <div class="title-actions">
           <span class="top-status" id="top-status"><span class="dot" id="top-status-dot"></span><b id="top-status-text">Connecting…</b></span>
+          <button class="btn scan-full" id="full-scan" type="button" title="Check the whole disk. Reports only: nothing is moved.">Full Scan</button>
           <button class="btn btn-primary scan-btn" id="quick-scan">
             <svg class="scan-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7V4h3M17 4h3v3M20 17v3h-3M7 20H4v-3"/><path d="M4 12h16"/></svg>
             <span class="spinner" aria-hidden="true"></span>
@@ -134,6 +135,7 @@
           <div class="scan-side">
             <span class="scan-time mono" id="scan-time">0.0 s</span>
             <div class="button-group">
+              <button class="btn btn-small" id="scan-cancel" type="button" hidden>Cancel</button>
               <button class="btn btn-small" id="scan-view" type="button" hidden>View activity</button>
               <button class="btn btn-small" id="scan-close" type="button" hidden>Close</button>
             </div>
@@ -191,7 +193,7 @@
                 <button class="stat" type="button" data-tone="alert" data-goto="activity" title="Open the activity log">
                   <span class="card-label"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 21 19H3z"/><path d="M12 10v4M12 17h.01"/></svg>Threats</span>
                   <b class="stat-num" id="stat-threats">0</b>
-                  <span class="stat-sub">stopped so far</span>
+                  <span class="stat-sub" id="stat-threats-sub">stopped so far</span>
                   <span class="corner-go" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M7 17 17 7M9 7h8v8"/></svg></span>
                 </button>
                 <button class="stat" type="button" data-goto="quarantine" title="Open quarantine">

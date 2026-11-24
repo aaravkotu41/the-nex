@@ -2,13 +2,15 @@
 """Generate app icons with the standard library only (no Pillow).
 
 Writes <crate>/icons/{icon.png, 32x32.png, 128x128.png, icon.ico, icon.icns}. The Nex's mark
-(default) is a gyroscope: an ink (#0E0F0E) outer ring, two gimbal rings crossing at +/-35 deg
-and a solid hub, on a mint (#7CEB8E) rounded square. Strokes thicken
-as the icon shrinks and the outer ring is dropped below 24 px so the 16 px tray size stays
-legible. The default run also writes tray-template.png (44x44, black glyph on transparent,
+(default) is the gyro bot from the in-app assistant (ui/bot.js): a thin white outer ring with
+two gimbal rings crossing at +/-35 deg inside it (not touching it) and a mint (#7CEB8E) hub,
+on a near-black tile with a slight top-to-bottom gradient. From 64 px up the tile follows the
+macOS icon grid (824 of 1024, so it sits level with other apps in the Dock); smaller sizes
+keep a thin margin and thicker strokes so 16 px stays legible. The .icns carries every size up
+to 1024 px. The default run also writes tray-template.png (44x44, black glyph on transparent,
 for macOS template images). With --variant aegismesh it writes the AegisMesh shield on a matte
 #0A0B0D tile, unchanged. Edges are anti-aliased with exact horizontal coverage per scanline;
-each ring/shape is its own even-odd layer and layers are combined by union (max coverage).
+shapes of one colour are unioned (max coverage) and colours are painted in order.
 """
 
 import argparse
@@ -24,6 +26,12 @@ BACKGROUND = (10, 11, 13)
 FOREGROUND = (255, 255, 255)
 MINT = (124, 235, 142)
 INK = (14, 15, 14)
+WHITE = (255, 255, 255)
+TILE_TOP = (38, 42, 38)  # the bot's ink, lifted a little at the top so the tile has depth
+TILE_BOTTOM = (9, 10, 9)
+MAC_GRID_INSET = 100 / 1024  # Apple's icon grid: an 824 px body centred in 1024
+SMALL_INSET = 0.04
+ICNS_TYPES = {16: b"icp4", 32: b"icp5", 64: b"icp6", 128: b"ic07", 256: b"ic08", 512: b"ic09", 1024: b"ic10"}
 CORNER_RADIUS = 0.22
 VERTICAL_SAMPLES = 4
 CURVE_POINTS = 128
@@ -50,28 +58,49 @@ def ring(rx, ry, stroke, angle=0.0):
     return [ellipse(rx + stroke / 2, ry + stroke / 2, angle), ellipse(rx - stroke / 2, ry - stroke / 2, angle)]
 
 
-def gyroscope(size, radius=11.5):
-    """Layers (each even-odd, unioned) of the gyroscope on a 32-unit grid, tuned for `size` px."""
-    stroke = max(1.9, 1.7 * 32 / size)  # >= 1.7 px at every size
-    if size < 24:  # 16/20 px: a single tilted gimbal inside the ring, small hub
-        return [ring(radius, radius, stroke), ring(radius, radius * 0.45, stroke, -40), [ellipse(2.4, 2.4)]]
-    ratio = 0.4 if size >= 32 else 0.5  # rounder gimbals keep the gaps open at 24 px
-    layers = [ring(radius, radius * ratio, stroke, 35), ring(radius, radius * ratio, stroke, -35)]
-    layers += [[ellipse(1.6 + stroke * 0.5, 1.6 + stroke * 0.5)], ring(radius, radius, stroke)]
-    return layers
+def thenex_inset(size):
+    return MAC_GRID_INSET if size >= 64 else SMALL_INSET
+
+
+THENEX_GLYPH_SCALE = 0.84  # share of the tile the 32-unit grid spans
+
+
+def gyro_bot(size):
+    """Colour groups [(layers, colour)] of the gyro bot on a 32-unit grid, tuned for `size` px."""
+    px = size * (1 - 2 * thenex_inset(size)) * THENEX_GLYPH_SCALE / 32  # pixels per grid unit
+    line = max(1.4, 1.35 / px)  # outer ring: fine at large sizes, never under 1.35 px
+    thin = max(1.15, 1.2 / px)
+    if size < 24:  # 16/20 px: one tilted gimbal inside the ring
+        return [([ring(12.6, 12.6, line), ring(9.4, 4.8, thin, -35)], WHITE), ([[ellipse(3.4, 3.4)]], MINT)]
+    ry = 4.5 if size >= 48 else 5.2  # rounder gimbals keep the gaps open at 24-40 px
+    lines = [ring(13, 13, line), ring(11.0, ry, thin, 35), ring(11.0, ry, thin, -35)]
+    return [(lines, WHITE), ([[ellipse(2.7, 2.7)]], MINT)]
 
 
 def gyroscope_tray():
-    stroke, r = 2.6, 11.5  # outer edge 12.8 of 16 units = 80% of the canvas
-    return [ring(r, r * 0.4, stroke, 35), ring(r, r * 0.4, stroke, -35), ring(r, r, stroke), [ellipse(3.0, 3.0)]]
+    stroke = 2.4  # outer edge 13.8 of 16 units; gimbals stop short of the ring, like the bot
+    return [ring(12.6, 12.6, stroke), ring(10.2, 4.4, stroke * 0.9, 35), ring(10.2, 4.4, stroke * 0.9, -35), [ellipse(2.9, 2.9)]]
 
 
-SHIELD_LAYERS = [SHIELD]
-# name -> (output dir, layers for size, tile colour, glyph colour)
+SHIELD_GROUPS = [([SHIELD], FOREGROUND)]
+# name -> (output dir, colour groups for size, tile colour or (top, bottom), sizes, tile inset for size)
 VARIANTS = {
-    "thenex": (ROOT / "crates" / "the-nex-gui" / "icons", gyroscope, MINT, INK),
-    "aegismesh": (ROOT / "crates" / "aegismesh-gui" / "icons", lambda size: SHIELD_LAYERS, BACKGROUND, FOREGROUND),
+    "thenex": (
+        ROOT / "crates" / "the-nex-gui" / "icons",
+        gyro_bot,
+        (TILE_TOP, TILE_BOTTOM),
+        ICO_SIZES + (512, 1024),
+        thenex_inset,
+    ),
+    "aegismesh": (
+        ROOT / "crates" / "aegismesh-gui" / "icons",
+        lambda size: SHIELD_GROUPS,
+        BACKGROUND,
+        ICO_SIZES,
+        lambda size: 0.0,
+    ),
 }
+GLYPH_SCALE = {"thenex": THENEX_GLYPH_SCALE, "aegismesh": 1.0}
 
 
 def polygon_spans(polygons, y):
@@ -117,45 +146,60 @@ def accumulate(coverage, spans, width, weight):
                 coverage[px] += overlap * weight
 
 
-def render(size, layers, tile=BACKGROUND, glyph_color=FOREGROUND, tray=False):
-    """Rows of RGBA. tray=True: black glyph on transparent (macOS template), no tile."""
-    scale = size / 32.0
-    scaled = [[[(x * scale, y * scale) for x, y in shape] for shape in layer] for layer in layers]
-    radius = CORNER_RADIUS * size
+def render(size, groups, tile=BACKGROUND, tray=False, inset=0.0, glyph_scale=1.0):
+    """Rows of RGBA. `groups` is [(layers, colour)], painted in order; `tile` is one colour or a
+    (top, bottom) pair; `inset` is the tile's margin as a share of the canvas.
+    tray=True: black glyph on transparent (macOS template), no tile."""
+    body = size * (1 - 2 * inset)
+    origin = size * inset
+    scale = body / 32.0 * glyph_scale
+    shift = origin + body * (1 - glyph_scale) / 2
+    # One even-odd layer per original layer, so overlapping rings of one colour union cleanly.
+    scaled = [
+        ([[[(x * scale + shift, y * scale + shift) for x, y in shape] for shape in layer] for layer in layers], colour)
+        for layers, colour in groups
+    ]
+    top, bottom = tile if isinstance(tile[0], tuple) else (tile, tile)
+    radius = CORNER_RADIUS * body
     weight = 1.0 / VERTICAL_SAMPLES
     rows = []
     for py in range(size):
         background = [0.0] * size
-        covers = [[0.0] * size for _ in scaled]
+        covers = [[[0.0] * size for _ in layers] for layers, _ in scaled]
         for j in range(VERTICAL_SAMPLES):
             y = py + (j + 0.5) / VERTICAL_SAMPLES
-            accumulate(background, rounded_rect_span(size, radius, y), size, weight)
-            for layer, cover in zip(scaled, covers):
-                accumulate(cover, polygon_spans(layer, y), size, weight)
-        glyph = [max(col) for col in zip(*covers)]  # union of layers
+            spans = [(a + origin, b + origin) for a, b in rounded_rect_span(body, radius, y - origin)]
+            accumulate(background, spans, size, weight)
+            for (layers, _), group_cover in zip(scaled, covers):
+                for layer, cover in zip(layers, group_cover):
+                    accumulate(cover, polygon_spans(layer, y), size, weight)
+        glyphs = [[max(col) for col in zip(*group_cover)] for group_cover in covers]  # union per colour
+        blend = min(max((py + 0.5 - origin) / body, 0.0), 1.0)
+        base = [t + (b - t) * blend for t, b in zip(top, bottom)]
         row = bytearray()
         for px in range(size):
             if tray:
-                row += b"\x00\x00\x00" + bytes([round(min(glyph[px], 1.0) * 255)])
+                row += b"\x00\x00\x00" + bytes([round(min(max(g[px] for g in glyphs), 1.0) * 255)])
                 continue
             alpha = min(background[px], 1.0)
-            ink = min(glyph[px], alpha)
             if alpha <= 0.0:
                 row += b"\x00\x00\x00\x00"
                 continue
-            mix = ink / alpha
-            pixel = [round(b + (f - b) * mix) for b, f in zip(tile, glyph_color)]
-            row += bytes(pixel) + bytes([round(alpha * 255)])
+            pixel = list(base)
+            for glyph, (_, colour) in zip(glyphs, scaled):
+                mix = min(glyph[px], alpha) / alpha
+                pixel = [p + (c - p) * mix for p, c in zip(pixel, colour)]
+            row += bytes(round(p) for p in pixel) + bytes([round(alpha * 255)])
         rows.append(bytes(row))
     return rows
 
 
-def png_bytes(size, layers, tile=BACKGROUND, glyph_color=FOREGROUND, tray=False):
+def png_bytes(size, groups, tile=BACKGROUND, tray=False, inset=0.0, glyph_scale=1.0):
     def chunk(kind, data):
         body = kind + data
         return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
 
-    raw = b"".join(b"\x00" + row for row in render(size, layers, tile, glyph_color, tray))
+    raw = b"".join(b"\x00" + row for row in render(size, groups, tile, tray, inset, glyph_scale))
     header = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)  # 8-bit RGBA, as tauri-codegen requires
     return (
         b"\x89PNG\r\n\x1a\n"
@@ -179,8 +223,7 @@ def ico_bytes(images):
 
 
 def icns_bytes(images):
-    types = {128: b"ic07", 256: b"ic08"}
-    body = b"".join(types[size] + struct.pack(">I", len(data) + 8) + data for size, data in images)
+    body = b"".join(ICNS_TYPES[size] + struct.pack(">I", len(data) + 8) + data for size, data in images)
     return b"icns" + struct.pack(">I", len(body) + 8) + body
 
 
@@ -195,24 +238,25 @@ def main():
     parser.add_argument("--variant", choices=sorted(VARIANTS), default="thenex")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
-    default_out, layers_for, tile, glyph_color = VARIANTS[args.variant]
+    default_out, groups_for, tile, sizes, inset_for = VARIANTS[args.variant]
     out = args.out or default_out
     out.mkdir(parents=True, exist_ok=True)
 
-    pngs = {size: png_bytes(size, layers_for(size), tile, glyph_color) for size in ICO_SIZES}
+    glyph_scale = GLYPH_SCALE[args.variant]
+    pngs = {size: png_bytes(size, groups_for(size), tile, inset=inset_for(size), glyph_scale=glyph_scale) for size in sizes}
     for size, data in pngs.items():
         validate_png(data, size)
 
     outputs = {
-        "icon.png": pngs[256],
+        "icon.png": pngs[max(s for s in sizes if s <= 512)],
         "32x32.png": pngs[32],
         "128x128.png": pngs[128],
         "icon.ico": ico_bytes([(size, pngs[size]) for size in ICO_SIZES]),
-        "icon.icns": icns_bytes([(128, pngs[128]), (256, pngs[256])]),
+        "icon.icns": icns_bytes([(size, pngs[size]) for size in sorted(ICNS_TYPES) if size in pngs]),
     }
     if args.variant == "thenex":
-        # Tray glyph fills ~80% of the canvas, thicker strokes for 22 pt.
-        tray = png_bytes(44, gyroscope_tray(), tray=True)
+        # Tray glyph fills most of the canvas, thicker strokes for 22 pt.
+        tray = png_bytes(44, [(gyroscope_tray(), INK)], tray=True)
         validate_png(tray, 44)
         outputs["tray-template.png"] = tray
     for name, data in outputs.items():

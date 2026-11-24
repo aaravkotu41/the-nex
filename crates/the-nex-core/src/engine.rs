@@ -5,6 +5,7 @@ use crate::logger;
 use crate::platform;
 use crate::process_guard;
 use crate::quarantine::{self, Severity, ThreatEvent};
+use crate::scan_jobs::{self, ScanJobs};
 use crate::status::{self, ResourceUsage, Telemetry};
 use crate::zip_bomb;
 use chrono::Utc;
@@ -26,6 +27,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 const MAIN_TICK: Duration = Duration::from_millis(250);
 const SETTINGS_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 const STATUS_INTERVAL: Duration = Duration::from_secs(2);
+const SCAN_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 const REDISCOVER_INTERVAL: Duration = Duration::from_secs(60);
 const SCAN_SETTLE: Duration = Duration::from_millis(300);
 const SCAN_RECV_TIMEOUT: Duration = Duration::from_millis(150);
@@ -35,6 +37,8 @@ const QUICK_SCAN_MAX_FILES: u64 = 50_000;
 const BINARY_EXTENSIONS: &[&str] = &["exe", "dll", "scr", "sys", "cpl", "ocx", "com", "efi"];
 /// Written next to events.jsonl by `--quick-scan` so callers that cannot read stdout (UAC) get the report.
 pub const QUICK_SCAN_REPORT_FILE: &str = "last_quick_scan.json";
+pub const FULL_SCAN_REPORT_FILE: &str = "last_full_scan.json";
+pub const SCAN_PROGRESS_FILE: &str = "scan_progress.json";
 
 /// Thin (32/64-bit, either byte order) and fat/universal Mach-O headers.
 #[cfg(target_os = "macos")]
@@ -115,6 +119,8 @@ fn is_engine_output(cfg: &AppConfig, path: &Path) -> bool {
         events.as_str(),
         crate::config::STATUS_FILE_NAME,
         QUICK_SCAN_REPORT_FILE,
+        FULL_SCAN_REPORT_FILE,
+        SCAN_PROGRESS_FILE,
         logger::LOG_FILE_NAME,
     ];
     let is_own = own_files
@@ -139,6 +145,81 @@ pub struct QuickScanReport {
     pub dry_run: bool,
     pub truncated: bool,
     pub duration_ms: u64,
+    /// Scan folders that exist but could not be opened (e.g. macOS privacy blocks Downloads
+    /// without Full Disk Access). A scan with any of these is not a clean result.
+    #[serde(default)]
+    pub unreadable: Vec<PathBuf>,
+    /// A full scan (the whole disk, report only) rather than a quick one.
+    #[serde(default)]
+    pub full: bool,
+    /// Stopped early because the user cancelled.
+    #[serde(default)]
+    pub cancelled: bool,
+    /// iCloud / File Provider placeholders left alone: reading one would download it.
+    #[serde(default)]
+    pub cloud_skipped: u64,
+    /// RFC 3339; makes every report distinct so a waiting client can see a new one arrive.
+    #[serde(default)]
+    pub finished_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanKind {
+    Quick,
+    Full,
+}
+
+impl ScanKind {
+    pub fn report_file(self) -> &'static str {
+        match self {
+            ScanKind::Quick => QUICK_SCAN_REPORT_FILE,
+            ScanKind::Full => FULL_SCAN_REPORT_FILE,
+        }
+    }
+}
+
+/// Bounds of one walk. Quick and full scans differ only in these and in their folders.
+pub struct ScanLimits {
+    pub max_depth: usize,
+    pub max_files: u64,
+    /// Folders this close to a scan root that cannot be opened are listed in the report
+    /// (0 = only the roots; 2 reaches /Users/<name>/Desktop from /Users)...
+    pub report_unreadable_depth: usize,
+    /// ...but below the roots only inside these trees: people's own folders, which Full Disk
+    /// Access unlocks. System folders macOS never opens (SIP) would otherwise show up in every
+    /// report and no scan would ever read as clean.
+    pub report_unreadable_under: &'static [&'static str],
+}
+
+pub const QUICK_LIMITS: ScanLimits = ScanLimits {
+    max_depth: QUICK_SCAN_MAX_DEPTH,
+    max_files: QUICK_SCAN_MAX_FILES,
+    report_unreadable_depth: 0,
+    report_unreadable_under: &[],
+};
+pub const FULL_LIMITS: ScanLimits = ScanLimits {
+    max_depth: 64,
+    max_files: 20_000_000,
+    report_unreadable_depth: 2,
+    report_unreadable_under: &["/Users", "/home"],
+};
+const MAX_UNREADABLE_LISTED: usize = 50;
+
+/// iCloud / File Provider placeholders ("dataless" files and folders): opening one makes macOS
+/// download it, so a scan would pull down the user's whole cloud drive.
+#[cfg(target_os = "macos")]
+fn is_cloud_placeholder(entry: &fs::DirEntry) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    const SF_DATALESS: u32 = 0x4000_0000;
+    entry
+        .metadata()
+        .is_ok_and(|m| m.st_flags() & SF_DATALESS != 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_cloud_placeholder(_entry: &fs::DirEntry) -> bool {
+    false
 }
 
 /// Inspects one complete file with the enabled engines; detections are acted on and logged.
@@ -197,6 +278,26 @@ pub fn quick_scan(
     roots: &[PathBuf],
     telemetry: &Telemetry,
 ) -> QuickScanReport {
+    scan_tree(
+        cfg,
+        scanner,
+        roots,
+        telemetry,
+        &QUICK_LIMITS,
+        &mut |_, _| true,
+    )
+}
+
+/// The walk behind every on-demand scan. `on_dir(report so far, folder being read)` is called
+/// for each folder and each file in it, so it must be cheap; returning false cancels the scan.
+pub fn scan_tree(
+    cfg: &AppConfig,
+    scanner: &BinaryAiScanner,
+    roots: &[PathBuf],
+    telemetry: &Telemetry,
+    limits: &ScanLimits,
+    on_dir: &mut dyn FnMut(&QuickScanReport, &Path) -> bool,
+) -> QuickScanReport {
     let started = Instant::now();
     let mut report = QuickScanReport {
         roots: roots.to_vec(),
@@ -206,8 +307,28 @@ pub fn quick_scan(
     let scanned_before = telemetry.files_scanned.load(Ordering::Relaxed);
     let mut stack: Vec<(PathBuf, usize)> = roots.iter().map(|r| (r.clone(), 0)).collect();
     'walk: while let Some((dir, depth)) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
+        report.files_scanned = telemetry.files_scanned.load(Ordering::Relaxed) - scanned_before;
+        if !on_dir(&report, &dir) {
+            report.cancelled = true;
+            break 'walk;
+        }
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                let listed = depth == 0
+                    || (depth <= limits.report_unreadable_depth
+                        && limits
+                            .report_unreadable_under
+                            .iter()
+                            .any(|tree| dir.starts_with(tree)));
+                if listed
+                    && e.kind() != std::io::ErrorKind::NotFound
+                    && report.unreadable.len() < MAX_UNREADABLE_LISTED
+                {
+                    report.unreadable.push(dir);
+                }
+                continue;
+            }
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -217,8 +338,12 @@ pub fn quick_scan(
             if kind.is_symlink() || should_ignore(cfg, &path) {
                 continue;
             }
+            if is_cloud_placeholder(&entry) {
+                report.cloud_skipped += 1;
+                continue;
+            }
             if kind.is_dir() {
-                if depth < QUICK_SCAN_MAX_DEPTH {
+                if depth < limits.max_depth {
                     stack.push((path, depth + 1));
                 }
                 continue;
@@ -227,8 +352,15 @@ pub fn quick_scan(
                 continue;
             }
             report.files_examined += 1;
-            if report.files_examined > QUICK_SCAN_MAX_FILES {
+            if report.files_examined > limits.max_files {
                 report.truncated = true;
+                break 'walk;
+            }
+            // Per file, not per folder: one folder of large programs can take minutes, and
+            // progress must keep moving (and a cancel must land) all through it.
+            report.files_scanned = telemetry.files_scanned.load(Ordering::Relaxed) - scanned_before;
+            if !on_dir(&report, &dir) {
+                report.cancelled = true;
                 break 'walk;
             }
             let file_kind = classify_file(&path);
@@ -248,15 +380,49 @@ pub fn quick_scan(
     report
 }
 
-/// Full quick scan as run by `--quick-scan` and the desktop app: scan, log a QUICK_SCAN summary
-/// event and leave the report next to events.jsonl.
+/// Quick scan as run by `--quick-scan` and the desktop app.
 pub fn run_quick_scan(cfg: &AppConfig, scanner: &BinaryAiScanner) -> QuickScanReport {
-    let roots = quick_scan_roots(cfg);
-    let report = quick_scan(cfg, scanner, &roots, &Telemetry::default());
+    run_scan(
+        cfg,
+        scanner,
+        &Telemetry::default(),
+        ScanKind::Quick,
+        &mut |_, _| true,
+    )
+}
+
+/// A whole on-demand scan: walk, log a summary event and leave the report next to events.jsonl.
+pub fn run_scan(
+    cfg: &AppConfig,
+    scanner: &BinaryAiScanner,
+    telemetry: &Telemetry,
+    kind: ScanKind,
+    on_dir: &mut dyn FnMut(&QuickScanReport, &Path) -> bool,
+) -> QuickScanReport {
+    // A full scan only reports. The model wrongly flags about 1 clean program in 200, so moving
+    // files across the whole disk on its word would break installed software. Its findings are
+    // logged without a notification each; the summary event below is the one alert.
+    let report_only = AppConfig {
+        dry_run: true,
+        quiet_events: true,
+        ..cfg.clone()
+    };
+    let (scan_cfg, roots, limits, event) = match kind {
+        ScanKind::Quick => (cfg, quick_scan_roots(cfg), &QUICK_LIMITS, "QUICK_SCAN"),
+        ScanKind::Full => (
+            &report_only,
+            full_scan_roots(cfg),
+            &FULL_LIMITS,
+            "FULL_SCAN",
+        ),
+    };
+    let mut report = scan_tree(scan_cfg, scanner, &roots, telemetry, limits, on_dir);
+    report.full = kind == ScanKind::Full;
+    report.finished_at = Utc::now().to_rfc3339();
     quarantine::record_event(
         cfg,
         ThreatEvent::new(
-            "QUICK_SCAN",
+            event,
             if report.findings.is_empty() {
                 Severity::Low
             } else {
@@ -269,19 +435,67 @@ pub fn run_quick_scan(cfg: &AppConfig, scanner: &BinaryAiScanner) -> QuickScanRe
                 .join("; "),
             format!("{} threat(s) found", report.findings.len()),
             format!(
-                "examined={} scanned={} truncated={} duration_ms={}",
-                report.files_examined, report.files_scanned, report.truncated, report.duration_ms
+                "examined={} scanned={} truncated={} cancelled={} unreadable_folders={} cloud_skipped={} duration_ms={}",
+                report.files_examined,
+                report.files_scanned,
+                report.truncated,
+                report.cancelled,
+                report.unreadable.len(),
+                report.cloud_skipped,
+                report.duration_ms
             ),
         ),
     );
     if let Ok(json) = serde_json::to_vec_pretty(&report) {
-        let _ = fs::write(cfg.log_dir.join(QUICK_SCAN_REPORT_FILE), json);
+        // Staged and renamed so a client polling for the report never reads half of it.
+        let path = cfg.log_dir.join(kind.report_file());
+        let staging = path.with_extension("json.tmp");
+        if fs::write(&staging, json).is_ok() {
+            let _ = fs::rename(&staging, &path);
+        }
     }
     report
 }
 
+pub fn read_scan_report(cfg: &AppConfig, kind: ScanKind) -> Option<QuickScanReport> {
+    serde_json::from_slice(&fs::read(cfg.log_dir.join(kind.report_file())).ok()?).ok()
+}
+
 pub fn read_last_quick_scan(cfg: &AppConfig) -> Option<QuickScanReport> {
-    serde_json::from_slice(&fs::read(cfg.log_dir.join(QUICK_SCAN_REPORT_FILE)).ok()?).ok()
+    read_scan_report(cfg, ScanKind::Quick)
+}
+
+/// Everywhere software can be installed or dropped. Apple's sealed system volume is left out
+/// (it is read-only and signed), as are external and network drives.
+pub fn full_scan_roots(cfg: &AppConfig) -> Vec<PathBuf> {
+    if let Some(dir) = &cfg.watch_dir {
+        return vec![dir.clone()];
+    }
+    #[cfg(target_os = "macos")]
+    let roots: Vec<PathBuf> = [
+        "/Applications",
+        "/Users",
+        "/Library",
+        "/opt",
+        "/usr/local",
+        "/private/tmp",
+        "/private/var/tmp",
+        "/private/var/folders",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    #[cfg(windows)]
+    let roots = vec![PathBuf::from(format!(
+        "{}\\",
+        std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string())
+    ))];
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let roots: Vec<PathBuf> = ["/home", "/opt", "/usr/local", "/tmp", "/var/tmp"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    roots.into_iter().filter(|p| p.is_dir()).collect()
 }
 
 pub fn quick_scan_roots(cfg: &AppConfig) -> Vec<PathBuf> {
@@ -513,6 +727,12 @@ pub fn run(cfg: AppConfig, shutdown: Arc<AtomicBool>) {
     if let Some(w) = watcher.as_mut() {
         refresh_watches(w, &mut watched, &watch_plan(&cfg));
     }
+    // On-demand scans requested by the desktop app (see scan_jobs).
+    let jobs = Arc::new(ScanJobs::default());
+    if let Err(e) = scan_jobs::prepare(&cfg) {
+        logger::warn(format!("on-demand scans are unavailable: {e}"));
+    }
+    let mut last_requests = Instant::now();
     let mut last_discovery = Instant::now();
     let mut last_settings = Instant::now();
     let mut last_status: Option<Instant> = None;
@@ -524,6 +744,10 @@ pub fn run(cfg: AppConfig, shutdown: Arc<AtomicBool>) {
         .unwrap_or(1.0);
 
     while !shutdown.load(Ordering::SeqCst) {
+        if last_requests.elapsed() >= SCAN_REQUEST_INTERVAL {
+            last_requests = Instant::now();
+            jobs.poll(&cfg, &scanner, &telemetry);
+        }
         if last_settings.elapsed() >= SETTINGS_RELOAD_INTERVAL {
             last_settings = Instant::now();
             if let Some(toggles) = cfg.toggles.reload_if_changed(&cfg.settings_file) {
@@ -572,6 +796,7 @@ pub fn run(cfg: AppConfig, shutdown: Arc<AtomicBool>) {
     }
 
     logger::info("The Nex stopping");
+    jobs.cancel();
     drop(watcher);
     drop(scan_tx);
     drop(canary_tx);
@@ -717,6 +942,30 @@ mod tests {
         cfg.toggles.apply(toggles);
         let report = quick_scan(&cfg, &scanner, &[watch], &telemetry);
         assert_eq!(report.files_scanned, 0);
+        assert!(report.unreadable.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quick_scan_reports_folders_it_cannot_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("blocked");
+        let (open, locked, missing) = (root.join("open"), root.join("locked"), root.join("gone"));
+        fs::create_dir_all(&open).unwrap();
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(open.join("notes.txt"), b"plain text").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let cfg = AppConfig::for_base_dir(&root.join("base"));
+        let scanner = BinaryAiScanner::heuristic_only();
+        let roots = [open, locked.clone(), missing];
+        let report = quick_scan(&cfg, &scanner, &roots, &Telemetry::default());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(report.files_examined, 1);
+        // root can open anything; a folder that does not exist is simply skipped
+        if fs::read_dir("/var/root").is_err() {
+            assert_eq!(report.unreadable, vec![locked]);
+        }
         let _ = fs::remove_dir_all(&root);
     }
 }

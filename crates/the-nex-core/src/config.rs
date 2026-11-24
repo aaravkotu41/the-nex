@@ -37,6 +37,7 @@ Modes:
   --notifier                show desktop notifications for new threat events
   --tray                    show the system tray icon (Windows)
   --quick-scan              scan Downloads and Desktop (or --watch-dir) once and exit
+  --full-scan               scan the whole disk (or --watch-dir) once, report only, and exit
   --rearm-canaries          verify and recreate canary files, then exit
   --scan-file <PATH>        explain the binary AI verdict for PATH (a file, a folder or
                             @list.txt); prints JSON lines and never changes anything
@@ -110,6 +111,7 @@ pub enum Mode {
     Notifier,
     Tray,
     QuickScan,
+    FullScan,
     RearmCanaries,
     ScanFile(PathBuf),
     Restore(String),
@@ -158,6 +160,7 @@ where
             "--notifier" => Some(Mode::Notifier),
             "--tray" => Some(Mode::Tray),
             "--quick-scan" => Some(Mode::QuickScan),
+            "--full-scan" => Some(Mode::FullScan),
             "--rearm-canaries" => Some(Mode::RearmCanaries),
             "--help" | "-h" | "/?" => Some(Mode::Help),
             "--restore" => Some(Mode::Restore(take_value(&mut iter, "--restore")?)),
@@ -208,9 +211,10 @@ where
         None if scan_options || path_overrides => Mode::Console,
         None => Mode::Service,
     };
-    if scan_options && !matches!(mode, Mode::Console | Mode::QuickScan) {
+    if scan_options && !matches!(mode, Mode::Console | Mode::QuickScan | Mode::FullScan) {
         return Err(
-            "--dry-run and --watch-dir are only valid with --console or --quick-scan".into(),
+            "--dry-run and --watch-dir are only valid with --console, --quick-scan or --full-scan"
+                .into(),
         );
     }
     if path_overrides && matches!(mode, Mode::Install | Mode::Uninstall | Mode::Help) {
@@ -401,6 +405,8 @@ pub struct AppConfig {
     pub watch_dir: Option<PathBuf>,
     /// Console mode: echo logs to stderr and raise desktop notifications directly.
     pub interactive: bool,
+    /// Events are logged but raise no notification (see `ThreatEvent::quiet`).
+    pub quiet_events: bool,
     pub zip_limits: ZipLimits,
     pub ai_threshold: f32,
     pub max_ai_scan_bytes: u64,
@@ -423,6 +429,7 @@ impl AppConfig {
             dry_run: false,
             watch_dir: None,
             interactive: false,
+            quiet_events: false,
             zip_limits: ZipLimits::default(),
             ai_threshold: AI_MALWARE_THRESHOLD,
             max_ai_scan_bytes: MAX_AI_SCAN_BYTES,

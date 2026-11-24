@@ -8,5 +8,6 @@ pub mod notifier;
 pub mod platform;
 pub mod process_guard;
 pub mod quarantine;
+pub mod scan_jobs;
 pub mod status;
 pub mod zip_bomb;

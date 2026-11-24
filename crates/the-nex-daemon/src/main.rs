@@ -29,7 +29,8 @@ fn main() -> ExitCode {
         Mode::Restore(id) => restore(id, &args),
         Mode::Delete(id) => delete(id, &args),
         Mode::Set(engine, enabled) => set_toggle(*engine, *enabled, &args),
-        Mode::QuickScan => quick_scan(&args),
+        Mode::QuickScan => scan(&args, engine::ScanKind::Quick),
+        Mode::FullScan => scan(&args, engine::ScanKind::Full),
         Mode::RearmCanaries => rearm_canaries(&args),
         Mode::ScanFile(target) => scan_file(target, &args),
         Mode::Notifier => {
@@ -159,14 +160,15 @@ fn set_toggle(engine: Engine, enabled: bool, args: &CliArgs) -> ExitCode {
     }
 }
 
-fn quick_scan(args: &CliArgs) -> ExitCode {
+fn scan(args: &CliArgs, kind: engine::ScanKind) -> ExitCode {
     let cfg = cli_config(args);
     if let Err(e) = cfg.ensure_dirs() {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
     }
     let scanner = BinaryAiScanner::load(&cfg.model_path).with_max_scan_bytes(cfg.max_ai_scan_bytes);
-    let result = engine::run_quick_scan(&cfg, &scanner);
+    let telemetry = the_nex_core::status::Telemetry::default();
+    let result = engine::run_scan(&cfg, &scanner, &telemetry, kind, &mut |_, _| true);
     println!(
         "{}",
         serde_json::to_string_pretty(&result).unwrap_or_default()

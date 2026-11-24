@@ -400,8 +400,13 @@ fn macos_lotl_commands_are_flagged() {
         ),
         (
             "osascript",
-            "osascript -e 'do shell script \"id\"'",
-            "osascript -e",
+            "osascript -e 'display dialog \"Password\" default answer \"\" with hidden answer'",
+            the_nex_core::process_guard::OSASCRIPT_PASSWORD_PROMPT,
+        ),
+        (
+            "osascript",
+            "osascript -e 'do shell script \"chmod +x /tmp/u && /tmp/u\"'",
+            the_nex_core::process_guard::OSASCRIPT_SHELL_FETCH,
         ),
         ("sh", "sh -c echo aWQ= | base64 -D | sh", "base64 -d"),
         (

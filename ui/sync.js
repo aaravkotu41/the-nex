@@ -128,7 +128,7 @@
   async function execute(cmd) {
     const out = await callApi(ALLOWED[cmd.command], { remote: true }); // lets the backend refuse elevation for remote runs
     if (cmd.command === "quick_scan") {
-      return { threats: (out.findings || []).length, files_scanned: out.files_scanned || 0, duration_ms: out.duration_ms || 0 };
+      return { threats: (out.findings || []).length, files_scanned: out.files_scanned || 0, duration_ms: out.duration_ms || 0, blocked: (out.unreadable || []).length };
     }
     const list = Array.isArray(out) ? out : [];
     return { intact: list.filter((c) => c.state === "Intact").length, total: list.length };
@@ -268,7 +268,7 @@
   function commandLine(c) {
     const r = c.result || {};
     let tail = "";
-    if (c.status === "done" && c.command === "quick_scan") tail = ": " + r.threats + (r.threats === 1 ? " threat, " : " threats, ") + r.files_scanned + " files, " + (r.duration_ms / 1000).toFixed(1) + " s";
+    if (c.status === "done" && c.command === "quick_scan") tail = ": " + r.threats + (r.threats === 1 ? " threat, " : " threats, ") + r.files_scanned + " files, " + (r.duration_ms / 1000).toFixed(1) + " s" + (r.blocked ? ", " + r.blocked + " folder(s) blocked by macOS" : "");
     else if (c.status === "done") tail = ": " + r.intact + " of " + r.total + " intact";
     else if (c.status === "pending") tail = ": waiting for the device";
     else if (c.status === "failed" && r.error) tail = ": " + r.error;

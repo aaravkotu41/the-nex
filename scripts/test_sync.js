@@ -109,7 +109,7 @@ const fresh = () => new Date().toISOString();
     const unsupported = p.find((c) => c.url.includes("id=eq.b"));
     check("unsupported command marked failed", unsupported.body.status === "failed" && unsupported.body.result.error === "unsupported");
     const scan = p.find((c) => c.url.includes("id=eq.a") && c.body.status === "done");
-    check("scan result summary", JSON.stringify(scan.body.result) === '{"threats":1,"files_scanned":10,"duration_ms":5}');
+    check("scan result summary", JSON.stringify(scan.body.result) === '{"threats":1,"files_scanned":10,"duration_ms":5,"blocked":0}');
     const ver = p.find((c) => c.url.includes("id=eq.c") && c.body.status === "done");
     check("canary result summary", JSON.stringify(ver.body.result) === '{"intact":1,"total":2}');
     e.sync.stop();

