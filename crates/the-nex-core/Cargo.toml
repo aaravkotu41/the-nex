@@ -21,6 +21,10 @@ chrono.workspace = true
 notify-rust.workspace = true
 sha2.workspace = true
 
+# Symlink- and FIFO-safe file handling in the root daemon (openat/O_NOFOLLOW/O_NONBLOCK).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
 [target.'cfg(windows)'.dependencies]
 windows-service.workspace = true
 windows-sys.workspace = true

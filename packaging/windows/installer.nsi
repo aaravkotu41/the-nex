@@ -101,6 +101,14 @@ Section "The Nex" SecMain
   DetailPrint "Stopping any running copy of The Nex..."
   !insertmacro StopTheNex
 
+  ; A user may have pre-created %ProgramData%\TheNex: take ownership for Administrators and drop
+  ; its ACLs before anything runs as SYSTEM from here (failures are ignored if it is absent).
+  CreateDirectory "$INSTDIR"
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C'
+  Pop $0
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /reset /T /C'
+  Pop $0
+
   SetOutPath "$INSTDIR"
   SetOverwrite on
   File "${SRCDIR}\the-nex.exe"

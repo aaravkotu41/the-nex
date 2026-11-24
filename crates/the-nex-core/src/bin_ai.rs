@@ -6,6 +6,7 @@
 //! (scripts/check_feature_parity.py): a model fed different numbers in production than in
 //! training silently stops working, so change both sides together.
 
+use crate::ai_policy;
 use crate::config::{AppConfig, MAX_AI_SCAN_BYTES};
 use crate::logger::{self, lock_or_recover};
 use crate::platform;
@@ -13,11 +14,11 @@ use crate::quarantine::{self, Severity, ThreatEvent};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::Read;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
 
 pub const FEATURE_COUNT: usize = 14;
 pub const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
@@ -261,9 +262,14 @@ pub struct AiOutcome {
     pub detection: Option<String>,
 }
 
+/// path -> ((mtime, size), verdict)
+type VerdictCache<T> = Mutex<HashMap<PathBuf, (FileStamp, T)>>;
+
 pub struct BinaryAiScanner {
     model: Option<InferenceFn>,
-    cache: Mutex<HashMap<PathBuf, (u64, f32)>>,
+    cache: VerdictCache<f32>,
+    /// Signature verdicts (spawning codesign / WinVerifyTrust is the costliest step), same key.
+    trust_cache: VerdictCache<bool>,
     fallback_warned: AtomicBool,
     max_scan_bytes: u64,
 }
@@ -294,6 +300,7 @@ impl BinaryAiScanner {
         Self {
             model,
             cache: Mutex::new(HashMap::new()),
+            trust_cache: Mutex::new(HashMap::new()),
             fallback_warned: AtomicBool::new(warned),
             max_scan_bytes: MAX_AI_SCAN_BYTES,
         }
@@ -328,33 +335,82 @@ impl BinaryAiScanner {
         heuristic_score(features)
     }
 
+    /// Opens once (no symlink follow, no FIFO hang), checks the opened handle is a regular file
+    /// and reads at most the size limit, so a swap or growth after a size check cannot bypass it.
     fn read_binary(&self, path: &Path) -> Option<Vec<u8>> {
-        let meta = fs::metadata(path).ok()?;
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = opts.open(path).ok()?;
+        let meta = file.metadata().ok()?;
         if !meta.is_file() || meta.len() == 0 || meta.len() > self.max_scan_bytes {
             return None;
         }
-        fs::read(path).ok()
+        let mut bytes = Vec::new();
+        file.take(self.max_scan_bytes + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (!bytes.is_empty() && bytes.len() as u64 <= self.max_scan_bytes).then_some(bytes)
     }
 
-    /// Scores a file (cached by path and mtime); None when it is not a parseable executable,
-    /// empty, or too large.
+    /// Cached `platform::is_trusted_binary` (signature checks are far slower than scoring).
+    pub fn is_trusted(&self, path: &Path) -> bool {
+        let Ok(meta) = fs::metadata(path) else {
+            return false;
+        };
+        let Some(stamp) = file_stamp(&meta) else {
+            return platform::is_trusted_binary(path); // never cache trust without a stamp
+        };
+        if let Some(&(cached, trusted)) = lock_or_recover(&self.trust_cache).get(path) {
+            if cached == stamp {
+                return trusted;
+            }
+        }
+        let trusted = platform::is_trusted_binary(path);
+        let mut cache = lock_or_recover(&self.trust_cache);
+        if cache.len() >= MAX_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), (stamp, trusted));
+        trusted
+    }
+
+    /// Scores a file (cached by path, mtime and size); None when it is not a parseable
+    /// executable, empty, or too large.
     pub fn scan_file(&self, path: &Path) -> Option<f32> {
-        let meta = fs::metadata(path).ok()?;
-        let mtime = modified_secs(&meta);
-        if let Some(&(cached_mtime, score)) = lock_or_recover(&self.cache).get(path) {
-            if cached_mtime == mtime {
-                return Some(score);
+        self.scan_with_profile(path).map(|(score, _)| score)
+    }
+
+    /// Like `scan_file`, and returns the parsed profile when the file was freshly read, so a
+    /// detection can be explained without reading and parsing the file a second time.
+    pub fn scan_with_profile(&self, path: &Path) -> Option<(f32, Option<BinaryProfile>)> {
+        let meta = fs::symlink_metadata(path).ok()?;
+        if !meta.file_type().is_file() {
+            return None;
+        }
+        let stamp = file_stamp(&meta);
+        if let Some(stamp) = stamp {
+            if let Some(&(cached, score)) = lock_or_recover(&self.cache).get(path) {
+                if cached == stamp {
+                    return Some((score, None));
+                }
             }
         }
         let bytes = self.read_binary(path)?;
         let profile = extract_profile(&bytes)?;
         let score = self.score_features(&profile.features());
-        let mut cache = lock_or_recover(&self.cache);
-        if cache.len() >= MAX_CACHE_ENTRIES {
-            cache.clear();
+        if let Some(stamp) = stamp {
+            let mut cache = lock_or_recover(&self.cache);
+            if cache.len() >= MAX_CACHE_ENTRIES {
+                cache.clear();
+            }
+            cache.insert(path.to_path_buf(), (stamp, score));
         }
-        cache.insert(path.to_path_buf(), (mtime, score));
-        Some(score)
+        Some((score, Some(profile)))
     }
 
     /// Full, uncached assessment: score plus the facts behind it (detections, `--scan-file`).
@@ -375,16 +431,41 @@ impl BinaryAiScanner {
     /// Event details for a file that scored `score`: re-reads it to explain the verdict.
     pub fn explain(&self, path: &Path, score: f32, threshold: f32) -> String {
         let profile = self.assess(path).map(|a| a.profile);
-        detection_details(score, threshold, self.engine_name(), profile.as_ref())
+        self.explain_with(profile.as_ref(), score, threshold)
+    }
+
+    pub fn explain_with(
+        &self,
+        profile: Option<&BinaryProfile>,
+        score: f32,
+        threshold: f32,
+    ) -> String {
+        detection_details(score, threshold, self.engine_name(), profile)
     }
 }
 
-pub fn modified_secs(meta: &fs::Metadata) -> u64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// Identity of a file's content for verdict caches: (dev, inode, size, mtime_ns, ctime_ns).
+/// ctime cannot be set from user space, so an in-place overwrite followed by `touch -r` still
+/// changes the stamp.
+pub type FileStamp = (u64, u64, u64, i128, i128);
+
+/// None where no tamper-resistant stamp exists (Windows): callers must not cache verdicts.
+#[cfg(unix)]
+pub fn file_stamp(meta: &fs::Metadata) -> Option<FileStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let ns = |s: i64, n: i64| i128::from(s) * 1_000_000_000 + i128::from(n);
+    Some((
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        ns(meta.mtime(), meta.mtime_nsec()),
+        ns(meta.ctime(), meta.ctime_nsec()),
+    ))
+}
+
+#[cfg(not(unix))]
+pub fn file_stamp(_meta: &fs::Metadata) -> Option<FileStamp> {
+    None
 }
 
 /// Shannon entropy in bits per byte (0.0..=8.0).
@@ -698,31 +779,51 @@ pub fn detection_details(
     details
 }
 
-/// Scores an untrusted binary and quarantines it (or logs, in dry-run) when it crosses the
-/// threshold. None when the file is trusted or not a parseable executable.
+/// Scores an untrusted binary and, if it crosses the threshold, lets `ai_policy` decide what
+/// may happen (quarantine, dry-run record, or alert only). None when the file is trusted or
+/// not a parseable executable.
 pub fn scan_and_respond(
     path: &Path,
     cfg: &AppConfig,
     scanner: &BinaryAiScanner,
 ) -> Option<AiOutcome> {
-    if platform::is_trusted_binary(path) {
+    if scanner.is_trusted(path) {
         return None;
     }
-    let score = scanner.scan_file(path)?;
-    if score < cfg.ai_threshold {
+    let (score, profile) = scanner.scan_with_profile(path)?;
+    let threshold = ai_policy::effective_threshold(cfg.ai_threshold);
+    if score.is_nan() || score < threshold {
         return Some(AiOutcome {
             score,
             detection: None,
         });
     }
     // Explain before quarantining: the file is moved away below.
-    let details = scanner.explain(path, score, cfg.ai_threshold);
-    let action = if cfg.is_dry_run() {
-        "DRY_RUN: would quarantine".to_string()
-    } else {
-        match quarantine::quarantine_file(path, cfg, "MALWARE_AI", &details) {
-            Ok(meta) => format!("QUARANTINED id={}", meta.id),
-            Err(e) => format!("QUARANTINE_FAILED: {e}"),
+    let details = match profile {
+        Some(p) => scanner.explain_with(Some(&p), score, threshold),
+        None => scanner.explain(path, score, threshold),
+    };
+    let action = ai_policy::decide(&ai_policy::Request {
+        path,
+        score,
+        threshold: cfg.ai_threshold,
+        trusted: false,
+        dry_run: cfg.is_dry_run(),
+        target: ai_policy::Target::File,
+        explanation: &details,
+        data_dir: &cfg.base_dir,
+    });
+    let action = match action {
+        ai_policy::Action::Ignore => return None,
+        ai_policy::Action::Alert(why) => format!("ALERT_ONLY: {why}"),
+        ai_policy::Action::WouldQuarantine | ai_policy::Action::WouldTerminateAndQuarantine => {
+            "DRY_RUN: would quarantine".to_string()
+        }
+        ai_policy::Action::Quarantine | ai_policy::Action::TerminateAndQuarantine => {
+            match quarantine::quarantine_file(path, cfg, "MALWARE_AI", &details) {
+                Ok(meta) => format!("QUARANTINED id={}", meta.id),
+                Err(e) => format!("QUARANTINE_FAILED: {e}"),
+            }
         }
     };
     quarantine::record_event(
@@ -837,6 +938,59 @@ pub mod prototypes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("thenex-binai-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_size_overwrite_with_restored_mtime_changes_the_stamp() {
+        let d = scratch("stamp");
+        let f = d.join("bin");
+        fs::write(&f, b"AAAAAAAA").unwrap();
+        let old = fs::metadata(&f).unwrap();
+        let before = file_stamp(&old).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&f, b"BBBBBBBB").unwrap(); // in place: same inode, same size
+        fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(old.modified().unwrap())
+            .unwrap(); // the `touch -r` step
+        let after = file_stamp(&fs::metadata(&f).unwrap()).unwrap();
+        assert_eq!((before.0, before.1, before.2), (after.0, after.1, after.2));
+        assert_eq!(before.3, after.3, "mtime was restored");
+        assert_ne!(before, after, "ctime must still differ");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_binary_rejects_fifo_symlink_and_oversize() {
+        let d = scratch("read");
+        let s = BinaryAiScanner::heuristic_only().with_max_scan_bytes(16);
+        let ok = d.join("ok");
+        fs::write(&ok, [1u8; 16]).unwrap();
+        assert_eq!(s.read_binary(&ok).map(|b| b.len()), Some(16));
+        let big = d.join("big");
+        fs::write(&big, [1u8; 17]).unwrap();
+        assert!(s.read_binary(&big).is_none());
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&ok, &link).unwrap();
+        assert!(s.read_binary(&link).is_none());
+        let fifo = d.join("fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(s.read_binary(&fifo).is_none(), "must not hang on a FIFO");
+        let _ = fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn entropy_bounds() {

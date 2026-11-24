@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod appearance;
+#[cfg(target_os = "macos")]
+mod menubar;
 
 use chrono::Utc;
 use serde::Serialize;
@@ -86,7 +88,24 @@ fn elevated(args: &[&str]) -> Result<(), String> {
     if !exe.is_file() {
         return Err(format!("{} was not found next to the app", exe.display()));
     }
-    match platform::run_elevated(&exe, args)? {
+    // macOS shows this sentence in the admin prompt, so a script can't hide what it asks for.
+    #[cfg(target_os = "macos")]
+    let status = {
+        let action = match args.first().copied() {
+            Some("--install") => "install its background protection service".to_string(),
+            Some("--uninstall") => "REMOVE its background protection service".to_string(),
+            Some("--set") => format!("change an engine setting ({})", args[1..].join(" ")),
+            Some("--quick-scan") => "run a quick scan".to_string(),
+            Some("--restore") => "restore a file from quarantine".to_string(),
+            Some("--delete") => "permanently delete a quarantined file".to_string(),
+            Some("--rearm-canaries") => "re-create its ransomware decoy files".to_string(),
+            _ => format!("run: the-nex {}", args.join(" ")),
+        };
+        platform::run_elevated_with_prompt(&exe, args, &format!("The Nex wants to {action}."))?
+    };
+    #[cfg(not(target_os = "macos"))]
+    let status = platform::run_elevated(&exe, args)?;
+    match status {
         0 => Ok(()),
         code => Err(format!(
             "the-nex {} exited with code {code}",
@@ -305,23 +324,39 @@ fn writable(dir: &Path) -> bool {
     ok
 }
 
+/// Message for remote (synced) commands that would need an administrator prompt.
+const NEEDS_LOCAL: &str = "Needs local approval: open The Nex on this computer";
+
+static SCAN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Shared by the `run_quick_scan` command and the macOS menu bar; blocks until the scan ends.
+/// Only one scan runs at a time. A `remote` caller never triggers an admin prompt.
+fn quick_scan(remote: bool) -> Result<QuickScanReport, String> {
+    let _guard = match SCAN_LOCK.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return Err("A scan is already running".into()),
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+    };
+    let cfg = config();
+    if writable(&cfg.quarantine_dir) && writable(&cfg.log_dir) {
+        let scanner =
+            BinaryAiScanner::load(&cfg.model_path).with_max_scan_bytes(cfg.max_ai_scan_bytes);
+        return Ok(engine::run_quick_scan(&cfg, &scanner));
+    }
+    if remote {
+        return Err(NEEDS_LOCAL.to_string());
+    }
+    let before = engine::read_last_quick_scan(&cfg);
+    elevated(&["--quick-scan"])?;
+    match engine::read_last_quick_scan(&cfg) {
+        Some(report) if Some(&report) != before.as_ref() => Ok(report),
+        _ => Err("the quick scan finished but its report could not be read".to_string()),
+    }
+}
+
 #[tauri::command]
-async fn run_quick_scan() -> Result<QuickScanReport, String> {
-    blocking(|| {
-        let cfg = config();
-        if writable(&cfg.quarantine_dir) && writable(&cfg.log_dir) {
-            let scanner =
-                BinaryAiScanner::load(&cfg.model_path).with_max_scan_bytes(cfg.max_ai_scan_bytes);
-            return Ok(engine::run_quick_scan(&cfg, &scanner));
-        }
-        let before = engine::read_last_quick_scan(&cfg);
-        elevated(&["--quick-scan"])?;
-        match engine::read_last_quick_scan(&cfg) {
-            Some(report) if Some(&report) != before.as_ref() => Ok(report),
-            _ => Err("the quick scan finished but its report could not be read".to_string()),
-        }
-    })
-    .await
+async fn run_quick_scan(remote: Option<bool>) -> Result<QuickScanReport, String> {
+    blocking(move || quick_scan(remote == Some(true))).await
 }
 
 #[tauri::command]
@@ -389,8 +424,8 @@ async fn delete_quarantine(id: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn verify_canaries() -> Result<Vec<CanaryStatus>, String> {
-    blocking(|| {
+async fn verify_canaries(remote: Option<bool>) -> Result<Vec<CanaryStatus>, String> {
+    blocking(move || {
         let cfg = config();
         let dirs: Vec<PathBuf> = engine::canary_dirs(&cfg);
         if dirs.is_empty() {
@@ -398,6 +433,9 @@ async fn verify_canaries() -> Result<Vec<CanaryStatus>, String> {
         }
         let report = canary::rearm_canaries(&dirs);
         if !report.iter().all(CanaryStatus::is_intact) {
+            if remote == Some(true) {
+                return Err(NEEDS_LOCAL.to_string());
+            }
             elevated(&["--rearm-canaries"])?;
         }
         Ok(merged_canaries(&cfg, fresh_status(&cfg).as_ref()))
@@ -431,7 +469,12 @@ async fn aegismesh(op: String, request: serde_json::Value) -> Result<serde_json:
 }
 
 fn main() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .setup(menubar::setup)
+        .on_window_event(menubar::on_window_event);
+    let app = builder
         .register_uri_scheme_protocol(appearance::WALLPAPER_SCHEME, |ctx, request| {
             appearance::serve_wallpaper(ctx.app_handle(), &request)
         })
@@ -453,8 +496,12 @@ fn main() {
             appearance::save_wallpaper_file,
             aegismesh
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("failed to start The Nex desktop app");
+    app.run(|_app, _event| {
+        #[cfg(target_os = "macos")]
+        menubar::on_run_event(_app, &_event);
+    });
 }
 
 #[cfg(test)]

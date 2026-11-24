@@ -4,9 +4,8 @@ use std::fs::{self, File};
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
-use zip::result::ZipResult;
-use zip::ZipArchive;
+use std::time::{Duration, Instant};
+use zip::{CompressionMethod, ZipArchive};
 
 const IGNORED_EXTENSIONS: &[&str] = &[
     "crdownload",
@@ -21,6 +20,26 @@ const READY_POLL: Duration = Duration::from_millis(150);
 const READY_MAX_RETRIES: u32 = 5;
 const READY_STABLE_CHECKS: u32 = 2;
 
+const EOCD_SIG: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
+const CDFH_SIG: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+const LFH_SIG: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
+const MAX_EOCD_SEARCH: u64 = 22 + u16::MAX as u64;
+const MAX_CD_BYTES: u64 = 64 * 1024 * 1024;
+/// Real datasets reach ~1.3M entries (ImageNet); the 64 MiB central-directory cap bounds the rest.
+const MAX_ENTRIES: u64 = 10_000_000;
+/// Local-header walk cap: no directory bounds it, so allow what a maximal directory could hold
+/// (46 B is the smallest central-directory entry).
+const LFH_MAX_ENTRIES: u64 = MAX_CD_BYTES / 46;
+/// How far before the EOCD to look for a displaced central directory.
+const SCAN_WINDOW: u64 = 1024 * 1024;
+/// Real decompression done to verify declared sizes, per top-level archive.
+const SAMPLE_BUDGET: u64 = 64 * 1024 * 1024;
+/// Nested archives read into memory, cumulative per top-level archive.
+const NESTED_BUDGET: u64 = 256 * 1024 * 1024;
+/// Past this the optional decompression work stops and the scan fails open.
+const TIME_BUDGET: Duration = Duration::from_secs(10);
+const NESTED_EXTENSIONS: &[&str] = &["zip", "jar", "war", "apk", "xpi"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZipThreatKind {
     CompressionRatio,
@@ -28,6 +47,12 @@ pub enum ZipThreatKind {
     OverlappingEntries,
     NestingDepth,
     NestedSizeMismatch,
+    /// More entries than any real archive carries (Zip64 counts included).
+    EntryCount,
+    /// Local header and central directory disagree about method or sizes.
+    HeaderMismatch,
+    /// Carries an end-of-central-directory record but no parser can make sense of it.
+    Malformed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,25 +85,41 @@ pub fn is_ignored_extension(path: &Path) -> bool {
         .is_some_and(|ext| IGNORED_EXTENSIONS.contains(&ext.as_str()))
 }
 
+/// Opens a regular file without blocking on FIFOs or following symlinks.
+fn open_regular(path: &Path) -> std::io::Result<File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = opts.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(file)
+}
+
 /// True once the size is unchanged across two consecutive 150 ms checks and the file opens.
 pub fn wait_for_file_ready(path: &Path) -> bool {
     if is_ignored_extension(path) {
         return false;
     }
-    let mut previous = match fs::metadata(path) {
+    let mut previous = match fs::symlink_metadata(path) {
         Ok(m) if m.is_file() => m.len(),
         _ => return false,
     };
     let mut stable = 0;
     for _ in 0..(READY_STABLE_CHECKS + READY_MAX_RETRIES) {
         thread::sleep(READY_POLL);
-        let current = match fs::metadata(path) {
-            Ok(m) => m.len(),
-            Err(_) => return false,
+        let current = match fs::symlink_metadata(path) {
+            Ok(m) if m.is_file() => m.len(),
+            _ => return false,
         };
         if current == previous {
             stable += 1;
-            if stable >= READY_STABLE_CHECKS && File::open(path).is_ok() {
+            if stable >= READY_STABLE_CHECKS && open_regular(path).is_ok() {
                 return true;
             }
         } else {
@@ -89,110 +130,507 @@ pub fn wait_for_file_ready(path: &Path) -> bool {
     false
 }
 
-/// Reads only the central directory and (bounded, in-memory) nested archives; never extracts.
+/// Reads the central directory, local headers and (bounded, in-memory) nested archives; never
+/// extracts to disk. Work is bounded by byte and time budgets, and failures fail open.
 pub fn inspect_zip_file(path: &Path, cfg: &AppConfig) -> Option<ZipThreat> {
-    let file = File::open(path).ok()?;
-    let mut budget = 0u64;
-    match inspect_zip_reader(BufReader::new(file), 1, &cfg.zip_limits, &mut budget) {
-        Ok(result) => result,
-        Err(_) => raw_overlap_scan(BufReader::new(File::open(path).ok()?), 1),
-    }
+    let file = open_regular(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    // Small buffer: every header probe seeks, and a seek throws the buffer away.
+    inspect_root(BufReader::with_capacity(4096, file), len, &cfg.zip_limits)
 }
 
 pub fn inspect_zip_bytes(bytes: &[u8], limits: &ZipLimits) -> Option<ZipThreat> {
-    let mut budget = 0u64;
-    match inspect_zip_reader(Cursor::new(bytes), 1, limits, &mut budget) {
-        Ok(result) => result,
-        Err(_) => raw_overlap_scan(Cursor::new(bytes), 1),
+    inspect_root(Cursor::new(bytes), bytes.len() as u64, limits)
+}
+
+fn inspect_root<R: Read + Seek>(reader: R, len: u64, limits: &ZipLimits) -> Option<ZipThreat> {
+    let mut scan = Scan {
+        cumulative: 0,
+        root_len: len.max(1),
+        sample_left: SAMPLE_BUDGET,
+        nested_left: NESTED_BUDGET,
+        deadline: Instant::now() + TIME_BUDGET,
+    };
+    inspect_level(reader, 1, limits, &mut scan)
+}
+
+/// Per-top-level-archive work budgets shared by every nesting level.
+struct Scan {
+    /// Declared uncompressed bytes summed over all levels.
+    cumulative: u64,
+    root_len: u64,
+    sample_left: u64,
+    nested_left: u64,
+    deadline: Instant,
+}
+
+/// One central-directory entry plus what its local header says.
+struct Rec {
+    cd_index: usize,
+    method: u16,
+    compressed: u64,
+    uncompressed: u64,
+    /// Local header start .. end of compressed data, absolute in the file.
+    extent: Option<(u64, u64)>,
+    nested: bool,
+    mismatch: Option<String>,
+}
+
+enum Raw {
+    TooMany(u64),
+    Recs(Vec<Rec>),
+    /// `eocd`: an end-of-central-directory record was found even though the walk failed.
+    Unparsable {
+        eocd: bool,
+    },
+}
+
+fn u16_at(buf: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        buf.get(at..at.checked_add(2)?)?.try_into().ok()?,
+    ))
+}
+
+fn u32_at(buf: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        buf.get(at..at.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+fn u64_at(buf: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        buf.get(at..at.checked_add(8)?)?.try_into().ok()?,
+    ))
+}
+
+fn read_at<R: Read + Seek>(reader: &mut R, at: u64, len: usize) -> Option<Vec<u8>> {
+    reader.seek(SeekFrom::Start(at)).ok()?;
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+fn is_nested_name(name: &[u8]) -> bool {
+    let lower = String::from_utf8_lossy(name).to_ascii_lowercase();
+    NESTED_EXTENSIONS
+        .iter()
+        .any(|ext| lower.ends_with(&format!(".{ext}")))
+}
+
+struct Pending {
+    rec: Rec,
+    local: u64,
+    raw_sizes: (u32, u32),
+}
+
+/// Applies a Zip64 extra field (id 1) to whichever of the three fields hold the 0xFFFFFFFF marker.
+fn apply_zip64(extra: &[u8], mut fields: [(u32, &mut u64); 3]) {
+    let mut e = 0usize;
+    while let (Some(id), Some(size)) = (u16_at(extra, e), u16_at(extra, e + 2)) {
+        let body = e + 4;
+        if id == 1 {
+            let mut at = body;
+            for (wanted, slot) in fields.iter_mut() {
+                if *wanted == 0xFFFF_FFFF {
+                    if let Some(v) = u64_at(extra, at) {
+                        **slot = v;
+                    }
+                    at += 8;
+                }
+            }
+        }
+        e = body.saturating_add(size as usize);
     }
 }
 
-fn le_u16(buf: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([buf[at], buf[at + 1]])
-}
-
-fn le_u32(buf: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
-}
-
-/// Minimal central-directory walk used when the zip crate refuses an archive, so that
-/// overlapping-entry bombs other extractors would still expand are flagged anyway.
-fn raw_overlap_scan<R: Read + Seek>(mut reader: R, depth: u32) -> Option<ZipThreat> {
-    const EOCD_SIG: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
-    const CDFH_SIG: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
-    const LFH_SIG: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
-    const MAX_EOCD_SEARCH: u64 = 22 + u16::MAX as u64;
-    const MAX_CD_BYTES: u64 = 64 * 1024 * 1024;
-
-    let len = reader.seek(SeekFrom::End(0)).ok()?;
-    let tail_len = len.min(MAX_EOCD_SEARCH);
-    reader.seek(SeekFrom::Start(len - tail_len)).ok()?;
-    let mut tail = vec![0u8; tail_len as usize];
-    reader.read_exact(&mut tail).ok()?;
-    let eocd = (0..tail.len().saturating_sub(21))
-        .rev()
-        .find(|&i| tail[i..i + 4] == EOCD_SIG)?;
-    let entries = le_u16(&tail, eocd + 10) as usize;
-    let cd_size = le_u32(&tail, eocd + 12) as u64;
-    let cd_offset = le_u32(&tail, eocd + 16) as u64;
-    if cd_size > MAX_CD_BYTES || cd_offset.checked_add(cd_size)? > len {
+/// One central-directory record at `pos`, plus the offset of the next one.
+fn parse_cdfh(cd: &[u8], pos: usize, index: usize) -> Option<(Pending, usize)> {
+    if cd.get(pos..pos.checked_add(4)?) != Some(&CDFH_SIG[..]) {
         return None;
     }
-
-    reader.seek(SeekFrom::Start(cd_offset)).ok()?;
-    let mut cd = vec![0u8; cd_size as usize];
-    reader.read_exact(&mut cd).ok()?;
-
-    let mut records: Vec<(u64, u64)> = Vec::with_capacity(entries.min(65_535));
-    let mut pos = 0usize;
-    while records.len() < entries && pos + 46 <= cd.len() && cd[pos..pos + 4] == CDFH_SIG {
-        let compressed = le_u32(&cd, pos + 20) as u64;
-        let name_len = le_u16(&cd, pos + 28) as usize;
-        let extra_len = le_u16(&cd, pos + 30) as usize;
-        let comment_len = le_u16(&cd, pos + 32) as usize;
-        let local_offset = le_u32(&cd, pos + 42) as u64;
-        records.push((local_offset, compressed));
-        pos += 46 + name_len + extra_len + comment_len;
-    }
-
-    let total_compressed = records.iter().map(|r| r.1).fold(0u64, u64::saturating_add);
-    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(records.len());
-    for (offset, compressed) in &records {
-        if *compressed == 0 || reader.seek(SeekFrom::Start(*offset)).is_err() {
-            continue;
-        }
-        let mut header = [0u8; 30];
-        if reader.read_exact(&mut header).is_err() || header[..4] != LFH_SIG {
-            continue;
-        }
-        let start = offset + 30 + le_u16(&header, 26) as u64 + le_u16(&header, 28) as u64;
-        spans.push((start, start.saturating_add(*compressed)));
-    }
-    spans.sort_unstable();
-    let pair = spans.windows(2).find(|pair| pair[1].0 < pair[0].1)?;
-    Some(ZipThreat {
-        kind: ZipThreatKind::OverlappingEntries,
-        depth,
-        entries: records.len(),
-        total_compressed,
-        total_uncompressed: 0,
-        detail: format!(
-            "entry data at offset {} overlaps entry data spanning {}..{} (raw central directory scan)",
-            pair[1].0, pair[0].0, pair[0].1
-        ),
-    })
+    let method = u16_at(cd, pos + 10)?;
+    let comp32 = u32_at(cd, pos + 20)?;
+    let unc32 = u32_at(cd, pos + 24)?;
+    let name_len = u16_at(cd, pos + 28)? as usize;
+    let extra_len = u16_at(cd, pos + 30)? as usize;
+    let comment_len = u16_at(cd, pos + 32)? as usize;
+    let off32 = u32_at(cd, pos + 42)?;
+    let name_at = pos + 46;
+    let extra_at = name_at.checked_add(name_len)?;
+    let next = extra_at.checked_add(extra_len)?.checked_add(comment_len)?;
+    let name = cd.get(name_at..extra_at)?;
+    let extra = cd.get(extra_at..extra_at.checked_add(extra_len)?)?;
+    let (mut compressed, mut uncompressed, mut local) = (comp32 as u64, unc32 as u64, off32 as u64);
+    apply_zip64(
+        extra,
+        [
+            (unc32, &mut uncompressed),
+            (comp32, &mut compressed),
+            (off32, &mut local),
+        ],
+    );
+    let rec = Rec {
+        cd_index: index,
+        method,
+        compressed,
+        uncompressed,
+        extent: None,
+        nested: !name.ends_with(b"/") && is_nested_name(name),
+        mismatch: None,
+    };
+    Some((
+        Pending {
+            rec,
+            local,
+            raw_sizes: (comp32, unc32),
+        },
+        next,
+    ))
 }
 
-fn inspect_zip_reader<R: Read + Seek>(
-    reader: R,
+/// Reads the central directory assuming archive offsets are shifted by `base`; succeeds only
+/// when it yields every declared entry.
+fn read_cd<R: Read + Seek>(
+    reader: &mut R,
+    base: u64,
+    cd_offset: u64,
+    cd_size: u64,
+    entries: u64,
+) -> Option<Vec<Pending>> {
+    let cd = read_at(reader, base.checked_add(cd_offset)?, cd_size as usize)?;
+    let mut pending: Vec<Pending> = Vec::with_capacity((entries as usize).min(4096));
+    let mut pos = 0usize;
+    while (pending.len() as u64) < entries {
+        let (p, next) = parse_cdfh(&cd, pos, pending.len())?;
+        pending.push(p);
+        pos = next;
+    }
+    Some(pending)
+}
+
+/// Last EOCD in the tail: (tail bytes, index in tail, absolute offset).
+fn locate_eocd<R: Read + Seek>(reader: &mut R, len: u64) -> Option<(Vec<u8>, usize, u64)> {
+    let tail_len = len.min(MAX_EOCD_SEARCH);
+    let tail_start = len - tail_len;
+    let tail = read_at(reader, tail_start, tail_len as usize)?;
+    let eocd = (0..=tail.len().checked_sub(22)?).rev().find(|&i| {
+        tail.get(i..i + 4) == Some(&EOCD_SIG[..])
+            && u16_at(&tail, i + 20).is_some_and(|c| i + 22 + c as usize <= tail.len())
+    })?;
+    Some((tail, eocd, tail_start + eocd as u64))
+}
+
+/// Own central-directory walk (Zip64 aware, stub/junk aware). `Unparsable` lets the caller fall
+/// back; `eocd` says whether an end-of-central-directory record was seen at all.
+fn raw_parse<R: Read + Seek>(reader: &mut R, len: u64, deadline: Instant) -> Raw {
+    let Some((tail, eocd, eocd_abs)) = locate_eocd(reader, len) else {
+        return Raw::Unparsable { eocd: false };
+    };
+    raw_parse_inner(reader, &tail, eocd, eocd_abs, deadline)
+        .unwrap_or(Raw::Unparsable { eocd: true })
+}
+
+fn raw_parse_inner<R: Read + Seek>(
+    reader: &mut R,
+    tail: &[u8],
+    eocd: usize,
+    eocd_abs: u64,
+    deadline: Instant,
+) -> Option<Raw> {
+    // Split archive (spanned or the last segment of .z01/.zip): the directory is not all here,
+    // so this is not a malformed archive. Let the caller fall back without an EOCD verdict.
+    if u16_at(tail, eocd + 4)? != 0 || u16_at(tail, eocd + 6)? != 0 {
+        return Some(Raw::Unparsable { eocd: false });
+    }
+    let mut entries = u16_at(tail, eocd + 10)? as u64;
+    let mut cd_size = u32_at(tail, eocd + 12)? as u64;
+    let mut cd_offset = u32_at(tail, eocd + 16)? as u64;
+    let mut cd_end = eocd_abs;
+
+    let zip64_marker = entries == 0xFFFF || cd_size == 0xFFFF_FFFF || cd_offset == 0xFFFF_FFFF;
+    if zip64_marker {
+        if let Some(locator) = eocd_abs
+            .checked_sub(20)
+            .and_then(|at| read_at(reader, at, 20))
+        {
+            if u32_at(&locator, 0)? == 0x0706_4b50 {
+                let stated = u64_at(&locator, 8)?;
+                let guess = eocd_abs.checked_sub(20 + 56);
+                let record = [Some(stated), guess].into_iter().flatten().find_map(|at| {
+                    let rec = read_at(reader, at, 56)?;
+                    (u32_at(&rec, 0)? == 0x0606_4b50).then_some((at, rec))
+                });
+                let (at, rec) = record?;
+                entries = u64_at(&rec, 32)?;
+                cd_size = u64_at(&rec, 40)?;
+                cd_offset = u64_at(&rec, 48)?;
+                cd_end = at;
+            }
+        }
+    }
+    if entries > MAX_ENTRIES {
+        return Some(Raw::TooMany(entries));
+    }
+    if cd_size > MAX_CD_BYTES {
+        return None;
+    }
+    // Bytes in front of the archive (self-extractor stub) shift every stored offset; bytes
+    // between the directory and the EOCD (junk) break the arithmetic, so also try no shift and
+    // then every central-directory signature found just before the EOCD.
+    let mut found = cd_end
+        .checked_sub(cd_size)
+        .and_then(|v| v.checked_sub(cd_offset))
+        .and_then(|base| Some((base, read_cd(reader, base, cd_offset, cd_size, entries)?)))
+        .or_else(|| Some((0, read_cd(reader, 0, cd_offset, cd_size, entries)?)));
+    if found.is_none() {
+        let from = cd_end.saturating_sub(cd_size + SCAN_WINDOW).max(cd_offset);
+        let window = read_at(reader, from, (cd_end.checked_sub(from)?) as usize)?;
+        let starts = window
+            .windows(4)
+            .enumerate()
+            .filter(|(_, w)| *w == CDFH_SIG)
+            .map(|(i, _)| from + i as u64)
+            .take(8);
+        for start in starts {
+            let base = start - cd_offset;
+            if let Some(p) = read_cd(
+                reader,
+                base,
+                cd_offset,
+                cd_size.min(cd_end - start),
+                entries,
+            ) {
+                found = Some((base, p));
+                break;
+            }
+        }
+    }
+    let (base, mut pending) = found?;
+
+    // Visit local headers in file order so the reads stay sequential. Past the deadline the
+    // remaining entries keep no extent; the verdict from what was read still stands.
+    let mut order: Vec<usize> = (0..pending.len()).collect();
+    order.sort_unstable_by_key(|&i| pending[i].local);
+    for i in order {
+        if Instant::now() > deadline {
+            break;
+        }
+        let p = &mut pending[i];
+        let Some(start) = base.checked_add(p.local) else {
+            continue;
+        };
+        let mut h = [0u8; 30];
+        if !read_exact_at(reader, start, &mut h) || h[..4] != LFH_SIG {
+            continue;
+        }
+        let (Some(flags), Some(method), Some(lc), Some(lu), Some(n), Some(x)) = (
+            u16_at(&h, 6),
+            u16_at(&h, 8),
+            u32_at(&h, 18),
+            u32_at(&h, 22),
+            u16_at(&h, 26),
+            u16_at(&h, 28),
+        ) else {
+            continue;
+        };
+        let data = start.saturating_add(30 + n as u64 + x as u64);
+        p.rec.extent = Some((start, data.saturating_add(p.rec.compressed)));
+        if method != p.rec.method {
+            p.rec.mismatch = Some(format!(
+                "local header method {method} differs from central directory method {}",
+                p.rec.method
+            ));
+        } else if flags & 8 == 0
+            && (lc, lu) != (0, 0)
+            && lc != 0xFFFF_FFFF
+            && lu != 0xFFFF_FFFF
+            && p.raw_sizes.0 != 0xFFFF_FFFF
+            && p.raw_sizes.1 != 0xFFFF_FFFF
+            && (lc, lu) != p.raw_sizes
+        {
+            p.rec.mismatch = Some(format!(
+                "local header sizes {lc}/{lu} differ from central directory {}/{}",
+                p.raw_sizes.0, p.raw_sizes.1
+            ));
+        }
+    }
+    Some(Raw::Recs(pending.into_iter().map(|p| p.rec).collect()))
+}
+
+fn read_exact_at<R: Read + Seek>(reader: &mut R, at: u64, buf: &mut [u8]) -> bool {
+    reader.seek(SeekFrom::Start(at)).is_ok() && reader.read_exact(buf).is_ok()
+}
+
+/// Walks local headers from offset 0 the way a streaming extractor would, ignoring the central
+/// directory entirely. Stops at the first non-header, truncated entry or streamed (descriptor)
+/// entry whose size is unknown.
+/// The flag is true when `cap` entries were collected and more headers may follow.
+fn lfh_walk<R: Read + Seek>(
+    reader: &mut R,
+    len: u64,
+    deadline: Instant,
+    cap: u64,
+) -> (Vec<Rec>, bool) {
+    let mut recs = Vec::new();
+    let mut pos = 0u64;
+    while Instant::now() <= deadline {
+        let mut h = [0u8; 30];
+        if !read_exact_at(reader, pos, &mut h) || h[..4] != LFH_SIG {
+            break;
+        }
+        let (Some(flags), Some(method), Some(c32), Some(u32v), Some(n), Some(x)) = (
+            u16_at(&h, 6),
+            u16_at(&h, 8),
+            u32_at(&h, 18),
+            u32_at(&h, 22),
+            u16_at(&h, 26),
+            u16_at(&h, 28),
+        ) else {
+            break;
+        };
+        if flags & 8 != 0 && c32 == 0 {
+            break;
+        }
+        let (mut compressed, mut uncompressed) = (c32 as u64, u32v as u64);
+        let data = pos + 30 + n as u64 + x as u64;
+        if c32 == 0xFFFF_FFFF || u32v == 0xFFFF_FFFF {
+            let Some(extra) = read_at(reader, pos + 30 + n as u64, x as usize) else {
+                break;
+            };
+            apply_zip64(
+                &extra,
+                [
+                    (u32v, &mut uncompressed),
+                    (c32, &mut compressed),
+                    (0, &mut 0),
+                ],
+            );
+        }
+        let end = data.saturating_add(compressed);
+        if end > len {
+            break;
+        }
+        if recs.len() as u64 >= cap {
+            return (recs, true);
+        }
+        recs.push(Rec {
+            cd_index: recs.len(),
+            method,
+            compressed,
+            uncompressed,
+            extent: Some((pos, end)),
+            nested: false,
+            mismatch: None,
+        });
+        pos = end;
+    }
+    (recs, false)
+}
+
+/// Fallback record list straight from the zip crate for archives the raw walk cannot parse.
+fn crate_recs<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Vec<Rec> {
+    let mut recs = Vec::with_capacity(archive.len().min(4096));
+    for index in 0..archive.len() {
+        let Ok(entry) = archive.by_index_raw(index) else {
+            continue;
+        };
+        let start = entry.data_start();
+        recs.push(Rec {
+            cd_index: index,
+            method: if entry.compression() == CompressionMethod::Stored {
+                0
+            } else {
+                8
+            },
+            compressed: entry.compressed_size(),
+            uncompressed: entry.size(),
+            extent: Some((
+                entry.header_start(),
+                start.saturating_add(entry.compressed_size()),
+            )),
+            nested: !entry.is_dir() && is_nested_name(entry.name_raw()),
+            mismatch: None,
+        });
+    }
+    recs
+}
+
+/// Counts bytes an entry really yields, up to `cap`, without keeping them.
+fn read_up_to(mut reader: impl Read, cap: u64) -> u64 {
+    let mut buf = [0u8; 16 * 1024];
+    let mut total = 0u64;
+    while total < cap {
+        let want = (cap - total).min(buf.len() as u64) as usize;
+        match reader.read(&mut buf[..want]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => total += n as u64,
+        }
+    }
+    total
+}
+
+fn inspect_level<R: Read + Seek>(
+    mut reader: R,
     depth: u32,
     limits: &ZipLimits,
-    budget: &mut u64,
-) -> ZipResult<Option<ZipThreat>> {
-    let mut archive = ZipArchive::new(reader)?;
-    let entries = archive.len();
+    scan: &mut Scan,
+) -> Option<ZipThreat> {
+    let len = reader.seek(SeekFrom::End(0)).ok()?;
+    let raw = raw_parse(&mut reader, len, scan.deadline);
+    let mut archive = None;
+    let recs = match raw {
+        Raw::TooMany(entries) => {
+            return Some(ZipThreat {
+                kind: ZipThreatKind::EntryCount,
+                depth,
+                entries: usize::try_from(entries).unwrap_or(usize::MAX),
+                total_compressed: 0,
+                total_uncompressed: 0,
+                detail: format!("{entries} declared entries exceeds the limit of {MAX_ENTRIES}"),
+            });
+        }
+        Raw::Recs(recs) => recs,
+        Raw::Unparsable { eocd } => match ZipArchive::new(&mut reader).is_ok() {
+            true => {
+                // Reopened because the failure branch below needs `reader` back.
+                let mut a = ZipArchive::new(&mut reader).ok()?;
+                let recs = crate_recs(&mut a);
+                archive = Some(a);
+                recs
+            }
+            false => {
+                // Streaming extractors ignore the directory, so judge what the headers say.
+                let (recs, truncated) = lfh_walk(&mut reader, len, scan.deadline, LFH_MAX_ENTRIES);
+                if truncated {
+                    return Some(ZipThreat {
+                        kind: ZipThreatKind::EntryCount,
+                        depth,
+                        entries: recs.len(),
+                        total_compressed: 0,
+                        total_uncompressed: 0,
+                        detail: format!(
+                            "more than {LFH_MAX_ENTRIES} local headers without a usable directory"
+                        ),
+                    });
+                }
+                if recs.is_empty() {
+                    return eocd.then(|| ZipThreat {
+                        kind: ZipThreatKind::Malformed,
+                        depth,
+                        entries: 0,
+                        total_compressed: 0,
+                        total_uncompressed: 0,
+                        detail: "carries a central directory record but cannot be parsed"
+                            .to_string(),
+                    });
+                }
+                recs
+            }
+        },
+    };
+    let entries = recs.len();
     if depth > limits.max_depth {
-        return Ok(Some(ZipThreat {
+        return Some(ZipThreat {
             kind: ZipThreatKind::NestingDepth,
             depth,
             entries,
@@ -202,110 +640,216 @@ fn inspect_zip_reader<R: Read + Seek>(
                 "archive nested {depth} levels deep exceeds the limit of {}",
                 limits.max_depth
             ),
-        }));
+        });
     }
 
-    let mut total_compressed = 0u64;
-    let mut total_uncompressed = 0u64;
-    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(entries);
-    let mut nested: Vec<usize> = Vec::new();
-
-    for index in 0..entries {
-        let Ok(entry) = archive.by_index_raw(index) else {
-            continue;
-        };
-        let compressed = entry.compressed_size();
-        let uncompressed = entry.size();
-        total_compressed = total_compressed.saturating_add(compressed);
-        total_uncompressed = total_uncompressed.saturating_add(uncompressed);
-        if compressed > 0 {
-            let start = entry.data_start();
-            spans.push((start, start.saturating_add(compressed)));
-        }
-        if !entry.is_dir()
-            && entry.name().to_ascii_lowercase().ends_with(".zip")
-            && uncompressed <= limits.max_nested_mem_read
-        {
-            nested.push(index);
-        }
-    }
-    *budget = budget.saturating_add(total_uncompressed);
-
-    let threat = |kind: ZipThreatKind, detail: String| ZipThreat {
-        kind,
-        depth,
-        entries,
-        total_compressed,
-        total_uncompressed,
-        detail,
+    let total_compressed = recs
+        .iter()
+        .fold(0u64, |acc, r| acc.saturating_add(r.compressed));
+    let total_uncompressed = recs
+        .iter()
+        .fold(0u64, |acc, r| acc.saturating_add(r.uncompressed));
+    scan.cumulative = scan.cumulative.saturating_add(total_uncompressed);
+    let threat = |kind: ZipThreatKind, detail: String| {
+        Some(ZipThreat {
+            kind,
+            depth,
+            entries,
+            total_compressed,
+            total_uncompressed,
+            detail,
+        })
     };
 
-    if total_uncompressed > limits.max_uncompressed_bytes || *budget > limits.max_uncompressed_bytes
+    if total_uncompressed > limits.max_uncompressed_bytes
+        || scan.cumulative > limits.max_uncompressed_bytes
     {
-        return Ok(Some(threat(
+        return threat(
             ZipThreatKind::UncompressedSize,
             format!(
                 "declared uncompressed size {} B (cumulative {} B) exceeds {} B",
-                total_uncompressed, *budget, limits.max_uncompressed_bytes
+                total_uncompressed, scan.cumulative, limits.max_uncompressed_bytes
             ),
-        )));
+        );
     }
 
     let ratio = total_uncompressed as f64 / total_compressed.max(1) as f64;
     if ratio > limits.max_ratio && total_uncompressed >= limits.min_ratio_check_bytes {
-        return Ok(Some(threat(
+        return threat(
             ZipThreatKind::CompressionRatio,
             format!(
                 "compression ratio {ratio:.1}:1 exceeds {:.0}:1",
                 limits.max_ratio
             ),
-        )));
+        );
     }
-
-    spans.sort_unstable();
-    if let Some(pair) = spans.windows(2).find(|pair| pair[1].0 < pair[0].1) {
-        return Ok(Some(threat(
-            ZipThreatKind::OverlappingEntries,
+    // A bomb entry hidden among large incompressible ones dilutes the whole-archive ratio.
+    if let Some(r) = recs.iter().find(|r| {
+        r.uncompressed >= limits.min_ratio_check_bytes
+            && r.uncompressed as f64 / r.compressed.max(1) as f64 > limits.max_ratio
+    }) {
+        return threat(
+            ZipThreatKind::CompressionRatio,
             format!(
-                "entry data at offset {} overlaps entry data spanning {}..{}",
-                pair[1].0, pair[0].0, pair[0].1
+                "entry #{} ratio {:.1}:1 exceeds {:.0}:1",
+                r.cd_index,
+                r.uncompressed as f64 / r.compressed.max(1) as f64,
+                limits.max_ratio
             ),
-        )));
+        );
     }
 
-    for index in nested {
+    // Whole-entry extents (local header through data) catch shared and quoted headers too.
+    let mut extents: Vec<(u64, u64)> = recs.iter().filter_map(|r| r.extent).collect();
+    extents.sort_unstable();
+    let mut max_end = 0u64;
+    let mut max_span = (0u64, 0u64);
+    for &(start, end) in &extents {
+        if start < max_end {
+            return threat(
+                ZipThreatKind::OverlappingEntries,
+                format!(
+                    "entry at offset {start} overlaps entry spanning {}..{}",
+                    max_span.0, max_span.1
+                ),
+            );
+        }
+        if end > max_end {
+            max_end = end;
+            max_span = (start, end);
+        }
+    }
+
+    if let Some(r) = recs
+        .iter()
+        .find(|r| r.method == 0 && r.uncompressed > r.compressed)
+    {
+        return threat(
+            ZipThreatKind::NestedSizeMismatch,
+            format!(
+                "stored entry #{} declares {} B but only holds {} B",
+                r.cd_index, r.uncompressed, r.compressed
+            ),
+        );
+    }
+    if let Some(r) = recs.iter().find(|r| r.mismatch.is_some()) {
+        return threat(
+            ZipThreatKind::HeaderMismatch,
+            format!(
+                "entry #{}: {}",
+                r.cd_index,
+                r.mismatch.clone().unwrap_or_default()
+            ),
+        );
+    }
+
+    // Everything below decompresses, so it is bounded by byte and time budgets.
+    if !recs.iter().any(|r| r.nested || r.method == 8) {
+        return None;
+    }
+    let mut archive = match archive {
+        Some(a) => a,
+        None => ZipArchive::new(&mut reader).ok()?,
+    };
+
+    // Actual decompressed bytes versus the declared size, smallest declarations first.
+    let mut sample: Vec<&Rec> = recs
+        .iter()
+        .filter(|r| r.method == 8 && r.compressed > 0 && !r.nested)
+        .collect();
+    sample.sort_unstable_by_key(|r| r.uncompressed);
+    for r in sample {
+        if scan.sample_left == 0 || Instant::now() > scan.deadline {
+            break;
+        }
+        let Ok(entry) = archive.by_index(r.cd_index) else {
+            continue;
+        };
+        let declared = entry.size();
+        let cap = declared.saturating_add(1).min(scan.sample_left);
+        let got = read_up_to(entry, cap);
+        scan.sample_left -= got;
+        if got > declared {
+            return threat(
+                ZipThreatKind::NestedSizeMismatch,
+                format!(
+                    "entry #{} inflates beyond its declared size of {declared} B",
+                    r.cd_index
+                ),
+            );
+        }
+    }
+
+    // A declared size is only a claim: always read up to the cap and trust what comes out.
+    for r in recs.iter().filter(|r| r.nested) {
+        if scan.nested_left == 0 || Instant::now() > scan.deadline {
+            continue;
+        }
+        let cap = limits.max_nested_mem_read.min(scan.nested_left);
         let mut data = Vec::new();
-        {
-            let Ok(entry) = archive.by_index(index) else {
+        let declared = {
+            let Ok(entry) = archive.by_index(r.cd_index) else {
                 continue;
             };
+            let declared = entry.size();
             if entry
-                .take(limits.max_nested_mem_read + 1)
+                .take(cap.saturating_add(1))
                 .read_to_end(&mut data)
                 .is_err()
             {
                 continue;
             }
-        }
-        if data.len() as u64 > limits.max_nested_mem_read {
-            return Ok(Some(threat(
+            declared
+        };
+        let actual = data.len() as u64;
+        scan.nested_left = scan.nested_left.saturating_sub(actual);
+        if actual > declared {
+            return threat(
                 ZipThreatKind::NestedSizeMismatch,
                 format!(
-                    "nested archive #{index} inflates beyond its declared size and the {} B read limit",
-                    limits.max_nested_mem_read
+                    "nested archive #{} inflates beyond its declared size of {declared} B (read limit {} B)",
+                    r.cd_index, limits.max_nested_mem_read
                 ),
-            )));
+            );
         }
-        let inner =
-            match inspect_zip_reader(Cursor::new(data.as_slice()), depth + 1, limits, budget) {
-                Ok(result) => result,
-                Err(_) => raw_overlap_scan(Cursor::new(data.as_slice()), depth + 1),
-            };
-        if inner.is_some() {
-            return Ok(inner);
+        if actual > cap {
+            // Too large to unpack in memory; only a clearly bomb-like ratio is worth a verdict.
+            if actual as f64 / r.compressed.max(1) as f64 > limits.max_ratio {
+                return threat(
+                    ZipThreatKind::NestedSizeMismatch,
+                    format!(
+                        "nested archive #{} exceeds the {cap} B read limit with ratio above {:.0}:1 and cannot be verified",
+                        r.cd_index, limits.max_ratio
+                    ),
+                );
+            }
+            continue;
+        }
+        if actual < declared {
+            return threat(
+                ZipThreatKind::NestedSizeMismatch,
+                format!(
+                    "nested archive #{} declares {declared} B but yields only {actual} B",
+                    r.cd_index
+                ),
+            );
+        }
+        if let Some(inner) = inspect_level(Cursor::new(data.as_slice()), depth + 1, limits, scan) {
+            return Some(inner);
+        }
+        // Ratios multiply through nesting: everything unpacked versus the file on disk.
+        let effective = scan.cumulative as f64 / scan.root_len as f64;
+        if effective > limits.max_ratio && scan.cumulative >= limits.min_ratio_check_bytes {
+            return threat(
+                ZipThreatKind::CompressionRatio,
+                format!(
+                    "effective nested ratio {effective:.1}:1 exceeds {:.0}:1",
+                    limits.max_ratio
+                ),
+            );
         }
     }
-    Ok(None)
+    None
 }
 
 pub fn scan_and_respond(path: &Path, cfg: &AppConfig) -> Option<ZipThreat> {
@@ -482,6 +1026,52 @@ mod tests {
             .expect("4-level nesting must be flagged");
         assert_eq!(threat.kind, ZipThreatKind::NestingDepth);
         assert_eq!(threat.depth, 4);
+    }
+
+    #[test]
+    fn expired_deadline_keeps_the_structural_verdict() {
+        let bomb = build_zip(&[("zeros.bin", vec![0u8; 2 * 1024 * 1024])]);
+        let limits = ZipLimits {
+            min_ratio_check_bytes: 1024 * 1024,
+            ..ZipLimits::default()
+        };
+        let mut scan = Scan {
+            cumulative: 0,
+            root_len: bomb.len() as u64,
+            sample_left: SAMPLE_BUDGET,
+            nested_left: NESTED_BUDGET,
+            deadline: Instant::now() - Duration::from_secs(1),
+        };
+        let threat = inspect_level(Cursor::new(bomb.as_slice()), 1, &limits, &mut scan)
+            .expect("ratio verdict survives an expired deadline");
+        assert_eq!(threat.kind, ZipThreatKind::CompressionRatio);
+    }
+
+    #[test]
+    fn last_segment_of_a_split_archive_is_not_malformed() {
+        let whole = build_zip(&[("a.txt", b"alpha".to_vec()), ("b.txt", b"beta".to_vec())]);
+        let cd = whole.windows(4).position(|w| w == CDFH_SIG).unwrap();
+        // Only the directory and EOCD survive in the last segment; it names disk 1.
+        let mut tail = whole[cd..].to_vec();
+        let eocd = tail.windows(4).rposition(|w| w == EOCD_SIG).unwrap();
+        tail[eocd + 4] = 1;
+        tail[eocd + 6] = 1;
+        assert_eq!(inspect_zip_bytes(&tail, &ZipLimits::default()), None);
+    }
+
+    #[test]
+    fn local_header_walk_is_capped() {
+        let bytes = build_zip(&[
+            ("a", b"1".to_vec()),
+            ("b", b"2".to_vec()),
+            ("c", b"3".to_vec()),
+        ]);
+        let len = bytes.len() as u64;
+        let far = Instant::now() + Duration::from_secs(5);
+        let (recs, truncated) = lfh_walk(&mut Cursor::new(bytes.as_slice()), len, far, 2);
+        assert!(truncated && recs.len() == 2);
+        let (recs, truncated) = lfh_walk(&mut Cursor::new(bytes.as_slice()), len, far, 3);
+        assert!(!truncated && recs.len() == 3);
     }
 
     #[test]

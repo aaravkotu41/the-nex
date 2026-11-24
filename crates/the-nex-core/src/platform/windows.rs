@@ -125,6 +125,9 @@ pub fn path_key(path: &Path) -> String {
 }
 
 pub fn path_is_within(path: &Path, root: &Path) -> bool {
+    if super::has_parent_dir(path) {
+        return false;
+    }
     let path = path_key(path);
     let root = path_key(root);
     if path == root {
@@ -267,8 +270,20 @@ fn icacls(path: &Path, args: &[&str]) -> bool {
     run_tool(&system32_tool("icacls.exe"), full).is_ok()
 }
 
+/// icacls follows reparse points; SYSTEM must never re-ACL a link target chosen by a user.
+fn is_link_or_missing(path: &Path) -> bool {
+    fs::symlink_metadata(path).map_or(true, |m| m.file_type().is_symlink())
+}
+
 /// Read-only, owned by Administrators, readable only by SYSTEM/Administrators, execute denied to everyone.
 pub fn lock_quarantined_file(path: &Path) {
+    if is_link_or_missing(path) {
+        logger::warn(format!(
+            "refusing to lock link or missing file {}",
+            path.display()
+        ));
+        return;
+    }
     let _ = quarantine::set_readonly(path, true);
     icacls(path, &["/setowner", SID_ADMINISTRATORS]);
     let system = format!("{SID_SYSTEM}:(F)");
@@ -289,6 +304,13 @@ pub fn lock_quarantined_file(path: &Path) {
 }
 
 pub fn unlock_restored_file(path: &Path) {
+    if is_link_or_missing(path) {
+        logger::warn(format!(
+            "refusing to unlock link or missing file {}",
+            path.display()
+        ));
+        return;
+    }
     icacls(path, &["/reset"]);
     let _ = quarantine::set_readonly(path, false);
 }
@@ -396,18 +418,18 @@ fn quote_arg(arg: &str) -> String {
         match c {
             '\\' => backslashes += 1,
             '"' => {
-                quoted.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
                 quoted.push('"');
                 backslashes = 0;
             }
             _ => {
-                quoted.extend(std::iter::repeat('\\').take(backslashes));
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
                 quoted.push(c);
                 backslashes = 0;
             }
         }
     }
-    quoted.extend(std::iter::repeat('\\').take(backslashes * 2));
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
     quoted.push('"');
     quoted
 }
@@ -516,10 +538,25 @@ fn restart_action(delay_secs: u64) -> ServiceAction {
     }
 }
 
+// UNVERIFIED / RESIDUAL RISK (Windows, not testable in the current environment):
+// - Binaries are installed under ProgramData\TheNex. A local user who pre-created that folder
+//   before install can have planted DLLs there (DLL planting) that the SYSTEM service loads;
+//   the ownership/ACL reset below does not remove already-planted content.
+// - `icacls /T` may traverse junctions inside a pre-created tree, so the reset can touch targets
+//   outside it.
+// Planned fix: install binaries under Program Files (admin-only writable) and keep only data in
+// ProgramData; if the data folder exists and is not owned by Administrators/SYSTEM, rename it
+// aside (never reset in place) and recreate it. The installer (installer.nsi) is deliberately
+// unchanged until that can be tested on Windows.
 fn harden_data_dirs(cfg: &AppConfig) -> Vec<String> {
     let mut notes = Vec::new();
     if let Err(e) = cfg.ensure_dirs() {
         notes.push(e);
+    }
+    // A user may have pre-created the folder: take ownership and drop its ACL before granting.
+    for dir in [&cfg.base_dir, &cfg.quarantine_dir] {
+        icacls(dir, &["/setowner", SID_ADMINISTRATORS, "/T", "/C"]);
+        icacls(dir, &["/reset", "/T", "/C"]);
     }
     let system = format!("{SID_SYSTEM}:(OI)(CI)F");
     let admins = format!("{SID_ADMINISTRATORS}:(OI)(CI)F");

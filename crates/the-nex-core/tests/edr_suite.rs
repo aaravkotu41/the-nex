@@ -493,7 +493,11 @@ fn quarantine_meta_restore_and_delete_round_trip() {
         serde_json::from_slice(&fs::read(quarantine::meta_path(&cfg, &meta.id)).unwrap()).unwrap();
     assert_eq!(stored, meta);
     assert_eq!(stored.sha256, expected_sha);
-    assert_eq!(stored.original_path, victim);
+    // quarantine records the symlink-resolved parent (/var -> /private/var on macOS)
+    let resolved = fs::canonicalize(victim.parent().unwrap())
+        .unwrap()
+        .join(victim.file_name().unwrap());
+    assert_eq!(stored.original_path, resolved);
     assert_eq!(
         quarantine::list_quarantined(&cfg).unwrap(),
         vec![meta.clone()]
@@ -542,4 +546,45 @@ fn runtime_toggles_round_trip() {
     assert!(reloaded.is_dry_run());
     assert!(!reloaded.engine_enabled(Engine::Canary));
     assert!(reloaded.engine_enabled(Engine::BinAi));
+}
+
+/// Timing harness: `cargo test -p the-nex-core --release --test edr_suite -- --ignored --nocapture bench_`
+#[test]
+#[ignore]
+fn bench_ai_hot_path() {
+    use std::time::Instant;
+    let dir = TempDir::new("bench");
+    let exe = dir.path().join("bench-target");
+    fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+    let model = model_path().expect("model");
+    let scanner = BinaryAiScanner::load(&model);
+    let mut cfg = AppConfig::for_base_dir(dir.path());
+    cfg.dry_run = true;
+    let size = fs::metadata(&exe).unwrap().len();
+
+    let t = Instant::now();
+    let first = bin_ai::scan_and_respond(&exe, &cfg, &scanner);
+    println!(
+        "size={size} first (cold) scan_and_respond: {:?} -> {first:?}",
+        t.elapsed().as_nanos() as f64 / 1e6
+    );
+    let n = 200;
+    let t = Instant::now();
+    for _ in 0..n {
+        bin_ai::scan_and_respond(&exe, &cfg, &scanner);
+    }
+    println!(
+        "repeat unchanged x{n}: {:.3} ms each",
+        t.elapsed().as_secs_f64() * 1e3 / n as f64
+    );
+
+    let features = bin_ai::prototypes::packed_injector().features();
+    let t = Instant::now();
+    for _ in 0..20_000 {
+        std::hint::black_box(scanner.score_features(&features));
+    }
+    println!(
+        "inference: {:.1} us each",
+        t.elapsed().as_secs_f64() * 1e6 / 20_000.0
+    );
 }

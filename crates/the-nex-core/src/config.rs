@@ -541,9 +541,57 @@ fn absolutize(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// True when running as root (Unix), or on Windows with an elevated token (UAC "run as
+/// administrator") or as a machine account such as SYSTEM (account name ends in `$`).
+fn running_privileged() -> bool {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { geteuid() == 0 }
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("USERNAME").is_ok_and(|u| u.ends_with('$')) || windows_token_elevated()
+    }
+}
+
+/// Unverified on CI (Windows only): fails closed, so an unreadable token counts as elevated.
+#[cfg(windows)]
+fn windows_token_elevated() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    // SAFETY: plain Win32 calls on the current process token with correctly sized out buffers;
+    // the token handle is closed before returning.
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return true;
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut returned = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+        CloseHandle(token);
+        ok == 0 || elevation.TokenIsElevated != 0
+    }
+}
+
+/// Default data directory. THENEX_DATA_DIR is honoured only for unprivileged runs: a privileged
+/// daemon must not be redirected to attacker-chosen storage through its environment.
 pub fn data_dir() -> PathBuf {
     std::env::var_os(DATA_DIR_ENV)
-        .filter(|v| !v.is_empty())
+        .filter(|v| !v.is_empty() && !running_privileged())
         .map(PathBuf::from)
         .unwrap_or_else(default_base_dir)
 }
@@ -578,6 +626,14 @@ fn user_fallback_base_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn privileged_runs_ignore_the_data_dir_env() {
+        // Not mutating the environment (shared across tests): just check the rule's input.
+        if super::running_privileged() {
+            assert_eq!(super::data_dir(), super::default_base_dir());
+        }
+    }
+
     use super::*;
 
     fn args(list: &[&str]) -> Result<CliArgs, String> {

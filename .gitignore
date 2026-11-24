@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 # On-device vision runtime, fetched and verified by scripts/fetch_vision_models.py
 /ui/aegismesh/vendor/
+.DS_Store
+# Tauri build output (capability schemas), regenerated on every build
+crates/*/gen/

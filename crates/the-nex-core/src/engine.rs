@@ -12,7 +12,7 @@ use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Read;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -69,7 +69,8 @@ pub fn classify_file(path: &Path) -> FileKind {
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
     let mut magic = [0u8; 4];
-    let read = File::open(path)
+    // No-follow, non-blocking: a FIFO or symlink swapped in after the lstat must not hang the scan.
+    let read = quarantine::open_nofollow(path)
         .and_then(|mut f| f.read(&mut magic))
         .unwrap_or(0);
     if (read >= 2 && &magic[..2] == b"MZ") || (read == 4 && is_macho_magic(&magic)) {
@@ -171,9 +172,15 @@ fn inspect_file(
     }
 }
 
+/// True only for a regular file; symlinks are never followed into scanning or quarantine
+/// (a link could point at a file the daemon's privileges can touch but the writer cannot).
+pub fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
 /// Live path: waits for the writer to finish, then inspects.
 pub fn scan_path(cfg: &AppConfig, scanner: &BinaryAiScanner, path: &Path, telemetry: &Telemetry) {
-    if should_ignore(cfg, path) || !path.is_file() {
+    if should_ignore(cfg, path) || !is_regular_file(path) {
         return;
     }
     let kind = classify_file(path);
@@ -577,7 +584,44 @@ pub fn run(cfg: AppConfig, shutdown: Arc<AtomicBool>) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_not_regular_files() {
+        let dir = std::env::temp_dir().join(format!("thenex-sym-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let real = dir.join("real");
+        fs::write(&real, b"x").unwrap();
+        let link = dir.join("link");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(super::is_regular_file(&real));
+        assert!(!super::is_regular_file(&link));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_file_does_not_hang_on_a_fifo_or_follow_a_link() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("thenex-fifo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe.dat");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(classify_file(&fifo), FileKind::Other); // returns instead of blocking
+
+        let real = dir.join("real.dat");
+        fs::write(&real, b"MZ\x90\x00").unwrap();
+        let link = dir.join("link.dat");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(classify_file(&real), FileKind::Binary);
+        assert_eq!(classify_file(&link), FileKind::Other);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("thenex-engine-{tag}-{}", std::process::id()));

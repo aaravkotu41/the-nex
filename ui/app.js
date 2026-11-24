@@ -12,6 +12,7 @@ const PAGE_TITLES = {
   activity: "Activity",
   quarantine: "Quarantine",
   canaries: "Canaries",
+  devices: "Devices",
   settings: "Settings",
   aegismesh: "AegisMesh",
 };
@@ -20,6 +21,7 @@ const PAGE_SUBS = {
   activity: "Everything the engines saw and did, newest first.",
   quarantine: "Files that were stopped. Restore or delete them here.",
   canaries: "Decoy files that reveal ransomware the moment they change.",
+  devices: "Every computer signed in to your account. Run a scan on any of them.",
   settings: "Background service, watched folders and the look of the app.",
   aegismesh: "Silent SOS simulation: wearables, tap rhythms, emergency signs and the relay mesh.",
 };
@@ -96,6 +98,7 @@ function notice(message, isError) {
   const box = $("notice");
   box.textContent = message;
   box.classList.toggle("error", Boolean(isError));
+  box.setAttribute("role", isError ? "alert" : "status");
   box.hidden = false;
   clearTimeout(noticeTimer);
   noticeTimer = setTimeout(() => { box.hidden = true; }, isError ? 9000 : 5000);
@@ -497,8 +500,8 @@ function renderDashboard(d) {
   $("service-detail").textContent = online
     ? `PID ${d.daemon.pid} · v${d.daemon.version} · up ${formatUptime(d.daemon.uptime_seconds)} · ${(d.daemon.memory_mb || 0).toFixed(1)} MB`
     : "The engine is not running in the background.";
-  $("install-service").textContent = d.service_installed ? "Reinstall" : "Install";
-  $("uninstall-service").disabled = !d.service_installed;
+  if (!$("install-service").dataset.busy) $("install-service").textContent = d.service_installed ? "Reinstall" : "Install";
+  if (!$("uninstall-service").dataset.busy) $("uninstall-service").disabled = !d.service_installed;
 
   replaceIfChanged($("watched-dirs"), JSON.stringify(d.watched_dirs), () => (d.watched_dirs.length
     ? d.watched_dirs.map((dir) => el("li", {}, [el("code", { className: "path-badge", text: dir })]))
@@ -554,7 +557,9 @@ const CHART_REFRESH_MS = 30000;
 async function loadChart(force) {
   if (!force && state.chartAt && Date.now() - state.chartAt < CHART_REFRESH_MS) return;
   state.chartAt = Date.now();
+  const seq = refreshSeq;
   const events = await call("get_events", { limit: 1000, query: null, severity: "ALL" }).catch(() => []);
+  if (seq !== refreshSeq) return;
   const days = [];
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -606,12 +611,12 @@ async function loadChart(force) {
 }
 
 const TYPE_COLOURS = {
-  ZIP_BOMB: "linear-gradient(90deg, #FF5FA2, #FF5C7A)",
-  RANSOMWARE_CANARY: "linear-gradient(90deg, #FF5FA2, #FF5C7A)",
-  RANSOMWARE_SUSPECT: "linear-gradient(90deg, #FF5FA2, #FF5C7A)",
-  MALWARE_AI: "linear-gradient(90deg, #9B6BFF, #6E7BFF)",
-  MALWARE_AI_PROCESS: "linear-gradient(90deg, #9B6BFF, #6E7BFF)",
-  LOTL_SCRIPT: "linear-gradient(90deg, #FFD27A, #FFB547)",
+  ZIP_BOMB: "var(--red)",
+  RANSOMWARE_CANARY: "var(--red)",
+  RANSOMWARE_SUSPECT: "var(--red)",
+  MALWARE_AI: "var(--ink)",
+  MALWARE_AI_PROCESS: "var(--ink)",
+  LOTL_SCRIPT: "var(--amber)",
 };
 
 function renderChartFacts(days, byType) {
@@ -694,7 +699,7 @@ function quarantineButton(action, label, id) {
   });
   button.addEventListener("click", (event) => {
     event.stopPropagation();
-    quarantineAction(action, id);
+    quarantineAction(action, id, event);
   });
   return button;
 }
@@ -722,7 +727,7 @@ function quarantineRows(q) {
       el("span", { className: "cell-sub", text: relativeTime(q.quarantined_at) }),
     ]),
     el("td", { className: "right" }, [
-      el("div", { className: "button-group", attrs: { style: "justify-content:flex-end;align-items:center" } }, [
+      el("div", { className: "button-group end" }, [
         quarantineButton("restore", "Restore", q.id),
         quarantineButton("delete", "Delete", q.id),
         chevron(),
@@ -771,13 +776,14 @@ function renderQuarantine() {
   $("quarantine-count").textContent = `${state.quarantine.length} file${state.quarantine.length === 1 ? "" : "s"} · click a row for details`;
 }
 
-async function quarantineAction(action, id) {
+async function quarantineAction(action, id, event) {
   if (!confirming(action, id)) {
-    state.confirm = { action, id, until: Date.now() + CONFIRM_MS };
+    state.confirm = { action, id, at: Date.now(), until: Date.now() + CONFIRM_MS };
     renderQuarantine();
     setTimeout(renderQuarantine, CONFIRM_MS + 50);
     return;
   }
+  if (event.detail > 1 || Date.now() - state.confirm.at < 400) return; // a double-click must not confirm
   state.confirm = null;
   try {
     const message = await call(action === "restore" ? "restore_quarantine" : "delete_quarantine", { id });
@@ -789,12 +795,15 @@ async function quarantineAction(action, id) {
 }
 
 async function loadEvents() {
+  const seq = refreshSeq;
   const overview = await call("get_events", { limit: OVERVIEW_EVENTS, query: state.query || null, severity: "ALL" });
+  if (seq !== refreshSeq) return;
   const eventsSignature = (events) => events.map((e) => `${e.id}|${e.timestamp}`).join(",");
   replaceIfChanged($("overview-events"), eventsSignature(overview), () => overview.map((e) => eventRow(e)));
   $("overview-empty").hidden = overview.length > 0;
   if (state.page === "activity") {
     const fetched = await call("get_events", { limit: 1000, query: state.query || null, severity: "ALL" });
+    if (seq !== refreshSeq) return;
     const all = fetched.filter((e) => {
       if (state.activityType && e.threat_type !== state.activityType) return false;
       if (state.activityDay !== null) {
@@ -819,21 +828,27 @@ async function loadEvents() {
   }
 }
 
+let refreshSeq = 0; // each refresh bumps it; older responses see the change and don't render
 async function refresh(force) {
   if (state.refreshing && !force) return;
   state.refreshing = true;
+  const seq = ++refreshSeq;
   try {
-    state.dashboard = await call("get_dashboard_state");
+    const dashboard = await call("get_dashboard_state");
+    if (seq !== refreshSeq) return;
+    state.dashboard = dashboard;
     renderDashboard(state.dashboard);
     for (const id of ["quick-scan", "verify-canaries", "install-service"]) {
       if (!$(id).dataset.busy) $(id).disabled = false;
     }
     await loadEvents();
     if (state.page === "overview") await loadChart(force);
-    state.quarantine = await call("list_quarantine").catch((error) => {
+    const quarantine = await call("list_quarantine").catch((error) => {
       if (state.page === "quarantine") notice(errorText(error), true);
       return state.quarantine;
     });
+    if (seq !== refreshSeq) return;
+    state.quarantine = quarantine;
     renderQuarantine();
   } catch (error) {
     renderOffline(invoke ? `Unavailable — ${errorText(error)}` : "Open The Nex from its desktop app to manage protection.");
@@ -956,7 +971,11 @@ async function runQuickScan() {
 
 function showPage(page) {
   state.page = page;
-  for (const item of document.querySelectorAll(".nav-item")) item.classList.toggle("active", item.dataset.page === page);
+  for (const item of document.querySelectorAll(".nav-item")) {
+    const active = item.dataset.page === page;
+    item.classList.toggle("active", active);
+    if (active) item.setAttribute("aria-current", "page"); else item.removeAttribute("aria-current");
+  }
   for (const section of document.querySelectorAll(".page")) section.classList.toggle("active", section.id === `page-${page}`);
   $("page-title").textContent = PAGE_TITLES[page];
   $("page-sub").textContent = page === "overview" ? greeting() : PAGE_SUBS[page] || "";
@@ -969,16 +988,17 @@ function showPage(page) {
 
 async function toggleEngine(button) {
   const engine = button.dataset.engine;
+  if (state.pendingToggles.has(engine)) return;
   const enabled = button.getAttribute("aria-checked") !== "true";
   state.pendingToggles.add(engine);
-  for (const twin of document.querySelectorAll(`.switch[data-engine="${engine}"]`)) setSwitch(twin, enabled);
+  for (const twin of document.querySelectorAll(`.switch[data-engine="${engine}"]`)) { setSwitch(twin, enabled); twin.disabled = true; }
   try {
     const toggles = await call("toggle_engine", { engine, enabled });
     state.pendingToggles.delete(engine);
     renderToggles(toggles, true);
   } catch (error) {
     state.pendingToggles.delete(engine);
-    for (const twin of document.querySelectorAll(`.switch[data-engine="${engine}"]`)) setSwitch(twin, !enabled);
+    for (const twin of document.querySelectorAll(`.switch[data-engine="${engine}"]`)) { setSwitch(twin, !enabled); twin.disabled = false; }
     notice(errorText(error), true);
   }
   await refresh(true);
@@ -997,13 +1017,6 @@ function wire() {
   document.addEventListener("click", (event) => {
     const target = event.target.closest("[data-goto]");
     if (target && !event.target.closest(".switch")) go(target);
-  });
-  document.addEventListener("keydown", (event) => {
-    const target = event.target.closest && event.target.closest(".engine-card[data-goto]");
-    if (target && event.target === target && (event.key === "Enter" || event.key === " ")) {
-      event.preventDefault();
-      go(target);
-    }
   });
   document.addEventListener("click", (event) => {
     const button = event.target.closest(".switch[data-engine]");
@@ -1063,14 +1076,18 @@ function wire() {
 /* ---- Appearance: wallpaper layer + glass theme ------------------------------------------- */
 
 const APPEARANCE_KEY = "thenex.appearance";
-const DEFAULT_APPEARANCE = Object.freeze({ wallpaper_source: "preset:aurora", bg_dim: 0.2, card_blur: 18, card_alpha: 0.62 });
+const DEFAULT_APPEARANCE = Object.freeze({ wallpaper_source: "preset:matte", bg_dim: 0, card_blur: 12, card_alpha: 0.95 });
 // Before 0.3.1 the default was Matte Dark; a look still exactly on that old default was never
 // customised, so it moves to the new default.
-const OLD_DEFAULT = Object.freeze({ wallpaper_source: "preset:matte", bg_dim: 0.65, card_blur: 14, card_alpha: 0.72 });
+// The same goes for the 0.3.x Aurora default, replaced by the solid paper look.
+const OLD_DEFAULTS = [
+  { wallpaper_source: "preset:matte", bg_dim: 0.65, card_blur: 14, card_alpha: 0.72 },
+  { wallpaper_source: "preset:aurora", bg_dim: 0.2, card_blur: 18, card_alpha: 0.62 },
+];
 const MAX_WALLPAPER_BYTES = 25 * 1024 * 1024;
 const WALLPAPER_FILE_NAME = /\.(png|jpe?g|webp|gif)$/i;
 const WALLPAPER_MIME = /^image\/(png|jpeg|webp|gif)$/;
-const VALID_SOURCE = /^(preset:(aurora|matte|crimson|cyberhex)|url:https?:\/\/\S+|file:wallpaper-[A-Za-z0-9-]+\.(png|jpe?g|webp|gif))$/i;
+const VALID_SOURCE = /^(preset:(aurora|matte|crimson|cyberhex)|url:https:\/\/\S+|file:wallpaper-[A-Za-z0-9-]+\.(png|jpe?g|webp|gif))$/i;
 const SAVE_DELAY_MS = 350;
 const IMAGE_TIMEOUT_MS = 20000;
 
@@ -1155,7 +1172,7 @@ const PRESETS = [
     id: "matte",
     label: "Matte",
     css: "none",
-    swatch: () => (isLight() ? "linear-gradient(135deg, #FFFFFF 0%, #E6ECFA 100%)" : "linear-gradient(135deg, #141A2E 0%, #060914 100%)"),
+    swatch: () => (isLight() ? "linear-gradient(135deg, #FFFFFF 0%, #EFEFED 100%)" : "linear-gradient(135deg, #1A1C1A 0%, #0B0C0B 100%)"),
   },
   { id: "crimson", label: "Crimson Abyss", css: CRIMSON_CSS },
   { id: "cyberhex", label: "Cyber Hex", css: cyberHexCss() },
@@ -1169,19 +1186,19 @@ function clampNumber(value, low, high, fallback) {
 }
 
 function isOldDefault(a) {
-  return a && Object.keys(OLD_DEFAULT).every((key) => a[key] === OLD_DEFAULT[key]);
+  return Boolean(a) && OLD_DEFAULTS.some((old) => Object.keys(old).every((key) => a[key] === old[key]));
 }
 
 function normalizeAppearance(value) {
   const a = value && typeof value === "object" ? (isOldDefault(value) ? DEFAULT_APPEARANCE : value) : {};
-  const source = typeof a.wallpaper_source === "string" && VALID_SOURCE.test(a.wallpaper_source)
+  const source = typeof a.wallpaper_source === "string" && VALID_SOURCE.test(a.wallpaper_source) && !(invoke && /^url:/i.test(a.wallpaper_source)) // the CSP blocks remote images in the app
     ? a.wallpaper_source
     : DEFAULT_APPEARANCE.wallpaper_source;
   return {
     wallpaper_source: source,
     bg_dim: clampNumber(a.bg_dim, 0, 0.9, DEFAULT_APPEARANCE.bg_dim),
     card_blur: clampNumber(a.card_blur, 0, 24, DEFAULT_APPEARANCE.card_blur),
-    card_alpha: clampNumber(a.card_alpha, 0.3, 0.95, DEFAULT_APPEARANCE.card_alpha),
+    card_alpha: clampNumber(a.card_alpha, 0.85, 0.95, DEFAULT_APPEARANCE.card_alpha),
   };
 }
 
@@ -1350,16 +1367,12 @@ function applyWallpaperUrl() {
   return withAppearanceBusy("Fetching wallpaper…", async () => {
     let imageUrl = raw;
     if (invoke) imageUrl = await call("resolve_wallpaper_url", { url: raw });
-    else if (!/^https?:\/\/\S+$/i.test(raw)) throw new Error("enter a full http:// or https:// address");
+    else if (!/^https:\/\/\S+$/i.test(raw)) throw new Error("enter a full https:// address");
     let source = `url:${imageUrl}`;
     let note = "";
     if (invoke) {
-      try {
-        source = `file:${await call("download_wallpaper", { url: imageUrl })}`;
-        note = " · saved for offline use";
-      } catch {
-        note = " · loaded from the web";
-      }
+      source = `file:${await call("download_wallpaper", { url: imageUrl })}`; // a failed download is shown, never hot-linked
+      note = " · saved for offline use";
     }
     await loadImage(imageSource(source));
     commitAppearance({ ...look.current, wallpaper_source: source });
@@ -1449,9 +1462,9 @@ const lightQuery = window.matchMedia ? window.matchMedia("(prefers-color-scheme:
 function themePref() {
   try {
     const value = localStorage.getItem(THEME_KEY);
-    return value === "light" || value === "system" ? value : "dark";
+    return value === "dark" || value === "system" ? value : "light";
   } catch {
-    return "dark";
+    return "light";
   }
 }
 
@@ -1501,9 +1514,28 @@ async function initAppearance() {
   }
 }
 
-wire();
-$("page-sub").textContent = greeting();
-wireTheme();
-initAppearance().then(applyTheme);
-refresh(true);
-setInterval(() => refresh(false), REFRESH_MS);
+let refreshTimer = null;
+function startDashboard() {
+  wire();
+  if (window.NexSync) window.NexSync.start(call);
+  // Offline assistant (ui/bot.js): read-only, starts only after sign-in like everything else here.
+  if (window.NexBot) window.NexBot.start({ call, showPage, openActivity });
+  $("page-sub").textContent = greeting();
+  wireTheme();
+  initAppearance().then(applyTheme);
+  refresh(true);
+  refreshTimer = setInterval(() => refresh(false), REFRESH_MS);
+  const events = window.__TAURI__ && window.__TAURI__.event;
+  if (events) {
+    // Menu-bar shortcuts (macOS); only known pages are honoured.
+    events.listen("menubar://navigate", (e) => {
+      const page = e.payload;
+      if (page === "activity") openActivity();
+      else if (["quarantine", "settings"].includes(page)) showPage(page);
+    });
+    events.listen("menubar://refresh", () => refresh(true));
+  }
+}
+
+// Fail closed: the dashboard only starts once NexAuth confirms a valid session.
+if (window.NexAuth && window.NexAuth.gate) window.NexAuth.gate(startDashboard);

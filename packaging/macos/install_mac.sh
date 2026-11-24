@@ -28,6 +28,10 @@ case "${APP_DIR}" in
     ;;
 esac
 
+# The daemon runs as root: the app it runs from must not be writable by anyone else.
+chown -R root:wheel "${APP_DIR}"
+chmod -R go-w "${APP_DIR}"
+
 if xattr -p com.apple.quarantine "${BIN}" >/dev/null 2>&1; then
   echo "warning: ${APP_DIR} carries the Gatekeeper quarantine flag (downloaded, ad-hoc signed)." >&2
   echo "         launchd may refuse to start it. Approve it in System Settings > Privacy & Security," >&2

@@ -57,6 +57,12 @@ const PROTECTED_PROCESS_NAMES: &[&str] = &[
     "the-nex-gui.exe",
 ];
 
+/// True when a path contains `..`; containment checks reject such paths instead of resolving them.
+pub(crate) fn has_parent_dir(path: &std::path::Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
 pub fn is_protected_process(pid: u32, name: &str) -> bool {
     if matches!(pid, 0 | 1 | 4) || pid == std::process::id() {
         return true;
@@ -121,6 +127,12 @@ mod tests {
             assert!(is_protected_process(4242, name), "{name}");
         }
         assert!(!is_protected_process(99999, "malware_sim.exe"));
+    }
+
+    #[test]
+    fn parent_dir_detection() {
+        assert!(has_parent_dir(std::path::Path::new("a/../b")));
+        assert!(!has_parent_dir(std::path::Path::new("a/b..c/d")));
     }
 
     #[test]

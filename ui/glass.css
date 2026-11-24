@@ -1,0 +1,59 @@
+/* Liquid Glass (macOS desktop app only): rules apply under :root[data-glass="mac"].
+   The native window shows NSGlassEffectView (macOS 26+) or an under-window material; the page
+   paints translucent panes on top. Tokens come from styles.css. */
+:root[data-glass="mac"] {
+  --glass-rgb: 255, 255, 255;
+  --glass-a: 0.82;
+  --glass-edge: rgba(255, 255, 255, 0.7);
+  --glass-hi: rgba(255, 255, 255, 0.85);
+  --glass-blur: blur(24px) saturate(1.6);
+  --glass-shadow: 0 1px 2px rgba(14, 15, 14, 0.05), 0 10px 28px rgba(14, 15, 14, 0.07);
+  --glass: rgba(var(--glass-rgb), var(--glass-a));
+  --faint: var(--muted);
+  --muted: #55585B; /* >=4.5:1 on an 82% white pane even over a black desktop */
+  --chip: rgba(14, 15, 14, 0.06);
+  --hover: rgba(var(--glass-rgb), 0.8);
+}
+:root[data-glass="mac"][data-theme="dark"] {
+  --glass-rgb: 18, 20, 18;
+  --glass-a: 0.8;
+  --glass-edge: rgba(255, 255, 255, 0.14);
+  --glass-hi: rgba(255, 255, 255, 0.16);
+  --glass-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 10px 30px rgba(0, 0, 0, 0.3);
+  --faint: var(--muted);
+  --muted: #B6BAB5;
+  --chip: rgba(241, 242, 240, 0.09);
+}
+
+/* Let the native glass through; a user wallpaper (--wallpaper) still paints on #bg-wallpaper. */
+:root[data-glass="mac"], :root[data-glass="mac"] body, :root[data-glass="mac"] #bg-scrim,
+:root[data-glass="mac"] .login { background: transparent; }
+:root[data-glass="mac"] #bg-wallpaper { background: transparent var(--wallpaper) center / cover no-repeat; }
+:root[data-glass="mac"] #bg-scrim { background: rgba(var(--scrim-rgb), var(--bg-dim)); }
+
+:root[data-glass="mac"] :is(.panel, .stat, .aegis-tile, .scan-sheet, .notice, .search, .icon-btn, .top-status, .service-icon, .login-card, .account) {
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow), inset 0 0 0 1px var(--glass-edge), inset 0 1px 0 var(--glass-hi);
+}
+:root[data-glass="mac"] .notice { box-shadow: var(--glass-shadow), inset 0 0 0 1px var(--mint), inset 0 1px 0 var(--glass-hi); }
+:root[data-glass="mac"] .notice.error { box-shadow: var(--glass-shadow), inset 0 0 0 1px var(--red), inset 0 1px 0 var(--glass-hi); }
+:root[data-glass="mac"] .account { padding: 4px 4px 4px 14px; border-radius: 14px; }
+:root[data-glass="mac"] .icon-btn:hover { background: var(--hover); }
+:root[data-glass="mac"] .search kbd, :root[data-glass="mac"] .search-icon { background: var(--chip); }
+
+/* Nav: inactive pills stay clear, active stays solid ink. */
+:root[data-glass="mac"] .nav-item:hover { background: var(--glass); }
+:root[data-glass="mac"] .nav-item.active { background: var(--ink); color: var(--on-ink); }
+
+/* Mint hero + login hero keep their glass recipe, slightly more see-through. */
+:root[data-glass="mac"] :is(.hero, .login-hero) { opacity: 0.94; }
+
+@media (prefers-reduced-transparency: reduce) {
+  :root[data-glass="mac"] { --glass-a: 1; --glass-blur: none; }
+  :root[data-glass="mac"] { background: var(--bg); }
+  :root[data-glass="mac"] #bg-wallpaper { background: var(--bg) var(--wallpaper) center / cover no-repeat; }
+  :root[data-glass="mac"] .login { background: var(--bg); }
+  :root[data-glass="mac"] :is(.hero, .login-hero) { opacity: 1; }
+  :root[data-glass="mac"] :is(.panel, .stat, .aegis-tile, .scan-sheet, .notice, .search, .icon-btn, .top-status, .service-icon, .login-card, .account) { background: rgb(var(--surface-rgb)); }
+}

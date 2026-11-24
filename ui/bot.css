@@ -1,0 +1,86 @@
+/* Nex assistant (ui/bot.js). Tokens only: light default, dark via :root[data-theme="dark"],
+   glass via :root[data-glass="mac"] (see glass.css). Text on mint is always literal ink. */
+#nexbot { position: fixed; right: 20px; bottom: 20px; z-index: 900; font-family: var(--sans); }
+.app[hidden] ~ #nexbot { display: none; }
+#nexbot[hidden] { display: none; }
+
+.nb-launcher {
+  position: relative; display: grid; place-items: center; width: 56px; height: 56px; padding: 0; margin-left: auto;
+  border: 0; border-radius: 50%; cursor: pointer; background: var(--ink); color: var(--on-ink);
+  box-shadow: 0 2px 4px rgba(14, 15, 14, 0.12), 0 10px 26px rgba(14, 15, 14, 0.2), 0 0 0 4px var(--mint-soft);
+  transition: transform 160ms ease, box-shadow 160ms ease;
+}
+.nb-launcher:hover { transform: scale(1.06); }
+.nb-launcher .nb-avatar { width: 34px; height: 34px; }
+.nb-launcher:focus-visible, .nb-close:focus-visible, .nb-chip:focus-visible, .nb-send:focus-visible, .nb-action:focus-visible,
+.nb-input:focus-visible, .nb-msgs:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.nb-launcher:focus-visible { outline-offset: 5px; }
+
+/* Gyroscope bot avatar: ring + two crossing gimbals + hub; currentColor strokes, no poles. */
+.nb-avatar { display: block; overflow: visible; }
+.nb-ring, .nb-gimbal { fill: none; stroke: currentColor; stroke-width: 2; }
+.nb-gimbal { stroke-width: 1.8; }
+.nb-hub { fill: var(--nb-hub, var(--mint)); }
+.nb-spin { transform-box: view-box; transform-origin: 50% 50%; animation: nb-spin 9s linear infinite; }
+.nb-spin.b { animation-duration: 6.5s; animation-direction: reverse; }
+@keyframes nb-spin { to { transform: rotate(360deg); } }
+
+.nb-panel {
+  position: absolute; right: 0; bottom: 68px; display: flex; flex-direction: column; width: 360px; max-width: calc(100vw - 32px);
+  height: 480px; max-height: calc(100vh - 112px); overflow: hidden; border-radius: var(--radius);
+  background: rgb(var(--surface-rgb)); color: var(--text); border: 1px solid var(--line-strong);
+  box-shadow: var(--shadow), 0 18px 48px rgba(14, 15, 14, 0.18);
+  animation: nb-pop 160ms ease-out;
+}
+.nb-panel[hidden] { display: none; }
+@keyframes nb-pop { from { opacity: 0; transform: translateY(8px) scale(0.98); } }
+
+.nb-head { display: flex; align-items: center; gap: 12px; padding: 14px 14px 12px 16px; border-bottom: 1px solid var(--line); }
+.nb-tile { display: grid; place-items: center; width: 38px; height: 38px; flex: none; border-radius: 50%; background: var(--mint-soft); color: var(--ink); --nb-hub: var(--ink); }
+.nb-tile .nb-avatar { width: 26px; height: 26px; }
+.nb-title { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.nb-title b { font-size: 16px; line-height: 1.2; }
+.nb-title span { font-size: 12.5px; color: var(--muted); }
+.nb-close { width: 32px; height: 32px; border: 0; border-radius: 50%; background: var(--chip); color: var(--text); font: inherit; font-size: 20px; line-height: 1; cursor: pointer; }
+.nb-close:hover { background: var(--hover); }
+
+.nb-msgs { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 14px 16px; border-radius: 8px; }
+.nb-msg { max-width: 92%; padding: 9px 12px; border-radius: 16px; font-size: 13.5px; line-height: 1.45; overflow-wrap: anywhere; }
+.nb-msg.bot { align-self: flex-start; background: var(--chip); border-bottom-left-radius: 6px; }
+.nb-msg.bot.note { color: var(--muted); font-style: italic; }
+.nb-msg.user { align-self: flex-end; background: var(--ink); color: var(--on-ink); border-bottom-right-radius: 6px; }
+.nb-msg p { margin: 0 0 6px; }
+.nb-msg p:last-child, .nb-msg ul:last-child { margin-bottom: 0; }
+.nb-msg ul { margin: 0 0 6px; padding-left: 18px; }
+.nb-msg li { margin: 1px 0; }
+.nb-msg code { font-family: var(--mono); font-size: 12px; padding: 1px 5px; border-radius: 6px; background: var(--mint-soft); color: var(--text); }
+.nb-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.nb-action { border: 0; border-radius: 999px; padding: 6px 12px; font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; background: var(--mint); color: #0E0F0E; }
+.nb-action:hover { box-shadow: 0 0 0 3px var(--mint-soft); }
+
+.nb-chips { display: flex; gap: 6px; padding: 8px 16px; overflow-x: auto; border-top: 1px solid var(--line); scrollbar-width: thin; }
+.nb-chip { flex: none; border: 1px solid var(--line-strong); border-radius: 999px; padding: 5px 11px; font: inherit; font-size: 12.5px; cursor: pointer; background: transparent; color: var(--text); white-space: nowrap; }
+.nb-chip:hover { background: var(--mint-soft); }
+
+.nb-form { display: flex; gap: 8px; padding: 10px 14px 14px; }
+.nb-input { flex: 1; min-width: 0; height: 40px; padding: 0 14px; border: 1px solid var(--line-strong); border-radius: 14px; font: inherit; font-size: 14px; background: var(--hover); color: var(--text); }
+.nb-input::placeholder { color: var(--muted); }
+.nb-send { height: 40px; padding: 0 16px; border: 0; border-radius: 14px; font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; background: var(--ink); color: var(--on-ink); }
+.nb-send:hover { box-shadow: 0 0 0 4px var(--mint-soft); }
+
+:root[data-glass="mac"] .nb-panel {
+  background: var(--glass); -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow), inset 0 0 0 1px var(--glass-edge), inset 0 1px 0 var(--glass-hi);
+  border-color: transparent;
+}
+:root[data-glass="mac"] .nb-input { background: var(--chip); }
+@media (prefers-reduced-transparency: reduce) {
+  :root[data-glass="mac"] .nb-panel { background: rgb(var(--surface-rgb)); }
+}
+
+@media (max-height: 640px) { .nb-panel { height: calc(100vh - 112px); } }
+@media (prefers-reduced-motion: reduce) {
+  .nb-spin, .nb-panel { animation: none; }
+  .nb-launcher { transition: none; }
+  .nb-launcher:hover { transform: none; }
+}

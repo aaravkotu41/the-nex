@@ -97,9 +97,7 @@ fn overlapping_zip() -> Vec<u8> {
     let size = data.len() as u32;
     let name = b"kernel.bin";
     let mut out = Vec::new();
-    for value in [0x0403_4b50u32] {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
+    out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
     for value in [20u16, 0, 0, 0, 0x21] {
         out.extend_from_slice(&value.to_le_bytes());
     }

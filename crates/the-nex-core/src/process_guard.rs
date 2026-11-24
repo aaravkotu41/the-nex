@@ -1,3 +1,4 @@
+use crate::ai_policy::{self, Action, Request, Target};
 use crate::bin_ai::{self, BinaryAiScanner};
 use crate::config::{AppConfig, Engine};
 use crate::logger;
@@ -24,32 +25,6 @@ const CMDLINE_LOG_LIMIT: usize = 512;
 /// (LotL) checks of new processes are never held up by binary analysis.
 const AI_SCAN_BUDGET: Duration = Duration::from_millis(250);
 const MAX_PENDING_AI: usize = 4096;
-/// Stopping a running program cannot be undone, so the binary AI needs at least this score to
-/// do it; between the configured threshold and this it only raises an alert.
-pub const PROCESS_KILL_CONFIDENCE: f32 = 0.9;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AiProcessAction {
-    Ignore,
-    AlertOnly(&'static str),
-    TerminateAndQuarantine,
-}
-
-/// What to do about a running program the binary AI scored. Programs that were already running
-/// when protection started are only reported: a statistical verdict must not kill the apps
-/// someone has open the moment The Nex is installed.
-pub fn ai_process_action(score: f32, threshold: f32, preexisting: bool) -> AiProcessAction {
-    if score < threshold {
-        AiProcessAction::Ignore
-    } else if preexisting {
-        AiProcessAction::AlertOnly("already running when protection started")
-    } else if score < threshold.max(PROCESS_KILL_CONFIDENCE) {
-        AiProcessAction::AlertOnly("below the confidence needed to stop a running program")
-    } else {
-        AiProcessAction::TerminateAndQuarantine
-    }
-}
-
 pub const LOTL_PROCESSES: &[&str] = &[
     "powershell.exe",
     "pwsh.exe",
@@ -186,6 +161,26 @@ fn command_line(process: &Process) -> String {
         .join(" ")
 }
 
+/// Protection by name alone is spoofable (malware can call itself "dock" or "explorer.exe"), so
+/// a name on the allowlist only protects a process whose image is at an OS-critical path or
+/// validly signed. With no readable image path only pid 0/1/4 and ourselves are protected (a
+/// self-deleting binary must not hide behind a protected name).
+/// `signed` is only evaluated for a listed name outside the critical roots.
+fn is_protected(
+    pid: u32,
+    name: &str,
+    exe: Option<&Path>,
+    signed: impl FnOnce(&Path) -> bool,
+) -> bool {
+    if matches!(pid, 0 | 1 | 4) || pid == std::process::id() {
+        return true;
+    }
+    if !platform::is_protected_process(pid, name) {
+        return false;
+    }
+    exe.is_some_and(|exe| ai_policy::is_os_critical_path(exe) || signed(exe))
+}
+
 pub struct ProcessGuard {
     cfg: Arc<AppConfig>,
     scanner: Arc<BinaryAiScanner>,
@@ -193,7 +188,9 @@ pub struct ProcessGuard {
     sys: System,
     /// pid -> start time, so a recycled PID is treated as a new process.
     seen: HashMap<Pid, u64>,
-    trust_cache: HashMap<PathBuf, (u64, bool)>,
+    trust_cache: HashMap<PathBuf, (bin_ai::FileStamp, bool)>,
+    /// (pid, start time) of everything running when protection started; never killed by the AI.
+    baseline: HashSet<(Pid, u64)>,
     /// (pid, was already running when protection started) waiting for a binary AI scan.
     pending_ai: VecDeque<(Pid, bool)>,
     /// The Nex itself and the chain that launched it (shell, terminal, service manager).
@@ -214,6 +211,7 @@ impl ProcessGuard {
             sys: System::new(),
             seen: HashMap::new(),
             trust_cache: HashMap::new(),
+            baseline: HashSet::new(),
             pending_ai: VecDeque::new(),
             ancestors: HashSet::new(),
             primed: false,
@@ -238,6 +236,7 @@ impl ProcessGuard {
             self.seen.clear();
             self.pending_ai.clear();
             self.primed = false;
+            self.baseline.clear();
             self.telemetry.processes_watched.store(0, Ordering::Relaxed);
             return;
         }
@@ -262,6 +261,12 @@ impl ProcessGuard {
             .fetch_add(fresh.len() as u64, Ordering::Relaxed);
         if first_poll {
             self.ancestors = self.ancestor_pids();
+            self.baseline = self
+                .sys
+                .processes()
+                .iter()
+                .map(|(pid, p)| (*pid, p.start_time()))
+                .collect();
             self.primed = true;
         }
         // Cheap command-line checks first, for every new process, so a malicious script host
@@ -293,9 +298,13 @@ impl ProcessGuard {
             return true;
         };
         let name = process_name(process);
-        if platform::is_protected_process(pid.as_u32(), &name) {
+        let exe = process.exe().map(Path::to_path_buf);
+        if is_protected(pid.as_u32(), &name, exe.as_deref(), |e| self.is_trusted(e)) {
             return true;
         }
+        let Some(process) = self.sys.process(pid) else {
+            return true;
+        };
         let cmdline = command_line(process);
         if let Some(pattern) = check_lotl_command(&name, &cmdline) {
             self.respond_lotl(pid, &name, &cmdline, pattern);
@@ -343,11 +352,11 @@ impl ProcessGuard {
     }
 
     fn is_trusted(&mut self, exe: &Path) -> bool {
-        let mtime = fs::metadata(exe)
-            .map(|m| bin_ai::modified_secs(&m))
-            .unwrap_or(0);
-        if let Some(&(cached_mtime, trusted)) = self.trust_cache.get(exe) {
-            if cached_mtime == mtime {
+        let Some(stamp) = fs::metadata(exe).ok().and_then(|m| bin_ai::file_stamp(&m)) else {
+            return platform::is_trusted_binary(exe); // no tamper-resistant stamp: never cache
+        };
+        if let Some(&(cached, trusted)) = self.trust_cache.get(exe) {
+            if cached == stamp {
                 return trusted;
             }
         }
@@ -355,34 +364,44 @@ impl ProcessGuard {
         if self.trust_cache.len() >= MAX_TRUST_CACHE {
             self.trust_cache.clear();
         }
-        self.trust_cache.insert(exe.to_path_buf(), (mtime, trusted));
+        self.trust_cache.insert(exe.to_path_buf(), (stamp, trusted));
         trusted
     }
 
     fn scan_executable(&mut self, pid: Pid, name: &str, exe: &Path, preexisting: bool) {
-        if !exe.is_file() || self.is_trusted(exe) {
+        if !crate::engine::is_regular_file(exe) || self.is_trusted(exe) {
             return;
         }
         let Some(score) = self.scanner.scan_file(exe) else {
             return;
         };
-        let decision = ai_process_action(score, self.cfg.ai_threshold, preexisting);
-        if decision == AiProcessAction::Ignore {
+        let threshold = ai_policy::effective_threshold(self.cfg.ai_threshold);
+        if score.is_nan() || score < threshold {
             return;
         }
         let details = format!(
             "pid={} name={name} {}",
             pid.as_u32(),
-            self.scanner.explain(exe, score, self.cfg.ai_threshold)
+            self.scanner.explain(exe, score, threshold)
         );
+        let decision = ai_policy::decide(&Request {
+            path: exe,
+            score,
+            threshold: self.cfg.ai_threshold,
+            trusted: false,
+            dry_run: self.cfg.is_dry_run(),
+            target: Target::Process { preexisting },
+            explanation: &details,
+            data_dir: &self.cfg.base_dir,
+        });
         let (severity, action) = match decision {
-            AiProcessAction::Ignore => return,
-            AiProcessAction::AlertOnly(why) => (Severity::High, format!("ALERT_ONLY: {why}")),
-            AiProcessAction::TerminateAndQuarantine if self.cfg.is_dry_run() => (
+            Action::Ignore => return,
+            Action::Alert(why) => (Severity::High, format!("ALERT_ONLY: {why}")),
+            Action::WouldTerminateAndQuarantine | Action::WouldQuarantine => (
                 Severity::Critical,
                 "DRY_RUN: would terminate process and quarantine executable".to_string(),
             ),
-            AiProcessAction::TerminateAndQuarantine => {
+            Action::Quarantine | Action::TerminateAndQuarantine => {
                 let killed = self.kill_all_with_exe(exe);
                 self.wait_for_exit(&killed);
                 let quarantined = match quarantine::quarantine_file(
@@ -412,19 +431,36 @@ impl ProcessGuard {
         );
     }
 
-    fn kill_all_with_exe(&self, exe: &Path) -> Vec<Pid> {
+    fn kill_all_with_exe(&mut self, exe: &Path) -> Vec<Pid> {
         let target = platform::path_key(exe);
+        let candidates: Vec<(Pid, u64)> = self
+            .sys
+            .processes()
+            .iter()
+            .filter(|(pid, process)| {
+                process
+                    .exe()
+                    .is_some_and(|candidate| platform::path_key(candidate) == target)
+                    && !self.ancestors.contains(pid)
+                    && !self.baseline.contains(&(**pid, process.start_time()))
+                    && !is_protected(pid.as_u32(), &process_name(process), process.exe(), |_| {
+                        false
+                    })
+            })
+            .map(|(pid, process)| (*pid, process.start_time()))
+            .collect();
         let mut killed = Vec::new();
-        for (pid, process) in self.sys.processes() {
-            let same_image = process
-                .exe()
-                .is_some_and(|candidate| platform::path_key(candidate) == target);
-            if same_image
-                && !self.ancestors.contains(pid)
-                && !platform::is_protected_process(pid.as_u32(), &process_name(process))
-                && process.kill()
+        for (pid, started) in candidates {
+            // The list may be stale: re-read this pid and kill only the same process instance
+            // (a recycled PID has a different start time).
+            self.sys
+                .refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+            if self
+                .sys
+                .process(pid)
+                .is_some_and(|p| p.start_time() == started && p.kill())
             {
-                killed.push(*pid);
+                killed.push(pid);
             }
         }
         killed
@@ -466,28 +502,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ai_stops_only_new_programs_with_high_confidence() {
-        assert_eq!(ai_process_action(0.5, 0.65, false), AiProcessAction::Ignore);
-        assert!(matches!(
-            ai_process_action(0.99, 0.65, true),
-            AiProcessAction::AlertOnly(_)
+    fn protected_names_do_not_protect_look_alikes() {
+        let me = std::process::id();
+        // Named like a system process but running from a user folder and unsigned.
+        assert!(!is_protected(
+            me + 1,
+            "explorer.exe",
+            Some(Path::new("C:\\Users\\x\\explorer.exe")),
+            |_| false
         ));
-        assert!(matches!(
-            ai_process_action(0.8, 0.65, false),
-            AiProcessAction::AlertOnly(_)
+        assert!(!is_protected(
+            me + 1,
+            "dock",
+            Some(Path::new("/tmp/dock")),
+            |_| false
         ));
-        assert_eq!(
-            ai_process_action(0.95, 0.65, false),
-            AiProcessAction::TerminateAndQuarantine
-        );
-        assert_eq!(
-            ai_process_action(0.92, 0.95, false),
-            AiProcessAction::Ignore
-        );
-        assert_eq!(
-            ai_process_action(0.97, 0.95, false),
-            AiProcessAction::TerminateAndQuarantine
-        );
+        // The real thing, or a validly signed one, stays protected.
+        assert!(is_protected(
+            me + 1,
+            "dock",
+            Some(Path::new(
+                "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"
+            )),
+            |_| false
+        ));
+        assert!(is_protected(
+            me + 1,
+            "dock",
+            Some(Path::new("/tmp/dock")),
+            |_| true
+        ));
+        // Kernel tasks with no image path, and our own pid, keep protection.
+        assert!(!is_protected(me + 1, "kernel_task", None, |_| false)); // no path: no name protection
+        assert!(is_protected(1, "kernel_task", None, |_| false));
+        assert!(is_protected(me, "anything", None, |_| false));
+        assert!(!is_protected(me + 1, "random", None, |_| true));
     }
 
     #[test]
@@ -646,5 +695,40 @@ mod tests {
         ] {
             assert_eq!(check_lotl_command(name, cmdline), None, "{name}: {cmdline}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_all_with_exe_spares_preexisting_instances() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("thenex-pg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("napper");
+        fs::copy("/bin/sleep", &exe).unwrap();
+        let mut old = Command::new(&exe).arg("30").spawn().unwrap();
+        let mut new = Command::new(&exe).arg("30").spawn().unwrap();
+        let cfg = Arc::new(AppConfig::for_base_dir(&dir.join("base")));
+        let mut g = ProcessGuard::new(
+            cfg,
+            Arc::new(BinaryAiScanner::heuristic_only()),
+            Arc::new(Telemetry::default()),
+        );
+        g.sys
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
+        let old_pid = Pid::from_u32(old.id());
+        let started = g.sys.process(old_pid).unwrap().start_time();
+        g.baseline.insert((old_pid, started));
+        let canon = fs::canonicalize(&exe).unwrap();
+        let killed = g.kill_all_with_exe(&canon);
+        assert_eq!(killed, vec![Pid::from_u32(new.id())]);
+        assert!(new.wait().is_ok());
+        assert!(
+            old.try_wait().unwrap().is_none(),
+            "preexisting must survive"
+        );
+        let _ = old.kill();
+        let _ = old.wait();
+        let _ = fs::remove_dir_all(&dir);
     }
 }

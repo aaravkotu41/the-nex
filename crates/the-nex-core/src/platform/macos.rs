@@ -1,6 +1,7 @@
 use crate::canary;
 use crate::config::{self, AppConfig};
 use crate::logger;
+use crate::quarantine;
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
@@ -45,13 +46,14 @@ const TRUSTED_ROOTS: &[&str] = &[
 const NOTIFY_SCRIPT: &str =
     "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run\n";
 
-/// Runs argv (program first) as root after the standard macOS administrator prompt.
+/// Runs argv[2..] (program first) as root after the standard macOS administrator prompt, which
+/// shows argv[1] as its message. Everything arrives via argv: nothing is interpolated into the script.
 const ELEVATE_SCRIPT: &str = "on run argv\n\
 set cmd to \"\"\n\
-repeat with a in argv\n\
-set cmd to cmd & quoted form of (a as text) & \" \"\n\
+repeat with i from 2 to count of argv\n\
+set cmd to cmd & quoted form of (item i of argv as text) & \" \"\n\
 end repeat\n\
-do shell script cmd with administrator privileges\n\
+do shell script cmd with prompt (item 1 of argv as text) with administrator privileges\n\
 end run\n";
 
 extern "C" {
@@ -89,6 +91,9 @@ pub fn path_key(path: &Path) -> String {
 }
 
 pub fn path_is_within(path: &Path, root: &Path) -> bool {
+    if super::has_parent_dir(path) {
+        return false;
+    }
     let path = path_key(path);
     let root = path_key(root);
     if path == root {
@@ -149,7 +154,13 @@ pub fn discover_watched_dirs() -> Vec<PathBuf> {
 }
 
 pub fn discover_canary_dirs() -> Vec<PathBuf> {
-    dedup_paths(home_folders(&["Desktop", "Documents"]))
+    // A Desktop/Documents that is itself a symlink is never a canary site (root would write through it).
+    dedup_paths(
+        home_folders(&["Desktop", "Documents"])
+            .into_iter()
+            .filter(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
+            .collect(),
+    )
 }
 
 /// Downloads and Desktop of every real user (/tmp is left to the live watcher).
@@ -160,18 +171,19 @@ pub fn discover_quick_scan_dirs() -> Vec<PathBuf> {
 pub fn set_hidden_file(path: &Path) {
     let _ = run_tool(
         Path::new("/usr/bin/chflags"),
-        [OsStr::new("hidden"), path.as_os_str()],
+        [OsStr::new("-h"), OsStr::new("hidden"), path.as_os_str()],
     );
 }
 
 pub fn lock_quarantined_file(path: &Path) {
-    if let Err(e) = fs::set_permissions(path, Permissions::from_mode(0o000)) {
+    // fchmod on an O_NOFOLLOW handle: a planted symlink is refused, never chmod'd through.
+    if let Err(e) = quarantine::chmod_nofollow(path, |_| 0o000) {
         logger::warn(format!("could not lock {}: {e}", path.display()));
     }
 }
 
 pub fn unlock_restored_file(path: &Path) {
-    if let Err(e) = fs::set_permissions(path, Permissions::from_mode(0o644)) {
+    if let Err(e) = quarantine::chmod_nofollow(path, |_| 0o644) {
         logger::warn(format!("could not unlock {}: {e}", path.display()));
     }
 }
@@ -226,8 +238,21 @@ fn has_apple_anchored_signature(path: &Path) -> bool {
 
 /// SIP-protected system paths, or a valid signature chaining to Apple (Apple / Developer ID).
 pub fn is_trusted_binary(path: &Path) -> bool {
+    in_trusted_root(path) || has_apple_anchored_signature(path)
+}
+
+/// Lexical SIP-root check. The Data volume's firmlink prefix is stripped first, otherwise
+/// /System/Volumes/Data/Users/... (user-writable) would match "/System/".
+fn in_trusted_root(path: &Path) -> bool {
+    if crate::platform::has_parent_dir(path) {
+        return false;
+    }
     let text = path.to_string_lossy();
-    TRUSTED_ROOTS.iter().any(|root| text.starts_with(root)) || has_apple_anchored_signature(path)
+    let text = match text.strip_prefix("/System/Volumes/Data") {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => rest,
+        _ => &text,
+    };
+    TRUSTED_ROOTS.iter().any(|root| text.starts_with(root))
 }
 
 fn run_tool<I, S>(program: &Path, args: I) -> Result<(), String>
@@ -376,6 +401,27 @@ fn process_snapshot() -> System {
     sys
 }
 
+/// The daemon runs as root, so the executable and every ancestor up to / must not be replaceable
+/// by a non-admin user: root-owned and not world-writable; group-writable only for wheel/admin
+/// (/Applications is root:admin 775).
+fn require_root_owned_chain(exe: &Path) -> Result<(), String> {
+    // Resolve links first: a root-owned symlink into a user-writable tree must not pass.
+    let exe = fs::canonicalize(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+    for dir in exe.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+        let meta = fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let mode = meta.mode();
+        let group_ok = mode & 0o020 == 0 || matches!(meta.gid(), 0 | 80);
+        if meta.uid() != 0 || mode & 0o002 != 0 || !group_ok {
+            return Err(format!(
+                "{} is not root-owned or is writable by other users, so the root daemon cannot run from it. \
+                 Move The Nex to /Applications and run the installer, or install with the .pkg",
+                dir.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn install_service() -> Result<String, String> {
     require_root()?;
     let exe = env::current_exe()
@@ -387,6 +433,8 @@ pub fn install_service() -> Result<String, String> {
                 .to_string(),
         );
     }
+
+    require_root_owned_chain(&exe)?;
 
     let cfg = AppConfig::for_base_dir(&config::default_base_dir());
     let mut notes = harden_data_dirs(&cfg);
@@ -516,6 +564,16 @@ pub fn run_tray(_cfg: AppConfig) -> Result<(), String> {
 
 /// Runs `program args` as root via the standard administrator prompt; returns its exit code.
 pub fn run_elevated(program: &Path, args: &[&str]) -> Result<i32, String> {
+    let prompt = format!("The Nex needs to run: the-nex {}", args.join(" "));
+    run_elevated_with_prompt(program, args, &prompt)
+}
+
+/// Like `run_elevated`, but `prompt` (one sentence naming the action) is shown in the admin dialog.
+pub fn run_elevated_with_prompt(
+    program: &Path,
+    args: &[&str],
+    prompt: &str,
+) -> Result<i32, String> {
     if is_root() {
         return Command::new(program)
             .args(args)
@@ -525,6 +583,7 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<i32, String> {
     }
     let mut child = Command::new("/usr/bin/osascript")
         .arg("-")
+        .arg(prompt)
         .arg(program)
         .args(args)
         .stdin(Stdio::piped())
@@ -560,8 +619,53 @@ mod tests {
         assert!(!tray_is_running());
         let cfg = AppConfig::for_base_dir(&env::temp_dir().join("thenex-tray-mac"));
         assert!(run_tray(cfg).is_err());
-        assert!(ELEVATE_SCRIPT.contains("with administrator privileges"));
+        assert!(ELEVATE_SCRIPT.contains("with prompt (item 1 of argv as text) with administrator"));
         assert!(!ELEVATE_SCRIPT.contains("osascript -e"));
+    }
+
+    #[test]
+    fn user_owned_executables_are_refused_for_install() {
+        // The temp dir is owned by the invoking user (or by root only when tests run as root).
+        let exe = env::temp_dir().join("the-nex");
+        if fs::metadata(env::temp_dir()).unwrap().uid() != 0 {
+            assert!(require_root_owned_chain(&exe).is_err());
+        }
+        assert!(require_root_owned_chain(Path::new("/bin/ls")).is_ok());
+    }
+
+    #[test]
+    fn trusted_roots_ignore_the_data_volume_firmlink() {
+        assert!(in_trusted_root(Path::new(
+            "/System/Library/CoreServices/Finder"
+        )));
+        assert!(in_trusted_root(Path::new("/usr/bin/ls")));
+        assert!(!in_trusted_root(Path::new(
+            "/System/Volumes/Data/Users/a/evil"
+        )));
+        assert!(!in_trusted_root(Path::new("/System/Volumes/Data/tmp/x")));
+        assert!(!in_trusted_root(Path::new("/System/../Users/a/evil")));
+        assert!(!in_trusted_root(Path::new("/usr/local/bin/x")));
+    }
+
+    #[test]
+    fn root_chain_check_follows_links() {
+        let dir = env::temp_dir().join(format!("thenex-chain-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("ls");
+        std::os::unix::fs::symlink("/bin/ls", &link).unwrap();
+        // The link's own folder is user-owned, but the canonical target chain is what counts.
+        assert!(require_root_owned_chain(&link).is_ok());
+        assert!(require_root_owned_chain(&dir.join("missing")).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parent_dir_paths_are_never_within() {
+        assert!(!path_is_within(
+            Path::new("/Users/a/../../etc/x"),
+            Path::new("/Users/a")
+        ));
     }
 
     #[test]

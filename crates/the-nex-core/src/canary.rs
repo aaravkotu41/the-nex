@@ -141,7 +141,17 @@ pub fn canary_content(index: usize) -> Vec<u8> {
 
 pub fn check_canary(path: &Path, index: usize) -> CanaryState {
     for attempt in 0..READ_RETRIES {
-        match fs::read(path) {
+        // A symlinked canary is tampering: never follow it (we may be root).
+        if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return CanaryState::Modified;
+        }
+        // Bounded read: a ransomware-grown or endless file cannot exhaust memory or stall us.
+        let read = quarantine::open_nofollow(path).and_then(|file| {
+            let mut data = Vec::new();
+            io::Read::read_to_end(&mut io::Read::take(file, CANARY_LEN as u64 + 1), &mut data)
+                .map(|_| data)
+        });
+        match read {
             Ok(data) => {
                 return if data == canary_content(index) {
                     CanaryState::Intact
@@ -150,6 +160,8 @@ pub fn check_canary(path: &Path, index: usize) -> CanaryState {
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => return CanaryState::Missing,
+            // A FIFO/device/directory where the canary was: tampering, not a transient error.
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => return CanaryState::Modified,
             Err(_) if attempt + 1 < READ_RETRIES => thread::sleep(READ_RETRY_DELAY),
             Err(_) => return CanaryState::Unreadable,
         }
@@ -157,13 +169,43 @@ pub fn check_canary(path: &Path, index: usize) -> CanaryState {
     CanaryState::Unreadable
 }
 
+/// Replaces whatever is at `path` with a fresh canary without ever touching a link target:
+/// a symlink is unlinked (not followed) and O_EXCL creation refuses a link planted meanwhile.
+pub fn replace_canary(path: &Path, content: &[u8]) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.is_file() {
+                let _ = quarantine::set_readonly(path, false);
+            }
+            // CREATE_ALWAYS fails on hidden files, so replace rather than overwrite.
+            fs::remove_file(path)?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // 0644: the content is public and deterministic, and the GUI verifies as the user.
+        file.set_permissions(fs::Permissions::from_mode(0o644))?; // fchmod on our own handle
+    }
+    io::Write::write_all(&mut file, content)
+}
+
 pub fn remove_canaries(dirs: &[PathBuf]) -> usize {
     let mut removed = 0;
     for dir in dirs {
         for name in CANARY_FILE_NAMES {
             let path = dir.join(name);
-            if path.exists() {
-                let _ = quarantine::set_readonly(&path, false);
+            if let Ok(meta) = fs::symlink_metadata(&path) {
+                if meta.is_file() {
+                    let _ = quarantine::set_readonly(&path, false);
+                }
+                // remove_file unlinks a symlink itself, never its target.
                 if fs::remove_file(&path).is_ok() {
                     removed += 1;
                 }
@@ -171,6 +213,11 @@ pub fn remove_canaries(dirs: &[PathBuf]) -> usize {
         }
     }
     removed
+}
+
+/// A real directory, not a symlink: a user could point Desktop at a folder the root daemon must not write into.
+fn is_real_dir(dir: &Path) -> bool {
+    fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
 }
 
 fn dedup_dirs(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -190,7 +237,7 @@ fn status_of(path: PathBuf, state: CanaryState) -> CanaryStatus {
 /// Read-only integrity check of every canary slot in `dirs`.
 pub fn canary_states(dirs: &[PathBuf]) -> Vec<CanaryStatus> {
     dirs.iter()
-        .filter(|dir| dir.is_dir())
+        .filter(|dir| is_real_dir(dir))
         .flat_map(|dir| {
             CANARY_FILE_NAMES
                 .iter()
@@ -207,15 +254,11 @@ pub fn canary_states(dirs: &[PathBuf]) -> Vec<CanaryStatus> {
 /// Recreates missing or altered canaries (hidden) and reports the resulting state of each.
 pub fn rearm_canaries(dirs: &[PathBuf]) -> Vec<CanaryStatus> {
     let mut report = Vec::new();
-    for dir in dirs.iter().filter(|dir| dir.is_dir()) {
+    for dir in dirs.iter().filter(|dir| is_real_dir(dir)) {
         for (index, name) in CANARY_FILE_NAMES.iter().enumerate() {
             let path = dir.join(name);
             if check_canary(&path, index) != CanaryState::Intact {
-                if path.exists() {
-                    let _ = quarantine::set_readonly(&path, false);
-                    let _ = fs::remove_file(&path);
-                }
-                if let Err(e) = fs::write(&path, canary_content(index)) {
+                if let Err(e) = replace_canary(&path, &canary_content(index)) {
                     logger::warn(format!("cannot rearm canary {}: {e}", path.display()));
                 }
             }
@@ -284,7 +327,7 @@ impl CanaryManager {
     }
 
     fn deploy_dir(&mut self, dir: &Path) -> usize {
-        if !dir.is_dir() {
+        if !is_real_dir(dir) {
             return 0;
         }
         let mut placed = 0;
@@ -310,12 +353,7 @@ impl CanaryManager {
 
     pub fn write_canary(&self, path: &Path, index: usize) -> io::Result<()> {
         self.self_write.store(now_millis(), Ordering::SeqCst);
-        if path.exists() {
-            let _ = quarantine::set_readonly(path, false);
-            // CREATE_ALWAYS fails on hidden files, so replace rather than overwrite.
-            fs::remove_file(path)?;
-        }
-        let result = fs::write(path, canary_content(index));
+        let result = replace_canary(path, &canary_content(index));
         if result.is_ok() {
             platform::set_hidden_file(path);
         }
@@ -350,6 +388,9 @@ impl CanaryManager {
         let Some((canary, index)) = self.resolve(path) else {
             return;
         };
+        if !canary.parent().is_some_and(is_real_dir) {
+            return;
+        }
         let state = check_canary(&canary, index);
         if state != CanaryState::Intact {
             self.on_tamper(&canary, index, state);
@@ -361,7 +402,7 @@ impl CanaryManager {
             return;
         }
         for (canary, index) in self.deployed_canaries() {
-            if !canary.parent().is_some_and(Path::is_dir) {
+            if !canary.parent().is_some_and(is_real_dir) {
                 continue;
             }
             let state = check_canary(&canary, index);
@@ -452,7 +493,26 @@ fn hunt_refresh_kind() -> ProcessRefreshKind {
         .with_disk_usage()
 }
 
-/// Highest active writer in the sampling window, excluding protected and known-safe processes.
+/// Name-based exemption (protected process or known-safe writer) only counts when the image is
+/// at an OS-critical path or validly signed, so malware named `svchost.exe` is still a suspect.
+/// pid 0/1/4 and ourselves are always exempt; with no readable image path nothing else is (a
+/// self-deleting binary must not hide behind a protected name).
+fn is_exempt(
+    pid: u32,
+    name: &str,
+    exe: Option<&Path>,
+    trusted: impl FnOnce(&Path) -> bool,
+) -> bool {
+    if matches!(pid, 0 | 1 | 4) || pid == std::process::id() {
+        return true;
+    }
+    if !platform::is_protected_process(pid, name) && !is_safe_writer(name) {
+        return false;
+    }
+    exe.is_some_and(|exe| crate::ai_policy::is_os_critical_path(exe) || trusted(exe))
+}
+
+/// Highest active writer in the sampling window, excluding verified protected/safe processes.
 pub fn select_suspect(sys: &System) -> Option<WriterSuspect> {
     sys.processes()
         .iter()
@@ -460,8 +520,12 @@ pub fn select_suspect(sys: &System) -> Option<WriterSuspect> {
             let name = OsStr::new(process.name()).to_string_lossy().into_owned();
             let written = process.disk_usage().written_bytes;
             if written <= ACTIVE_WRITE_BYTES
-                || platform::is_protected_process(pid.as_u32(), &name)
-                || is_safe_writer(&name)
+                || is_exempt(
+                    pid.as_u32(),
+                    &name,
+                    process.exe(),
+                    platform::is_trusted_binary,
+                )
             {
                 return None;
             }
@@ -590,7 +654,10 @@ mod tests {
         manager.write_canary(&first, index).unwrap();
         assert_eq!(check_canary(&first, index), CanaryState::Intact);
 
-        assert_eq!(remove_canaries(&[dir.clone()]), CANARY_FILE_NAMES.len());
+        assert_eq!(
+            remove_canaries(std::slice::from_ref(&dir)),
+            CANARY_FILE_NAMES.len()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -602,26 +669,67 @@ mod tests {
     }
 
     #[test]
+    fn name_exemption_needs_a_trusted_image() {
+        let spoof = Path::new("/tmp/evil/svchost.exe");
+        assert!(!is_exempt(4242, "svchost.exe", Some(spoof), |_| false));
+        assert!(!is_exempt(4242, "onedrive.exe", Some(spoof), |_| false));
+        assert!(is_exempt(4242, "onedrive.exe", Some(spoof), |_| true)); // validly signed
+        assert!(is_exempt(
+            4242,
+            "mds",
+            Some(Path::new("/usr/libexec/mds")),
+            |_| false
+        ));
+        assert!(!is_exempt(4242, "launchd", None, |_| true)); // no image path: name alone never exempts
+        assert!(is_exempt(4, "System", None, |_| false));
+        assert!(is_exempt(1, "anything", Some(spoof), |_| false));
+        assert!(!is_exempt(4242, "evil", Some(spoof), |_| true)); // unlisted name: never exempt
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_event_ignores_a_folder_swapped_for_a_symlink() {
+        let dir = temp_dir();
+        let desktop = dir.join("desktop");
+        fs::create_dir_all(&desktop).unwrap();
+        let cfg = Arc::new(AppConfig::for_base_dir(&dir.join("base")));
+        let mut manager = CanaryManager::new(cfg, vec![desktop.clone()]);
+        assert_eq!(manager.deploy_all(), CANARY_FILE_NAMES.len());
+        let (canary, _) = manager.deployed_canaries()[0].clone();
+
+        // Desktop is swapped for a link to a folder root must never write into.
+        let victim = dir.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let moved = dir.join("desktop-real");
+        fs::rename(&desktop, &moved).unwrap();
+        std::os::unix::fs::symlink(&victim, &desktop).unwrap();
+        manager.self_write.store(0, Ordering::SeqCst);
+        manager.handle_fs_event(&canary);
+        assert_eq!(fs::read_dir(&victim).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rearm_restores_and_reports_every_slot() {
         let dir = temp_dir();
-        let states = canary_states(&[dir.clone()]);
+        let states = canary_states(std::slice::from_ref(&dir));
         assert_eq!(states.len(), CANARY_FILE_NAMES.len());
         assert!(states.iter().all(|s| s.state == "Missing"));
 
-        let report = rearm_canaries(&[dir.clone()]);
+        let report = rearm_canaries(std::slice::from_ref(&dir));
         assert!(report.iter().all(CanaryStatus::is_intact), "{report:?}");
 
         let tampered = dir.join(CANARY_FILE_NAMES[1]);
         let _ = fs::remove_file(&tampered);
         fs::write(&tampered, b"ransom note").unwrap();
-        let states = canary_states(&[dir.clone()]);
+        let states = canary_states(std::slice::from_ref(&dir));
         assert_eq!(states[1].state, "Modified");
-        assert!(rearm_canaries(&[dir.clone()])
+        assert!(rearm_canaries(std::slice::from_ref(&dir))
             .iter()
             .all(CanaryStatus::is_intact));
         assert!(canary_states(&[dir.join("missing-folder")]).is_empty());
 
-        remove_canaries(&[dir.clone()]);
+        remove_canaries(std::slice::from_ref(&dir));
         let _ = fs::remove_dir_all(&dir);
     }
 }

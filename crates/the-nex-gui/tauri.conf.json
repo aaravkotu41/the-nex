@@ -17,17 +17,19 @@
         "minWidth": 960,
         "minHeight": 600,
         "center": true,
-        "resizable": true,
-        "theme": "Dark",
-        "backgroundColor": "#060914"
+        "resizable": true
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: wallpaper: http://wallpaper.localhost; media-src 'self' blob: mediastream:; connect-src 'self' ipc: http://ipc.localhost https://nnftdhyfjfzjalxvhhmz.supabase.co blob: data:; font-src 'self' data:; frame-src 'self'; child-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"
     }
   },
   "bundle": {
     "active": false,
-    "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"]
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
+    ]
   }
 }

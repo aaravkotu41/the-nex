@@ -46,6 +46,8 @@ pub fn error(msg: impl AsRef<str>) {
 }
 
 fn write(level: &str, msg: &str) {
+    // File names reach log messages; escape line breaks so they cannot forge log lines.
+    let msg = msg.replace('\n', "\\n").replace('\r', "\\r");
     let line = format!(
         "{} [{level}] {msg}\n",
         Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)

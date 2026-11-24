@@ -2,8 +2,11 @@
 
 The Nex is a local endpoint protection app for Windows and macOS: it stops zip bombs before
 extraction, scores new programs with a small on-device AI model, kills malicious
-PowerShell/shell one-liners, and catches ransomware with decoy "canary" files. Nothing is sent
-to the cloud.
+PowerShell/shell one-liners, and catches ransomware with decoy "canary" files. Detection runs
+entirely on the device. While you are signed in, the dashboard talks to Supabase (sign-in, a small
+device-status summary every 60 s and a command check every 15 s, which reveals your IP address and
+activity times to Supabase); a pasted wallpaper URL contacts that page's host and then the image host it points to, following redirects. Device rows and command history stay on Supabase after sign-out or uninstall until removed from the Devices page; in-app account deletion isn't available yet. See
+Settings → Privacy in the app for the full list.
 
 ## Windows 10 / 11 (64-bit)
 
@@ -11,7 +14,7 @@ to the cloud.
    (repository page → **Releases** on the right).
 2. Double-click it and choose **Yes** on the administrator prompt.
 3. That's it. The installer copies The Nex to `C:\ProgramData\TheNex`, starts the background
-   service, puts the shield icon in the system tray, and adds **The Nex** to the Start menu and
+   service, puts the gyroscope icon in the system tray, and adds **The Nex** to the Start menu and
    desktop.
 
 **"Windows protected your PC"?** The installer is not code-signed yet. Click **More info →
@@ -50,3 +53,10 @@ then drag TheNex.app to the Trash.
   camera access the first time; video stays on your device.
 - Quarantined files can be restored from the **Quarantine** page.
 - Your wallpaper and theme are under **Settings → Appearance & Wallpaper**.
+
+## Sign-in setup (Supabase)
+
+The dashboard needs a Supabase project before anyone can sign in. Put its project URL and its
+**publishable** key (`sb_publishable_…`, or the legacy anon key) into `ui/supabase-config.js`.
+Never put the service_role or secret key there. While either value is empty, the login screen
+says sign-in is not set up and the dashboard stays locked.

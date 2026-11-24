@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Privacy - The Nex</title>
+  <link rel="stylesheet" href="styles.css">
+  <script>
+    // Same appearance as the app: follow the saved theme before the first paint.
+    try {
+      var pref = localStorage.getItem("thenex.theme") || "light";
+      var light = pref === "light" || (pref === "system" && window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
+      document.documentElement.dataset.theme = light ? "light" : "dark";
+    } catch (error) { document.documentElement.dataset.theme = "light"; }
+  </script>
+</head>
+<body>
+  <main class="doc">
+    <p><a class="btn" href="index.html">&larr; Back to The Nex</a></p>
+    <h1>Privacy</h1>
+    <p class="muted">What The Nex keeps on your computer, what it sends to its sign-in and sync service, and what it never does. No cookies, no analytics, no ads. Threat detection runs on your device.</p>
+
+    <section class="panel">
+      <h2>Stored on this device (browser storage)</h2>
+      <dl class="facts">
+        <dt><code>thenex.session</code></dt><dd>Supabase access and refresh token, expiry time, your user id and email. Removed when you sign out. Your password is never stored.</dd>
+        <dt><code>thenex.device.&lt;user&gt;</code></dt><dd>A random device id and the device name, one record per account.</dd>
+        <dt><code>thenex.theme</code></dt><dd>Dark, light or match system.</dd>
+        <dt><code>thenex.appearance</code></dt><dd>Wallpaper choice (including a URL if you pasted one), background dim, card blur and card opacity.</dd>
+        <dt><code>aegismesh.form</code>, <code>.profile</code>, <code>.camera</code>, <code>.signtests</code></dt><dd>AegisMesh console settings and sign-test results. Camera frames are processed on this device and are never recorded or sent anywhere.</dd>
+      </dl>
+    </section>
+
+    <section class="panel">
+      <h2>Stored in the app data folder (local only)</h2>
+      <p>Settings (<code>settings.json</code>), wallpaper images, the event log (<code>events.jsonl</code>, with file paths and hashes), quarantined files, and the last scan report. None of this is uploaded.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Sent to Supabase (hosted service)</h2>
+      <ul>
+        <li><b>Account (Supabase Auth):</b> your email, a hash of your password, and authentication logs that include your IP address and user agent.</li>
+        <li><b>Devices table:</b> device id, device name, platform, app version and a status summary: online, dry run, number of engines on, and counts of threats, quarantined files and canaries. Updated every 60 seconds while the app is running and you are signed in. No file paths or event details are included.</li>
+        <li><b>Device commands:</b> the command you send to a device (quick scan or canary check), its status and a small result summary.</li>
+        <li><b>Network metadata:</b> while you are signed in the app contacts Supabase every 15 seconds and every 60 seconds, which reveals your IP address and activity times to Supabase.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Wallpaper downloads</h2>
+      <p>If you paste a wallpaper URL, that page's host is contacted, then the image host it points to (which may differ), following redirects; the image is stored locally. Those hosts see your IP address.</p>
+      <p>Device rows and command history stay on Supabase after sign-out or uninstall until you remove them from the Devices page (or the project owner deletes the account). In-app account deletion is not available yet.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Operator and contact</h2>
+      <p>Operator / contact: (to be added by the project owner)</p>
+    </section>
+
+    <section class="panel">
+      <h2>Third-party software</h2>
+      <ul>
+        <li>Tauri: MIT or Apache-2.0</li>
+        <li>three.js: MIT</li>
+        <li>MediaPipe Tasks Vision and the hand and face models: Apache-2.0</li>
+        <li>Supabase: hosted service (sign-in and device sync)</li>
+        <li>Rust crate licences: see <code>Cargo.lock</code> / cargo-about (not yet generated)</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

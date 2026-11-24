@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::io::{self, Read};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -95,7 +96,8 @@ pub fn is_valid_source(source: &str) -> bool {
 
 fn web_url(text: &str) -> Option<Url> {
     let url = Url::parse(text.trim()).ok()?;
-    matches!(url.scheme(), "http" | "https").then_some(url)
+    // https only: the fetch agent refuses plain http anyway (https_only), so say so up front.
+    (url.scheme() == "https").then_some(url)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,6 +263,8 @@ pub fn wallpaper_response(dir: Option<PathBuf>, uri_path: &str) -> Response<Vec<
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime)
                 .header(header::CACHE_CONTROL, "max-age=31536000, immutable")
+                .header("X-Content-Type-Options", "nosniff")
+                .header("Content-Security-Policy", "default-src 'none'")
                 .body(bytes)
                 .unwrap_or_default()
         }
@@ -415,14 +419,80 @@ pub fn extract_meta_image(html: &str, base: &Url) -> Option<String> {
     found.sort_by_key(|(priority, _)| *priority);
     found.into_iter().find_map(|(_, value)| {
         let url = base.join(decode_entities(value.trim()).as_str()).ok()?;
-        matches!(url.scheme(), "http" | "https").then(|| url.to_string())
+        (url.scheme() == "https").then(|| url.to_string())
     })
+}
+
+/// True for addresses a wallpaper fetch must never reach: loopback, private, link-local,
+/// unspecified, multicast, CGNAT, and IPv4-mapped forms of those.
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+                || o[0] == 0 // "this network"
+                || o[0] >= 240 // reserved
+                || (o[0] == 198 && (18..20).contains(&o[1])) // benchmarking
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            // IPv4-mapped (::ffff:a.b.c.d), IPv4-compatible (::a.b.c.d) and NAT64 (64:ff9b::/96)
+            // all reach an IPv4 host, so judge the embedded address.
+            let embedded = if s[..6] == [0, 0, 0, 0, 0, 0xffff]
+                || (s[..6] == [0; 6] && (s[6] != 0 || s[7] > 1))
+                || s[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
+            {
+                Some(std::net::Ipv4Addr::new(
+                    (s[6] >> 8) as u8,
+                    s[6] as u8,
+                    (s[7] >> 8) as u8,
+                    s[7] as u8,
+                ))
+            } else {
+                None
+            };
+            if let Some(v4) = embedded {
+                return is_blocked_ip(IpAddr::V4(v4));
+            }
+            let first = s[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || first & 0xfe00 == 0xfc00
+                || first & 0xffc0 == 0xfe80
+        }
+    }
+}
+
+/// Resolves like the system resolver but drops blocked addresses (SSRF guard); the address
+/// that is filtered is the one ureq connects to, so DNS rebinding cannot swap it afterwards.
+struct PublicOnlyResolver;
+
+impl ureq::Resolver for PublicOnlyResolver {
+    fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
+        let addrs: Vec<SocketAddr> = netloc
+            .to_socket_addrs()?
+            .filter(|a| !is_blocked_ip(a.ip()))
+            .collect();
+        if addrs.is_empty() {
+            return Err(io::Error::other("blocked address"));
+        }
+        Ok(addrs)
+    }
 }
 
 fn http_agent() -> Result<ureq::Agent, String> {
     let tls = native_tls::TlsConnector::new().map_err(|e| format!("TLS is unavailable: {e}"))?;
     Ok(ureq::AgentBuilder::new()
         .tls_connector(Arc::new(tls))
+        .resolver(PublicOnlyResolver)
+        .https_only(true)
         .timeout(HTTP_TIMEOUT)
         .redirects(5)
         .user_agent(USER_AGENT)
@@ -432,7 +502,8 @@ fn http_agent() -> Result<ureq::Agent, String> {
 fn describe(error: ureq::Error) -> String {
     match error {
         ureq::Error::Status(code, _) => format!("the site answered HTTP {code}"),
-        ureq::Error::Transport(transport) => format!("could not reach the site: {transport}"),
+        // Generic on purpose: no hints about which hosts or ports exist.
+        ureq::Error::Transport(_) => "could not reach the site".to_string(),
     }
 }
 
@@ -442,8 +513,7 @@ pub fn resolve_image_url(input: &str) -> Result<String, String> {
     if input.len() > MAX_URL_LEN {
         return Err("that address is too long".to_string());
     }
-    let url =
-        web_url(input).ok_or_else(|| "enter a full http:// or https:// address".to_string())?;
+    let url = web_url(input).ok_or_else(|| "enter a full https:// address".to_string())?;
     if ImageKind::from_url_path(url.path()).is_some() {
         return Ok(url.to_string());
     }
@@ -534,6 +604,18 @@ pub fn save_wallpaper_file(
     app: AppHandle,
     request: tauri::ipc::Request<'_>,
 ) -> Result<String, String> {
+    // Reject on the declared length first; store_wallpaper re-checks the real length.
+    let declared = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > MAX_WALLPAPER_BYTES) {
+        return Err(format!(
+            "images up to {} MB are supported",
+            MAX_WALLPAPER_BYTES / (1024 * 1024)
+        ));
+    }
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err("expected the image file's bytes".to_string());
     };
@@ -549,6 +631,51 @@ mod tests {
             std::env::temp_dir().join(format!("thenex-appearance-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn ip_filter_blocks_internal_ranges() {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "224.0.0.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "::1",
+            "::",
+            "fc00::1",
+            "fd12::1",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::127.0.0.1",
+            "64:ff9b::a9fe:a9fe",
+            "0.1.2.3",
+            "198.18.0.1",
+            "240.0.0.1",
+        ] {
+            assert!(is_blocked_ip(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "8.8.8.8",
+            "100.63.0.1",
+            "100.128.0.1",
+            "2606:4700::1111",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(!is_blocked_ip(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[test]
+    fn resolver_refuses_loopback() {
+        use ureq::Resolver;
+        assert!(PublicOnlyResolver.resolve("localhost:443").is_err());
     }
 
     fn png() -> Vec<u8> {
