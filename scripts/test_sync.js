@@ -42,7 +42,8 @@ function env(handler, cfg = {}) {
 const dash = {
   platform: "macos", dry_run: false, threats_detected: 3, quarantined: 2, canaries_intact: 1,
   daemon: { online: true, version: "0.3.0" },
-  toggles: { zip_bomb_enabled: true, bin_ai_enabled: true, process_guard_enabled: false, canary_enabled: true },
+  toggles: { known_bad_enabled: true, zip_bomb_enabled: true, bin_ai_enabled: true, process_guard_enabled: false, canary_enabled: true },
+  known_bad: { loaded: true, entries: 21, created: "2026-11-24T00:00:00+00:00" },
   canaries: [{ path: "/Users/me/secret.docx", state: "Intact" }, { path: "/x", state: "Modified" }],
   watched_dirs: ["/Users/me/Downloads"], data_dir: "/secret",
 };
@@ -66,11 +67,20 @@ const fresh = () => new Date().toISOString();
     const hb = e.calls.find((c) => c.method === "POST" && c.url.endsWith("/rest/v1/devices"));
     const keys = Object.keys(hb.body).sort().join(",");
     check("heartbeat keys are the allowed ones", keys === "app_version,id,last_seen,name,platform,status", keys);
-    check("heartbeat status keys", Object.keys(hb.body.status).sort().join(",") === "canaries_intact,canaries_total,dry_run,engines_on,online,quarantined,threats_detected");
-    check("engines_on counts toggles", hb.body.status.engines_on === 3 && hb.body.status.canaries_total === 2);
+    check("heartbeat status keys", Object.keys(hb.body.status).sort().join(",") === "canaries_intact,canaries_total,dry_run,engines_on,engines_total,online,quarantined,threats_detected");
+    check("engines_on counts toggles", hb.body.status.engines_on === 4 && hb.body.status.engines_total === 5 && hb.body.status.canaries_total === 2);
     check("heartbeat has no paths", !/\/Users|\/secret|Downloads/.test(JSON.stringify(hb.body)));
     check("heartbeat upserts with merge-duplicates", hb.headers.Prefer.startsWith("resolution=merge-duplicates") && hb.headers.apikey === "pk" && hb.headers.Authorization === "Bearer tok");
     check("default name from platform", hb.body.name === "macOS device", hb.body.name);
+    e.sync.stop();
+  }
+  {
+    // the list engine only counts as on when the service has a list loaded (older services report none)
+    const e = env((u) => ({ status: u.includes("device_commands") ? 200 : 201, body: [] }));
+    e.sync.start(async (c) => (c === "get_dashboard_state" ? { ...dash, known_bad: undefined } : null));
+    await e.sync.heartbeat();
+    const hb = e.calls.find((c) => c.method === "POST" && c.url.endsWith("/rest/v1/devices"));
+    check("engines_on leaves out a list engine with no list", hb.body.status.engines_on === 3 && hb.body.status.engines_total === 5, hb.body.status.engines_on);
     e.sync.stop();
   }
 

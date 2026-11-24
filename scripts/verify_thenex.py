@@ -2,13 +2,14 @@
 """Live end-to-end verifier for The Nex (Windows and macOS).
 
 Runs the real release binary against harmless decoys confined to ./thenex_live_sandbox:
-  1 startup & canaries        4 nested zip bomb           7 canary trip & recovery
-  2 benign zip pass-through   5 overlapping-header bomb   8 --restore CLI
-  3 ratio zip bomb            6 LotL process kill         9 --dry-run mode
-Exit status is 0 only when all nine checks pass.
+  1 startup & canaries        5 overlapping-header bomb    9 --restore CLI
+  2 benign zip pass-through   6 known-malware list        10 --dry-run mode
+  3 ratio zip bomb            7 LotL process kill
+  4 nested zip bomb           8 canary trip & recovery
+Exit status is 0 only when all ten checks pass.
 
 Note: like the real product, the console engine watches every process on the machine while
-it runs; checks 6 and 7 rely on that and only target the decoy processes this script starts.
+it runs; checks 7 and 8 rely on that and only target the decoy processes this script starts.
 """
 
 import argparse
@@ -29,11 +30,14 @@ import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fetch_hash_list as hashlist  # noqa: E402
 SANDBOX = ROOT / "thenex_live_sandbox"
 WATCH = SANDBOX / "watch"
 QUARANTINE = SANDBOX / "quarantine"
 STAGING = SANDBOX / "staging"
 EVENTS = SANDBOX / "events.jsonl"
+HASH_LIST = SANDBOX / "known_bad_test.bin"
 DAEMON_LOG = SANDBOX / "daemon-output.log"
 WINDOWS = os.name == "nt"
 EXE = ROOT / "target" / "release" / ("the-nex.exe" if WINDOWS else "the-nex")
@@ -44,6 +48,11 @@ CANARY_MAGIC = b"THENEX\x00CANARY"
 ACTION_TIMEOUT = 3.0
 KILL_TIMEOUT = 4.0
 COOLDOWN = 2.5
+DECOY_NAME = "payroll_update.docm"
+CONTROL_NAME = "meeting_notes.docm"
+DRY_DECOY_NAME = "payroll_update_dry.docm"
+DECOY = b"The Nex live verifier: harmless known-malware decoy. Not a real threat.\n" * 8
+CONTROL = b"The Nex live verifier: harmless meeting notes, not on any list.\n" * 8
 
 
 def wait_until(predicate, timeout, interval=0.1):
@@ -150,6 +159,7 @@ class Daemon:
             "--watch-dir", str(WATCH),
             "--quarantine-dir", str(QUARANTINE),
             "--log-file", str(EVENTS),
+            "--hash-list", str(HASH_LIST),
         ]
         if dry_run:
             command.append("--dry-run")
@@ -207,6 +217,33 @@ def check_bomb(name, data):
     event = find_event("ZIP_BOMB", name)
     detail = event["details"].split(":")[0] if event else "no ZIP_BOMB event"
     return ok, f"quarantined ({detail})" if ok else f"exists={path.exists()} quarantined={quarantined(name)} event={bool(event)}"
+
+
+def check_known_malware(daemon):
+    control = drop(CONTROL_NAME, CONTROL)
+    decoy = drop(DECOY_NAME, DECOY)
+    ok = wait_until(
+        lambda: not decoy.exists() and quarantined(DECOY_NAME) and find_event("KNOWN_MALWARE", DECOY_NAME, "QUARANTINED"),
+        ACTION_TIMEOUT,
+    )
+    event = find_event("KNOWN_MALWARE", DECOY_NAME, "QUARANTINED")
+    if not ok or not event:
+        seen = find_event("KNOWN_MALWARE", DECOY_NAME)
+        return False, (f"decoy exists={decoy.exists()} quarantined={quarantined(DECOY_NAME)} "
+                       f"event={seen.get('action_taken') if seen else None}")
+    problems = []
+    if str(event.get("severity", "")).upper() != "CRITICAL":
+        problems.append(f"severity={event.get('severity')!r}, expected CRITICAL")
+    if "known-malware list" not in str(event.get("details", "")).lower():
+        problems.append(f"details lack 'known-malware list': {event.get('details')!r}")
+    time.sleep(2.0)  # give the engine time to wrongly act on the control file too
+    if not control.exists():
+        problems.append("control file was removed")
+    if quarantined(CONTROL_NAME):
+        problems.append("control file was quarantined")
+    if find_event("KNOWN_MALWARE", CONTROL_NAME):
+        problems.append("control file got a KNOWN_MALWARE event")
+    return not problems, "decoy quarantined (CRITICAL), control untouched" if not problems else "; ".join(problems)
 
 
 def lotl_decoy_command():
@@ -295,11 +332,16 @@ def check_dry_run(daemon):
     daemon.start(dry_run=True)
     time.sleep(1.5)
     path = drop("ratio_bomb_dry.zip", ratio_bomb(50))
+    doc = drop(DRY_DECOY_NAME, DECOY)
     logged = wait_until(lambda: find_event("ZIP_BOMB", "ratio_bomb_dry.zip", "DRY_RUN"), ACTION_TIMEOUT)
+    doc_logged = wait_until(lambda: find_event("KNOWN_MALWARE", DRY_DECOY_NAME, "DRY_RUN"), ACTION_TIMEOUT)
     time.sleep(0.5)
-    ok = bool(logged) and path.exists() and not quarantined("ratio_bomb_dry.zip")
+    ok = (bool(logged) and path.exists() and not quarantined("ratio_bomb_dry.zip")
+          and bool(doc_logged) and doc.exists() and not quarantined(DRY_DECOY_NAME))
     daemon.stop()
-    return ok, "logged, file untouched" if ok else f"logged={bool(logged)} exists={path.exists()}"
+    return ok, "logged, files untouched" if ok else (
+        f"zip logged={bool(logged)} exists={path.exists()}; "
+        f"known-malware logged={bool(doc_logged)} exists={doc.exists()} quarantined={quarantined(DRY_DECOY_NAME)}")
 
 
 def ensure_assets(skip_build):
@@ -341,6 +383,8 @@ def main():
     for folder in (WATCH, QUARANTINE, STAGING):
         folder.mkdir(parents=True, exist_ok=True)
 
+    fillers = [hashlist.prefix(hashlib.sha256(b"filler-%d" % i).digest()) for i in range(20)]
+    hashlist.write_list(HASH_LIST, fillers + [hashlist.prefix(hashlib.sha256(DECOY).digest())], int(time.time()))
     ratio_data = ratio_bomb(50)
     daemon = Daemon()
     checks = [
@@ -349,6 +393,7 @@ def main():
         ("Live ratio zip bomb", lambda: check_bomb("ratio_bomb.zip", ratio_data)),
         ("Live nested zip bomb", lambda: check_bomb("nested_bomb.zip", nested_bomb(4))),
         ("Live overlapping-header bomb", lambda: check_bomb("overlap_bomb.zip", overlap_bomb())),
+        ("Live known-malware list", lambda: check_known_malware(daemon)),
         ("Live LotL process kill", lambda: check_lotl(daemon)),
         ("Live canary trip & recovery", lambda: check_canary(daemon)),
         ("Live restore CLI", lambda: check_restore(daemon, ratio_data)),

@@ -27,6 +27,7 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 notify-rust = "4"
 sha2 = "0.10"
+memmap2 = "0.9"
 zeroize = { version = "1", features = ["derive"] }
 # OS CSPRNG for AegisMesh ephemeral keys and nonces (already in the lockfile via tauri).
 getrandom = "0.2"

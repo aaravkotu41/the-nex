@@ -21,6 +21,7 @@ fn status_text() -> String {
     };
     let t = &state.toggles;
     let on = [
+        t.known_bad_enabled,
         t.zip_bomb_enabled,
         t.bin_ai_enabled,
         t.process_guard_enabled,
@@ -33,10 +34,12 @@ fn status_text() -> String {
         "Engine service offline".into()
     } else if state.dry_run {
         "Dry run · detecting only".into()
-    } else if on == 4 {
-        "Protected · 4 of 4 engines on".into()
+    } else if on == 5 && !state.known_bad.loaded {
+        "Partial protection · no malware list".into()
+    } else if on == 5 {
+        "Protected · 5 of 5 engines on".into()
     } else {
-        format!("Partial protection · {on} of 4 engines on")
+        format!("Partial protection · {on} of 5 engines on")
     }
 }
 

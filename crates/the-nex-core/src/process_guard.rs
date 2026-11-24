@@ -1,6 +1,7 @@
 use crate::ai_policy::{self, Action, Request, Target};
 use crate::bin_ai::{self, BinaryAiScanner};
 use crate::config::{AppConfig, Engine};
+use crate::known_bad::{self, Digest32};
 use crate::logger;
 use crate::platform;
 use crate::quarantine::{self, Severity, ThreatEvent};
@@ -212,6 +213,9 @@ pub struct ProcessGuard {
     /// pid -> start time, so a recycled PID is treated as a new process.
     seen: HashMap<Pid, u64>,
     trust_cache: HashMap<PathBuf, (bin_ai::FileStamp, bool)>,
+    /// Program file -> its SHA-256 when it is on the known-malware list, so each version of a
+    /// program is hashed once however often it starts.
+    known_cache: HashMap<PathBuf, (known_bad::Stamp, Option<Digest32>)>,
     /// (pid, start time) of everything running when protection started; never killed by the AI.
     baseline: HashSet<(Pid, u64)>,
     /// (pid, was already running when protection started) waiting for a binary AI scan.
@@ -234,6 +238,7 @@ impl ProcessGuard {
             sys: System::new(),
             seen: HashMap::new(),
             trust_cache: HashMap::new(),
+            known_cache: HashMap::new(),
             baseline: HashSet::new(),
             pending_ai: VecDeque::new(),
             ancestors: HashSet::new(),
@@ -294,16 +299,27 @@ impl ProcessGuard {
         }
         // Cheap command-line checks first, for every new process, so a malicious script host
         // is stopped within one poll; binary scans follow within a time budget.
+        // Programs that just started go ahead of the backlog of those already running at
+        // start-up: only a new program can still be stopped, so it must not wait behind
+        // hundreds that will only ever be reported.
+        let mut next_new = self
+            .pending_ai
+            .iter()
+            .position(|&(_, at_startup)| at_startup)
+            .unwrap_or(self.pending_ai.len());
         for pid in fresh {
-            if self.ancestors.contains(&pid) {
+            if self.ancestors.contains(&pid) || self.inspect_command(pid) {
                 continue;
             }
-            if !self.inspect_command(pid) {
-                self.pending_ai.push_back((pid, first_poll));
+            if first_poll {
+                self.pending_ai.push_back((pid, true));
+            } else {
+                self.pending_ai.insert(next_new, (pid, false));
+                next_new += 1;
             }
         }
         while self.pending_ai.len() > MAX_PENDING_AI {
-            self.pending_ai.pop_front();
+            self.pending_ai.pop_back();
         }
         let started = Instant::now();
         while started.elapsed() < AI_SCAN_BUDGET {
@@ -337,7 +353,9 @@ impl ProcessGuard {
     }
 
     fn inspect_binary(&mut self, pid: Pid, preexisting: bool) {
-        if !self.cfg.engine_enabled(Engine::BinAi) {
+        let listed = self.cfg.known_bad_active();
+        let ai = self.cfg.engine_enabled(Engine::BinAi);
+        if !listed && !ai {
             return;
         }
         let Some(process) = self.sys.process(pid) else {
@@ -347,7 +365,58 @@ impl ProcessGuard {
         let Some(exe) = process.exe().map(Path::to_path_buf) else {
             return;
         };
-        self.scan_executable(pid, &name, &exe, preexisting);
+        if !crate::engine::is_regular_file(&exe) {
+            return;
+        }
+        // The list first: a match is certain, and it applies to signed programs too (malware
+        // is often signed with a stolen certificate), which the AI skips.
+        if listed && self.respond_known_bad(pid, &name, &exe, preexisting) {
+            return;
+        }
+        if ai {
+            self.scan_executable(pid, &name, &exe, preexisting);
+        }
+    }
+
+    /// The program's SHA-256 when it is on the known-malware list.
+    fn known_bad_digest(&mut self, exe: &Path) -> Option<Digest32> {
+        let stamp = fs::metadata(exe).ok().and_then(|m| known_bad::stamp(&m))?;
+        if let Some(&(cached, hit)) = self.known_cache.get(exe) {
+            if cached == stamp {
+                return hit;
+            }
+        }
+        let hit = known_bad::hash_file(exe, known_bad::MAX_HASH_BYTES)
+            .filter(|digest| self.cfg.known_bad.contains(digest));
+        // A match is only remembered under a stamp that cannot be forged (see Stamp::Weak).
+        if hit.is_none() || matches!(stamp, known_bad::Stamp::Strong(_)) {
+            if self.known_cache.len() >= MAX_TRUST_CACHE {
+                self.known_cache.clear();
+            }
+            self.known_cache.insert(exe.to_path_buf(), (stamp, hit));
+        }
+        hit
+    }
+
+    /// True when the program is known malware (and has been dealt with and logged).
+    fn respond_known_bad(&mut self, pid: Pid, name: &str, exe: &Path, preexisting: bool) -> bool {
+        let Some(digest) = self.known_bad_digest(exe) else {
+            return false;
+        };
+        let details = format!(
+            "{} pid={} name={name}",
+            self.cfg.known_bad.describe(&digest),
+            pid.as_u32()
+        );
+        let decision = known_bad::decide(&self.cfg, exe, Target::Process { preexisting }, &details);
+        self.respond(
+            known_bad::THREAT_TYPE,
+            Severity::Critical,
+            exe,
+            decision,
+            details,
+        );
+        true
     }
 
     fn respond_lotl(&mut self, pid: Pid, name: &str, cmdline: &str, pattern: &str) {
@@ -392,7 +461,7 @@ impl ProcessGuard {
     }
 
     fn scan_executable(&mut self, pid: Pid, name: &str, exe: &Path, preexisting: bool) {
-        if !crate::engine::is_regular_file(exe) || self.is_trusted(exe) {
+        if self.is_trusted(exe) {
             return;
         }
         let Some(score) = self.scanner.scan_file(exe) else {
@@ -417,9 +486,22 @@ impl ProcessGuard {
             explanation: &details,
             data_dir: &self.cfg.base_dir,
         });
+        self.respond("MALWARE_AI_PROCESS", Severity::High, exe, decision, details);
+    }
+
+    /// Carries out a verdict on a running program and logs it. `alert_severity` is the
+    /// severity of an event that only alerts; anything acted on is critical.
+    fn respond(
+        &mut self,
+        threat_type: &str,
+        alert_severity: Severity,
+        exe: &Path,
+        decision: Action,
+        details: String,
+    ) {
         let (severity, action) = match decision {
             Action::Ignore => return,
-            Action::Alert(why) => (Severity::High, format!("ALERT_ONLY: {why}")),
+            Action::Alert(why) => (alert_severity, format!("ALERT_ONLY: {why}")),
             Action::WouldTerminateAndQuarantine | Action::WouldQuarantine => (
                 Severity::Critical,
                 "DRY_RUN: would terminate process and quarantine executable".to_string(),
@@ -427,15 +509,11 @@ impl ProcessGuard {
             Action::Quarantine | Action::TerminateAndQuarantine => {
                 let killed = self.kill_all_with_exe(exe);
                 self.wait_for_exit(&killed);
-                let quarantined = match quarantine::quarantine_file(
-                    exe,
-                    &self.cfg,
-                    "MALWARE_AI_PROCESS",
-                    &details,
-                ) {
-                    Ok(meta) => format!("QUARANTINED id={}", meta.id),
-                    Err(e) => format!("QUARANTINE_FAILED: {e}"),
-                };
+                let quarantined =
+                    match quarantine::quarantine_file(exe, &self.cfg, threat_type, &details) {
+                        Ok(meta) => format!("QUARANTINED id={}", meta.id),
+                        Err(e) => format!("QUARANTINE_FAILED: {e}"),
+                    };
                 (
                     Severity::Critical,
                     format!("TERMINATED {} process(es); {quarantined}", killed.len()),
@@ -445,7 +523,7 @@ impl ProcessGuard {
         quarantine::record_event(
             &self.cfg,
             ThreatEvent::new(
-                "MALWARE_AI_PROCESS",
+                threat_type,
                 severity,
                 exe.display().to_string(),
                 action,
@@ -760,6 +838,136 @@ mod tests {
         ] {
             assert_eq!(check_lotl_command(name, cmdline), None, "{name}: {cmdline}");
         }
+    }
+
+    /// Not a test: keeps a copy of this test program alive for the test below.
+    #[test]
+    #[ignore]
+    fn napper() {
+        if std::env::var_os("THENEX_TEST_NAP").is_some() {
+            thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_listed_program_is_stopped_unless_already_running_or_signed_by_apple() {
+        use std::process::{Child, Command, Stdio};
+        let dir = std::env::temp_dir().join(format!("thenex-pg-known-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
+        // A copy of this test program (not signed by Apple) and one of /bin/sleep (signed by
+        // Apple); both go on the list.
+        let (exe, apple) = (dir.join("napper"), dir.join("apple-napper"));
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        fs::copy("/bin/sleep", &apple).unwrap();
+        let nap = |program: &Path| -> Child {
+            // The copy of this test program runs only `napper`; sleep takes the seconds.
+            let args: &[&str] = if program == apple {
+                &["60"]
+            } else {
+                &["--ignored", "--exact", "process_guard::tests::napper"]
+            };
+            Command::new(program)
+                .args(args)
+                .env("THENEX_TEST_NAP", "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+
+        let mut cfg = AppConfig::for_base_dir(&dir.join("base"));
+        cfg.ensure_dirs().unwrap();
+        let digests: Vec<Digest32> = [&exe, &apple]
+            .iter()
+            .map(|p| known_bad::hash_file(p, u64::MAX).unwrap())
+            .collect();
+        let list = dir.join("list.bin");
+        known_bad::write_list(&list, &digests, 1_795_000_000).unwrap();
+        cfg.hash_list = Some(list);
+        cfg.load_known_bad().unwrap();
+        let cfg = Arc::new(cfg);
+        let events = |cfg: &AppConfig| -> Vec<ThreatEvent> {
+            quarantine::read_recent_events(&cfg.events_log, 1 << 20)
+                .unwrap()
+                .into_iter()
+                .rev() // oldest first
+                .filter(|e| e.threat_type == "KNOWN_MALWARE")
+                .collect()
+        };
+        let set_dry_run = |cfg: &AppConfig, on: bool| {
+            let mut toggles = cfg.toggles.snapshot();
+            toggles.set(Engine::DryRun, on);
+            cfg.toggles.apply(toggles);
+        };
+
+        let mut old = nap(&exe);
+        let mut g = ProcessGuard::new(
+            Arc::clone(&cfg),
+            Arc::new(BinaryAiScanner::heuristic_only()),
+            Arc::new(Telemetry::default()),
+        );
+        let refresh = |g: &mut ProcessGuard| {
+            g.sys
+                .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind())
+        };
+        refresh(&mut g);
+        let old_pid = Pid::from_u32(old.id());
+        g.baseline
+            .insert((old_pid, g.sys.process(old_pid).unwrap().start_time()));
+
+        // Already running when protection started: reported, never stopped.
+        g.inspect_binary(old_pid, true);
+        let seen = events(&cfg);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].severity, Severity::Critical);
+        assert!(seen[0].details.starts_with("matched known-malware list"));
+        assert_eq!(
+            seen[0].action_taken,
+            "ALERT_ONLY: already running when protection started"
+        );
+
+        // A new copy of it: dry run only reports...
+        let mut new = nap(&exe);
+        let new_pid = Pid::from_u32(new.id());
+        refresh(&mut g);
+        set_dry_run(&cfg, true);
+        g.inspect_binary(new_pid, false);
+        assert_eq!(
+            events(&cfg)[1].action_taken,
+            "DRY_RUN: would terminate process and quarantine executable"
+        );
+        assert!(new.try_wait().unwrap().is_none() && exe.exists());
+
+        // ...and for real it is stopped and its file quarantined; the old one keeps running.
+        set_dry_run(&cfg, false);
+        g.inspect_binary(new_pid, false);
+        let action = &events(&cfg)[2].action_taken;
+        assert!(
+            action.starts_with("TERMINATED 1 process(es); QUARANTINED id="),
+            "{action}"
+        );
+        assert!(new.wait().is_ok() && !exe.exists());
+        assert!(old.try_wait().unwrap().is_none(), "preexisting survives");
+
+        // Signed by Apple: a wrong list entry must not take a system program away.
+        let mut signed = nap(&apple);
+        let signed_pid = Pid::from_u32(signed.id());
+        refresh(&mut g);
+        g.inspect_binary(signed_pid, false);
+        assert_eq!(
+            events(&cfg)[3].action_taken,
+            "ALERT_ONLY: signed by the operating system vendor; alert only"
+        );
+        assert!(signed.try_wait().unwrap().is_none() && apple.exists());
+
+        for child in [&mut old, &mut signed] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

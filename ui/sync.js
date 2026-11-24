@@ -53,7 +53,8 @@
       status: {
         online: !!(d.daemon && d.daemon.online),
         dry_run: !!d.dry_run,
-        engines_on: ["zip_bomb_enabled", "bin_ai_enabled", "process_guard_enabled", "canary_enabled"].filter((k) => t[k]).length,
+        engines_total: 5,
+        engines_on: ["known_bad_enabled", "zip_bomb_enabled", "bin_ai_enabled", "process_guard_enabled", "canary_enabled"].filter((k) => t[k] && (k !== "known_bad_enabled" || (d.known_bad && d.known_bad.loaded))).length,
         threats_detected: num(d.threats_detected),
         quarantined: num(d.quarantined),
         canaries_intact: num(d.canaries_intact),
@@ -262,8 +263,9 @@
   function protection(st) {
     if (!st.online) return ["Service offline", "red"];
     if (st.dry_run) return ["Dry run", "amber"];
-    if (st.engines_on === 4) return ["Protected", "green"];
-    return [st.engines_on + " of 4 engines on", st.engines_on ? "amber" : "red"];
+    const total = st.engines_total || 4;
+    if (st.engines_on === total) return ["Protected", "green"];
+    return [st.engines_on + " of " + total + " engines on", st.engines_on ? "amber" : "red"];
   }
   function commandLine(c) {
     const r = c.result || {};

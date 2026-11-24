@@ -17,6 +17,7 @@
   const TYPE_NOTES = {
     ZIP_BOMB: "An archive built to expand far beyond its size and exhaust the disk or memory. It was caught before anything was extracted.",
     LOTL_SCRIPT: "A built-in tool (PowerShell, cmd, mshta, osascript…) was started the way malware uses it, for example with a hidden window, an encoded command or a download.",
+    KNOWN_MALWARE: "A file or program whose fingerprint (SHA-256) is on the known-malware list. This is a certain match, not a guess.",
     MALWARE_AI: "The on-device AI model scored this new program as malicious. The detail line lists what it noticed.",
     MALWARE_AI_PROCESS: "The on-device AI model scored the image of a running program as malicious.",
     RANSOMWARE_CANARY: "A decoy file that nothing should touch was changed: the typical first sign of ransomware encrypting files.",
@@ -26,6 +27,7 @@
   };
   // Phrases -> threat types, most specific first.
   const TYPE_ALIASES = [
+    [/known[ _-]?(bad|malware)/, ["KNOWN_MALWARE"]],
     [/malware[ _-]?ai[ _-]?process/, ["MALWARE_AI_PROCESS"]],
     [/malware[ _-]?ai/, ["MALWARE_AI"]],
     [/zip[ _-]?bomb/, ["ZIP_BOMB"]],
@@ -37,6 +39,7 @@
     [/ransomware/, ["RANSOMWARE_CANARY", "RANSOMWARE_SUSPECT"]],
   ];
   const ENGINES = [
+    ["known_bad_enabled", "Known malware list"],
     ["zip_bomb_enabled", "Zip bomb guard"],
     ["bin_ai_enabled", "AI file scan"],
     ["process_guard_enabled", "Process guard"],

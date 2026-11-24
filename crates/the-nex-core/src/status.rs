@@ -80,6 +80,11 @@ pub struct EngineStatus {
     pub threats_detected: u64,
     pub model_loaded: bool,
     pub model_path: PathBuf,
+    /// Entries in the loaded known-malware list (0 = none installed) and when it was built.
+    #[serde(default)]
+    pub known_bad_entries: u64,
+    #[serde(default)]
+    pub known_bad_created: Option<DateTime<Utc>>,
     pub watched_dirs: Vec<PathBuf>,
     pub canaries: Vec<CanaryStatus>,
     pub quarantine: Vec<QuarantineMeta>,
@@ -115,6 +120,8 @@ pub fn build_status(
         threats_detected: quarantine::threat_events_recorded(),
         model_loaded: telemetry.model_loaded.load(Ordering::Relaxed),
         model_path: cfg.model_path.clone(),
+        known_bad_entries: cfg.known_bad.len() as u64,
+        known_bad_created: cfg.known_bad.created(),
         watched_dirs: telemetry.watched_dirs(),
         canaries: telemetry.canaries(),
         quarantine: quarantine::list_quarantined(cfg).unwrap_or_default(),

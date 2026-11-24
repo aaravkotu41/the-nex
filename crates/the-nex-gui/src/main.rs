@@ -46,6 +46,14 @@ struct Thresholds {
     ai_threshold: f32,
 }
 
+/// The known-malware list as the running service loaded it.
+#[derive(Serialize)]
+struct KnownBadInfo {
+    loaded: bool,
+    entries: u64,
+    created: Option<String>,
+}
+
 #[derive(Serialize)]
 struct DashboardState {
     daemon: DaemonInfo,
@@ -62,6 +70,7 @@ struct DashboardState {
     model_path: String,
     model_present: bool,
     model_loaded: bool,
+    known_bad: KnownBadInfo,
     watched_dirs: Vec<String>,
     data_dir: String,
     events_log: String,
@@ -241,6 +250,14 @@ fn get_dashboard_state() -> Result<DashboardState, String> {
         canaries,
         model_present: cfg.model_path.is_file(),
         model_loaded: status.as_ref().map(|s| s.model_loaded).unwrap_or(false),
+        known_bad: KnownBadInfo {
+            loaded: status.as_ref().is_some_and(|s| s.known_bad_entries > 0),
+            entries: status.as_ref().map(|s| s.known_bad_entries).unwrap_or(0),
+            created: status
+                .as_ref()
+                .and_then(|s| s.known_bad_created)
+                .map(|d| d.to_rfc3339()),
+        },
         model_path: display(&cfg.model_path),
         watched_dirs,
         data_dir: display(&cfg.base_dir),
@@ -396,11 +413,12 @@ fn quick_scan(remote: bool) -> Result<QuickScanReport, String> {
         Err(std::sync::TryLockError::WouldBlock) => return Err(SCAN_BUSY.into()),
         Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
     };
-    let cfg = config();
+    let mut cfg = config();
     if service_scans(&cfg) {
         return scan_jobs::request_and_wait(&cfg, ScanKind::Quick, QUICK_SCAN_WAIT);
     }
     if writable(&cfg.quarantine_dir) && writable(&cfg.log_dir) {
+        engine::load_known_bad(&mut cfg);
         let scanner =
             BinaryAiScanner::load(&cfg.model_path).with_max_scan_bytes(cfg.max_ai_scan_bytes);
         return Ok(engine::run_quick_scan(&cfg, &scanner));

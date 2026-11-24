@@ -1,6 +1,7 @@
 use crate::bin_ai::{self, BinaryAiScanner};
 use crate::canary::{self, CanaryMsg};
 use crate::config::{AppConfig, Engine};
+use crate::known_bad;
 use crate::logger;
 use crate::platform;
 use crate::process_guard;
@@ -190,6 +191,9 @@ pub struct ScanLimits {
     /// Access unlocks. System folders macOS never opens (SIP) would otherwise show up in every
     /// report and no scan would ever read as clean.
     pub report_unreadable_under: &'static [&'static str],
+    /// Look every file up in the known-malware list (false: only the types the list holds,
+    /// because hashing every file on a whole disk would take hours).
+    pub hash_every_file: bool,
 }
 
 pub const QUICK_LIMITS: ScanLimits = ScanLimits {
@@ -197,12 +201,14 @@ pub const QUICK_LIMITS: ScanLimits = ScanLimits {
     max_files: QUICK_SCAN_MAX_FILES,
     report_unreadable_depth: 0,
     report_unreadable_under: &[],
+    hash_every_file: true,
 };
 pub const FULL_LIMITS: ScanLimits = ScanLimits {
     max_depth: 64,
     max_files: 20_000_000,
     report_unreadable_depth: 2,
     report_unreadable_under: &["/Users", "/home"],
+    hash_every_file: false,
 };
 const MAX_UNREADABLE_LISTED: usize = 50;
 
@@ -223,32 +229,49 @@ fn is_cloud_placeholder(_entry: &fs::DirEntry) -> bool {
 }
 
 /// Inspects one complete file with the enabled engines; detections are acted on and logged.
+/// `hash` = also look it up in the known-malware list, first: a match there is certain, so the
+/// file is dealt with before the engines that only estimate get to it.
 fn inspect_file(
     cfg: &AppConfig,
     scanner: &BinaryAiScanner,
     path: &Path,
     kind: FileKind,
+    hash: bool,
     telemetry: &Telemetry,
 ) -> Option<QuickScanFinding> {
+    let estimated = match kind {
+        FileKind::Archive => cfg.engine_enabled(Engine::ZipBomb),
+        FileKind::Binary => cfg.engine_enabled(Engine::BinAi),
+        FileKind::Other => false,
+    };
+    if !hash && !estimated {
+        return None;
+    }
+    telemetry.add_files_scanned(1);
+    if hash {
+        if let Some(detail) = known_bad::check_file(cfg, path) {
+            return Some(QuickScanFinding {
+                path: path.to_path_buf(),
+                threat_type: known_bad::THREAT_TYPE.to_string(),
+                detail,
+            });
+        }
+    }
     match kind {
-        FileKind::Archive if cfg.engine_enabled(Engine::ZipBomb) => {
-            telemetry.add_files_scanned(1);
+        FileKind::Archive if estimated => {
             zip_bomb::scan_and_respond(path, cfg).map(|threat| QuickScanFinding {
                 path: path.to_path_buf(),
                 threat_type: "ZIP_BOMB".to_string(),
                 detail: threat.summary(),
             })
         }
-        FileKind::Binary if cfg.engine_enabled(Engine::BinAi) => {
-            telemetry.add_files_scanned(1);
-            bin_ai::scan_and_respond(path, cfg, scanner)
-                .and_then(|outcome| outcome.detection)
-                .map(|detail| QuickScanFinding {
-                    path: path.to_path_buf(),
-                    threat_type: "MALWARE_AI".to_string(),
-                    detail,
-                })
-        }
+        FileKind::Binary if estimated => bin_ai::scan_and_respond(path, cfg, scanner)
+            .and_then(|outcome| outcome.detection)
+            .map(|detail| QuickScanFinding {
+                path: path.to_path_buf(),
+                threat_type: "MALWARE_AI".to_string(),
+                detail,
+            }),
         _ => None,
     }
 }
@@ -265,10 +288,46 @@ pub fn scan_path(cfg: &AppConfig, scanner: &BinaryAiScanner, path: &Path, teleme
         return;
     }
     let kind = classify_file(path);
-    if kind == FileKind::Other || !zip_bomb::wait_for_file_ready(path) {
+    let hash = cfg.known_bad_active();
+    // Programs and archives are parsed, so they must be complete. Every other file is only
+    // hashed: a half-written one simply does not match, and the write that completes it
+    // queues the file again (scan_worker), so there is no need to hold the queue for it.
+    if kind == FileKind::Other {
+        if !hash {
+            return;
+        }
+    } else if !zip_bomb::wait_for_file_ready(path) {
         return;
     }
-    inspect_file(cfg, scanner, path, kind, telemetry);
+    inspect_file(cfg, scanner, path, kind, hash, telemetry);
+}
+
+/// Loads the known-malware list into `cfg`. A list that is damaged, altered or not the one
+/// this build was made with is refused whole: protection carries on without it and the
+/// refusal is logged where the owner will see it.
+pub fn load_known_bad(cfg: &mut AppConfig) {
+    match cfg.load_known_bad() {
+        Ok(()) if cfg.known_bad.is_empty() => {
+            logger::info("known-malware list: none installed (the engine is idle)")
+        }
+        Ok(()) => logger::info(format!(
+            "known-malware list loaded: {}",
+            cfg.known_bad.summary()
+        )),
+        Err(e) => {
+            logger::error(format!("known-malware list refused: {e}"));
+            quarantine::record_event(
+                cfg,
+                ThreatEvent::new(
+                    "INTEGRITY",
+                    Severity::High,
+                    known_bad::FILE_NAME,
+                    "LIST_REFUSED: known-malware checks are off until it is replaced",
+                    format!("the known-malware list was refused: {e}"),
+                ),
+            );
+        }
+    }
 }
 
 /// One-shot recursive scan of existing files under `roots` (bounded in depth and file count).
@@ -305,6 +364,7 @@ pub fn scan_tree(
         ..QuickScanReport::default()
     };
     let scanned_before = telemetry.files_scanned.load(Ordering::Relaxed);
+    let hash_active = cfg.known_bad_active();
     let mut stack: Vec<(PathBuf, usize)> = roots.iter().map(|r| (r.clone(), 0)).collect();
     'walk: while let Some((dir, depth)) = stack.pop() {
         report.files_scanned = telemetry.files_scanned.load(Ordering::Relaxed) - scanned_before;
@@ -364,11 +424,14 @@ pub fn scan_tree(
                 break 'walk;
             }
             let file_kind = classify_file(&path);
-            if file_kind == FileKind::Other {
+            let hash = hash_active
+                && (limits.hash_every_file
+                    || known_bad::is_listed_type(&path, file_kind != FileKind::Other));
+            if file_kind == FileKind::Other && !hash {
                 continue;
             }
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                inspect_file(cfg, scanner, &path, file_kind, telemetry)
+                inspect_file(cfg, scanner, &path, file_kind, hash, telemetry)
             }));
             if let Ok(Some(finding)) = outcome {
                 report.findings.push(finding);
@@ -667,12 +730,13 @@ where
 }
 
 /// Runs every detector until `shutdown` is set. Used by both the service and `--console`.
-pub fn run(cfg: AppConfig, shutdown: Arc<AtomicBool>) {
+pub fn run(mut cfg: AppConfig, shutdown: Arc<AtomicBool>) {
     logger::init(&cfg.log_dir, cfg.interactive);
     panic::set_hook(Box::new(|info| logger::error(format!("panic: {info}"))));
     if let Err(e) = cfg.ensure_dirs() {
         logger::error(format!("startup: {e}"));
     }
+    load_known_bad(&mut cfg);
     logger::info(format!(
         "The Nex starting (base={}, events={}, quarantine={}, dry_run={}, model={})",
         cfg.base_dir.display(),
@@ -943,6 +1007,151 @@ mod tests {
         let report = quick_scan(&cfg, &scanner, &[watch], &telemetry);
         assert_eq!(report.files_scanned, 0);
         assert!(report.unreadable.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A config whose known-malware list holds exactly the files in `listed`.
+    fn cfg_with_list(root: &Path, listed: &[PathBuf]) -> AppConfig {
+        let mut cfg = AppConfig::for_base_dir(&root.join("base"));
+        cfg.ensure_dirs().unwrap();
+        let digests: Vec<_> = listed
+            .iter()
+            .map(|p| known_bad::hash_file(p, u64::MAX).unwrap())
+            .collect();
+        let list = root.join("list.bin");
+        known_bad::write_list(&list, &digests, 1_795_000_000).unwrap();
+        cfg.hash_list = Some(list);
+        cfg.load_known_bad().unwrap();
+        cfg
+    }
+
+    /// Events of one type, oldest first.
+    fn events_of(cfg: &AppConfig, kind: &str) -> Vec<ThreatEvent> {
+        quarantine::read_recent_events(&cfg.events_log, 1 << 20)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .filter(|e| e.threat_type == kind)
+            .collect()
+    }
+
+    fn set_engine(cfg: &AppConfig, engine: Engine, on: bool) {
+        let mut toggles = cfg.toggles.snapshot();
+        toggles.set(engine, on);
+        cfg.toggles.apply(toggles);
+    }
+
+    #[test]
+    fn a_listed_file_is_quarantined_and_dry_run_and_the_switch_are_respected() {
+        let root = temp_root("known");
+        let watch = root.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        let names = ["payroll.docm", "payroll_dry.docm", "payroll_off.docm"];
+        let listed: Vec<PathBuf> = names.iter().map(|n| watch.join(n)).collect();
+        for (i, path) in listed.iter().enumerate() {
+            fs::write(path, format!("harmless decoy {i}")).unwrap();
+        }
+        let clean = watch.join("meeting_notes.docm");
+        fs::write(&clean, b"ordinary file").unwrap();
+        let cfg = cfg_with_list(&root, &listed);
+        let scanner = BinaryAiScanner::heuristic_only();
+        let telemetry = Telemetry::default();
+
+        scan_path(&cfg, &scanner, &clean, &telemetry);
+        assert!(clean.exists());
+        assert!(events_of(&cfg, known_bad::THREAT_TYPE).is_empty());
+
+        scan_path(&cfg, &scanner, &listed[0], &telemetry);
+        assert!(!listed[0].exists(), "moved to quarantine");
+        let events = events_of(&cfg, known_bad::THREAT_TYPE);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, Severity::Critical);
+        assert!(events[0].action_taken.starts_with("QUARANTINED id="));
+        assert!(events[0]
+            .details
+            .starts_with("matched known-malware list (list of 2026-11-18, 3 entries) sha256="));
+        let id = events[0].quarantine_id().unwrap();
+        let meta = quarantine::load_meta(id, &cfg).unwrap();
+        assert_eq!(meta.original_path.file_name(), listed[0].file_name());
+        assert_eq!(meta.threat_type, known_bad::THREAT_TYPE);
+
+        set_engine(&cfg, Engine::DryRun, true);
+        scan_path(&cfg, &scanner, &listed[1], &telemetry);
+        assert!(listed[1].exists(), "dry run never moves a file");
+        let events = events_of(&cfg, known_bad::THREAT_TYPE);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].action_taken, "DRY_RUN: would quarantine");
+        set_engine(&cfg, Engine::DryRun, false);
+
+        set_engine(&cfg, Engine::KnownBad, false);
+        scan_path(&cfg, &scanner, &listed[2], &telemetry);
+        assert!(listed[2].exists(), "the engine is switched off");
+        assert_eq!(events_of(&cfg, known_bad::THREAT_TYPE).len(), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quick_scans_hash_every_file_and_full_scans_only_the_types_the_list_holds() {
+        let root = temp_root("known-scan");
+        let watch = root.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        let listed = vec![watch.join("listed.txt"), watch.join("listed.docm")];
+        fs::write(&listed[0], b"decoy with a type the list does not hold").unwrap();
+        fs::write(&listed[1], b"decoy document").unwrap();
+        fs::write(watch.join("clean.txt"), b"ordinary").unwrap();
+        let mut cfg = cfg_with_list(&root, &listed);
+        cfg.dry_run = true;
+        let scanner = BinaryAiScanner::heuristic_only();
+        let roots = [watch];
+        let scan = |limits: &ScanLimits| {
+            scan_tree(
+                &cfg,
+                &scanner,
+                &roots,
+                &Telemetry::default(),
+                limits,
+                &mut |_, _| true,
+            )
+        };
+
+        let quick = scan(&QUICK_LIMITS);
+        assert_eq!((quick.files_examined, quick.files_scanned), (3, 3));
+        assert_eq!(quick.findings.len(), 2);
+        assert!(quick
+            .findings
+            .iter()
+            .all(|f| f.threat_type == "KNOWN_MALWARE"
+                && f.detail.starts_with("matched known-malware list")));
+
+        let full = scan(&FULL_LIMITS);
+        assert_eq!((full.files_examined, full.files_scanned), (3, 1));
+        assert_eq!(full.findings.len(), 1);
+        assert_eq!(full.findings[0].path, listed[1]);
+        assert!(listed.iter().all(|p| p.exists()), "dry run");
+
+        set_engine(&cfg, Engine::KnownBad, false);
+        let off = scan(&QUICK_LIMITS);
+        assert_eq!((off.files_scanned, off.findings.len()), (0, 0));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_refused_list_is_logged_and_leaves_the_engine_idle() {
+        let root = temp_root("known-refused");
+        let mut cfg = AppConfig::for_base_dir(&root.join("base"));
+        cfg.ensure_dirs().unwrap();
+        let list = root.join("list.bin");
+        known_bad::write_list(&list, &[[9u8; 32]], 5).unwrap();
+        let mut bytes = fs::read(&list).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x01;
+        fs::write(&list, bytes).unwrap();
+        cfg.hash_list = Some(list);
+
+        load_known_bad(&mut cfg);
+        assert!(!cfg.known_bad_active());
+        let events = events_of(&cfg, "INTEGRITY");
+        assert_eq!(events.len(), 1);
+        assert!(events[0].details.contains("checksum mismatch"));
         let _ = fs::remove_dir_all(&root);
     }
 

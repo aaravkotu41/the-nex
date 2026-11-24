@@ -17,7 +17,7 @@ const PAGE_TITLES = {
   aegismesh: "AegisMesh",
 };
 const PAGE_SUBS = {
-  engines: "Four local engines. Nothing leaves this computer.",
+  engines: "Five local engines. Nothing leaves this computer.",
   activity: "Everything the engines saw and did, newest first.",
   quarantine: "Files that were stopped. Restore or delete them here.",
   canaries: "Decoy files that reveal ransomware the moment they change.",
@@ -33,13 +33,14 @@ function greeting() {
   return `${part} · ${now.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" })}`;
 }
 const TOGGLE_FIELDS = {
+  known_bad: "known_bad_enabled",
   zip_bomb: "zip_bomb_enabled",
   bin_ai: "bin_ai_enabled",
   process_guard: "process_guard_enabled",
   canary: "canary_enabled",
   dry_run: "dry_run",
 };
-const RED_TYPES = new Set(["ZIP_BOMB", "RANSOMWARE_CANARY", "RANSOMWARE_SUSPECT", "MALWARE_AI", "MALWARE_AI_PROCESS"]);
+const RED_TYPES = new Set(["ZIP_BOMB", "RANSOMWARE_CANARY", "RANSOMWARE_SUSPECT", "MALWARE_AI", "MALWARE_AI_PROCESS", "KNOWN_MALWARE"]);
 const AMBER_TYPES = new Set(["LOTL_SCRIPT"]);
 const GREEN_TYPES = new Set(["QUARANTINE_RESTORE"]);
 
@@ -63,6 +64,7 @@ const SEARCH_PAGES = new Set(["overview", "activity", "quarantine", "canaries"])
 const TYPE_NOTES = {
   ZIP_BOMB: "An archive built to expand far beyond its size and exhaust the disk or memory. It was caught before anything was extracted.",
   LOTL_SCRIPT: "A built-in tool (PowerShell, cmd, mshta, osascript…) was started the way malware uses it, for example with a hidden window, an encoded command or a download.",
+  KNOWN_MALWARE: "A file or program whose fingerprint (SHA-256) is on the known-malware list. This is a certain match, not a guess.",
   MALWARE_AI: "The on-device AI model scored this new program as malicious. The detail line lists what it noticed.",
   MALWARE_AI_PROCESS: "The on-device AI model scored the image of a running program as malicious.",
   RANSOMWARE_CANARY: "A decoy file that nothing should touch was changed: the typical first sign of ransomware encrypting files.",
@@ -387,6 +389,7 @@ function focusEngine(engine) {
 function buildEngineRows() {
   const rows = $("engine-rows");
   const engines = [
+    ["known_bad", "Known Malware List", "Matches files and programs against a list of known malware hashes."],
     ["zip_bomb", "Zip Bomb Guard", "Central-directory inspection before extraction: ratio, size, overlap and nesting."],
     ["bin_ai", "ONNX Binary AI", "Scores new PE and Mach-O files and processes with the local tract model."],
     ["process_guard", "LotL Process Guard", "Terminates script hosts and shells launched with download or obfuscation patterns."],
@@ -459,6 +462,8 @@ function renderDashboard(d) {
   badge.hidden = d.quarantined === 0;
 
   const t = d.thresholds;
+  const kb = d.known_bad || {};
+  $("card-known").textContent = kb.loaded ? `${count(kb.entries)} hashes · list of ${String(kb.created).slice(0, 10)}` : "no list installed";
   $("card-zip").textContent = `Ratio >${t.max_ratio}:1 · Depth ≤${t.max_depth} · Pre-extraction`;
   let model;
   if (d.model_loaded) model = "thenex_model.onnx · Offline · Local tract";
@@ -469,6 +474,7 @@ function renderDashboard(d) {
   $("card-canary").textContent = `${d.canaries_intact} decoy file${d.canaries_intact === 1 ? "" : "s"} intact · Desktop & Docs`;
   renderToggles(d.toggles, true);
 
+  fillThresholds("known_bad", kb.loaded ? [`${count(kb.entries)} hashes`, `list of ${String(kb.created).slice(0, 10)}`] : ["no list installed"]);
   fillThresholds("zip_bomb", [
     `ratio > ${t.max_ratio}:1 above ${t.min_ratio_check_mb} MB`,
     `size ≤ ${t.max_uncompressed_gb} GB`,
@@ -519,18 +525,20 @@ function renderDashboard(d) {
 /** 0-100: service 30, engines 40, AI model 10, canaries 10, blocking (not dry run) 10. */
 function protectionScore(d) {
   const t = d.toggles || {};
-  const enginesOn = ["zip_bomb_enabled", "bin_ai_enabled", "process_guard_enabled", "canary_enabled"].filter((k) => t[k]).length;
+  const enginesOn = ["known_bad_enabled", "zip_bomb_enabled", "bin_ai_enabled", "process_guard_enabled", "canary_enabled"].filter((k) => t[k]).length;
+  const kbLoaded = d.known_bad && d.known_bad.loaded;
   const canaries = (d.canaries || []).length;
   const canariesOk = canaries > 0 && d.canaries_intact === canaries;
   const items = [
     { ok: d.daemon.online, text: d.daemon.online ? "Background service running" : "Background service offline", goto: "settings" },
-    { ok: enginesOn === 4, text: `${enginesOn} of 4 engines on`, goto: "engines" },
+    { ok: enginesOn === 5, text: `${enginesOn} of 5 engines on`, goto: "engines" },
+    ...(t.known_bad_enabled ? [{ ok: Boolean(kbLoaded), text: kbLoaded ? "Known-malware list loaded" : "No known-malware list installed", goto: "engines" }] : []),
     { ok: Boolean(d.model_loaded), text: d.model_loaded ? "AI model loaded" : "AI on heuristic fallback", goto: "engines", focus: "bin_ai" },
     { ok: canariesOk, text: `${d.canaries_intact} of ${canaries} canaries intact`, goto: "canaries" },
     { ok: !d.dry_run, text: d.dry_run ? "Dry run: detecting only" : "Blocking threats", goto: "engines" },
   ];
   const score = d.daemon.online
-    ? Math.round(30 + (40 * enginesOn) / 4 + (d.model_loaded ? 10 : 0) + (canariesOk ? 10 : 0) + (d.dry_run ? 0 : 10))
+    ? Math.round(30 + (40 * enginesOn) / 5 + (d.model_loaded ? 10 : 0) + (canariesOk ? 10 : 0) + (d.dry_run ? 0 : 10))
     : 0;
   return { score, items };
 }
@@ -613,6 +621,7 @@ async function loadChart(force) {
 }
 
 const TYPE_COLOURS = {
+  KNOWN_MALWARE: "var(--ink)",
   ZIP_BOMB: "var(--red)",
   RANSOMWARE_CANARY: "var(--red)",
   RANSOMWARE_SUSPECT: "var(--red)",

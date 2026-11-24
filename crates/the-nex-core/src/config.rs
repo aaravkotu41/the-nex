@@ -1,3 +1,4 @@
+use crate::known_bad::{self, KnownBad};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -43,7 +44,8 @@ Modes:
                             @list.txt); prints JSON lines and never changes anything
   --restore <ID>          restore a quarantined file by its quarantine ID
   --delete <ID>             permanently delete a quarantined file by its quarantine ID
-  --set <ENGINE>=<on|off>   toggle zip_bomb, bin_ai, process_guard, canary or dry_run
+  --set <ENGINE>=<on|off>   toggle known_bad, zip_bomb, bin_ai, process_guard, canary or
+                            dry_run
   --help                    show this help
 
 Options:
@@ -51,11 +53,14 @@ Options:
   --watch-dir <PATH>        watch only PATH (recursively) and place canaries there
   --quarantine-dir <PATH>   use PATH for quarantined files and their .meta.json records
   --log-file <PATH>         write threat events (JSON lines) to PATH
+  --hash-list <PATH>        use PATH as the known-malware list (testing; only with --console,
+                            --quick-scan or --full-scan, never the installed service)
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Engine {
+    KnownBad,
     ZipBomb,
     BinAi,
     ProcessGuard,
@@ -64,7 +69,8 @@ pub enum Engine {
 }
 
 impl Engine {
-    pub const ALL: [Engine; 5] = [
+    pub const ALL: [Engine; 6] = [
+        Engine::KnownBad,
         Engine::ZipBomb,
         Engine::BinAi,
         Engine::ProcessGuard,
@@ -74,6 +80,9 @@ impl Engine {
 
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "known_bad" | "knownbad" | "known_malware" | "hash" | "hashes" | "hash_list" => {
+                Some(Engine::KnownBad)
+            }
             "zip_bomb" | "zip" | "zipbomb" => Some(Engine::ZipBomb),
             "bin_ai" | "ai" | "onnx" | "binary_ai" => Some(Engine::BinAi),
             "process_guard" | "lotl" | "process" => Some(Engine::ProcessGuard),
@@ -85,6 +94,7 @@ impl Engine {
 
     pub fn key(self) -> &'static str {
         match self {
+            Engine::KnownBad => "known_bad",
             Engine::ZipBomb => "zip_bomb",
             Engine::BinAi => "bin_ai",
             Engine::ProcessGuard => "process_guard",
@@ -127,6 +137,8 @@ pub struct CliArgs {
     pub watch_dir: Option<PathBuf>,
     pub quarantine_dir: Option<PathBuf>,
     pub log_file: Option<PathBuf>,
+    /// Console and one-shot scans only: a known-malware list to use instead of the shipped one.
+    pub hash_list: Option<PathBuf>,
 }
 
 fn take_value<I: Iterator<Item = OsString>>(iter: &mut I, flag: &str) -> Result<String, String> {
@@ -149,6 +161,7 @@ where
     let mut watch_dir: Option<PathBuf> = None;
     let mut quarantine_dir: Option<PathBuf> = None;
     let mut log_file: Option<PathBuf> = None;
+    let mut hash_list: Option<PathBuf> = None;
     let mut iter = args.into_iter();
 
     while let Some(raw) = iter.next() {
@@ -194,6 +207,10 @@ where
                 log_file = Some(PathBuf::from(take_value(&mut iter, "--log-file")?));
                 None
             }
+            "--hash-list" => {
+                hash_list = Some(PathBuf::from(take_value(&mut iter, "--hash-list")?));
+                None
+            }
             other => return Err(format!("unknown argument: {other}")),
         };
         if let Some(next) = selected {
@@ -208,7 +225,7 @@ where
     let path_overrides = quarantine_dir.is_some() || log_file.is_some();
     let mode = match mode {
         Some(m) => m,
-        None if scan_options || path_overrides => Mode::Console,
+        None if scan_options || path_overrides || hash_list.is_some() => Mode::Console,
         None => Mode::Service,
     };
     if scan_options && !matches!(mode, Mode::Console | Mode::QuickScan | Mode::FullScan) {
@@ -216,6 +233,11 @@ where
             "--dry-run and --watch-dir are only valid with --console, --quick-scan or --full-scan"
                 .into(),
         );
+    }
+    // The installed service takes no arguments, so it can only ever load the list its build
+    // was made with; a list named on a command line decides what gets quarantined.
+    if hash_list.is_some() && !matches!(mode, Mode::Console | Mode::QuickScan | Mode::FullScan) {
+        return Err("--hash-list is only valid with --console, --quick-scan or --full-scan".into());
     }
     if path_overrides && matches!(mode, Mode::Install | Mode::Uninstall | Mode::Help) {
         return Err("--quarantine-dir and --log-file cannot be combined with that mode".into());
@@ -226,6 +248,7 @@ where
         watch_dir,
         quarantine_dir,
         log_file,
+        hash_list,
     })
 }
 
@@ -233,6 +256,7 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RuntimeToggles {
+    pub known_bad_enabled: bool,
     pub zip_bomb_enabled: bool,
     pub bin_ai_enabled: bool,
     pub process_guard_enabled: bool,
@@ -243,6 +267,7 @@ pub struct RuntimeToggles {
 impl Default for RuntimeToggles {
     fn default() -> Self {
         Self {
+            known_bad_enabled: true,
             zip_bomb_enabled: true,
             bin_ai_enabled: true,
             process_guard_enabled: true,
@@ -255,6 +280,7 @@ impl Default for RuntimeToggles {
 impl RuntimeToggles {
     pub fn get(&self, engine: Engine) -> bool {
         match engine {
+            Engine::KnownBad => self.known_bad_enabled,
             Engine::ZipBomb => self.zip_bomb_enabled,
             Engine::BinAi => self.bin_ai_enabled,
             Engine::ProcessGuard => self.process_guard_enabled,
@@ -265,6 +291,7 @@ impl RuntimeToggles {
 
     pub fn set(&mut self, engine: Engine, enabled: bool) {
         match engine {
+            Engine::KnownBad => self.known_bad_enabled = enabled,
             Engine::ZipBomb => self.zip_bomb_enabled = enabled,
             Engine::BinAi => self.bin_ai_enabled = enabled,
             Engine::ProcessGuard => self.process_guard_enabled = enabled,
@@ -306,6 +333,7 @@ fn modified_nanos(path: &Path) -> u64 {
 /// Lock-free view of [`RuntimeToggles`] shared by every detector thread.
 #[derive(Debug)]
 pub struct LiveToggles {
+    known_bad: AtomicBool,
     zip_bomb: AtomicBool,
     bin_ai: AtomicBool,
     process_guard: AtomicBool,
@@ -317,6 +345,7 @@ pub struct LiveToggles {
 impl LiveToggles {
     pub fn new(toggles: RuntimeToggles) -> Self {
         let live = Self {
+            known_bad: AtomicBool::new(true),
             zip_bomb: AtomicBool::new(true),
             bin_ai: AtomicBool::new(true),
             process_guard: AtomicBool::new(true),
@@ -336,6 +365,8 @@ impl LiveToggles {
     }
 
     pub fn apply(&self, toggles: RuntimeToggles) {
+        self.known_bad
+            .store(toggles.known_bad_enabled, Ordering::SeqCst);
         self.zip_bomb
             .store(toggles.zip_bomb_enabled, Ordering::SeqCst);
         self.bin_ai.store(toggles.bin_ai_enabled, Ordering::SeqCst);
@@ -347,6 +378,7 @@ impl LiveToggles {
 
     pub fn snapshot(&self) -> RuntimeToggles {
         RuntimeToggles {
+            known_bad_enabled: self.known_bad.load(Ordering::SeqCst),
             zip_bomb_enabled: self.zip_bomb.load(Ordering::SeqCst),
             bin_ai_enabled: self.bin_ai.load(Ordering::SeqCst),
             process_guard_enabled: self.process_guard.load(Ordering::SeqCst),
@@ -411,6 +443,10 @@ pub struct AppConfig {
     pub ai_threshold: f32,
     pub max_ai_scan_bytes: u64,
     pub toggles: Arc<LiveToggles>,
+    /// `--hash-list`: use this list instead of the shipped one.
+    pub hash_list: Option<PathBuf>,
+    /// Empty until `load_known_bad` runs.
+    pub known_bad: Arc<KnownBad>,
 }
 
 impl AppConfig {
@@ -433,6 +469,8 @@ impl AppConfig {
             zip_limits: ZipLimits::default(),
             ai_threshold: AI_MALWARE_THRESHOLD,
             max_ai_scan_bytes: MAX_AI_SCAN_BYTES,
+            hash_list: None,
+            known_bad: Arc::new(KnownBad::empty()),
         }
     }
 
@@ -446,6 +484,7 @@ impl AppConfig {
         cfg.dry_run = args.dry_run;
         cfg.watch_dir = args.watch_dir.as_deref().map(absolutize);
         cfg.interactive = args.mode == Mode::Console;
+        cfg.hash_list = args.hash_list.as_deref().map(absolutize);
 
         if args.mode == Mode::Console && cfg.ensure_base_dirs().is_err() {
             if let Some(fallback) = user_fallback_base_dir() {
@@ -491,6 +530,8 @@ impl AppConfig {
         next.zip_limits = self.zip_limits;
         next.ai_threshold = self.ai_threshold;
         next.max_ai_scan_bytes = self.max_ai_scan_bytes;
+        next.hash_list = self.hash_list.clone();
+        next.known_bad = Arc::clone(&self.known_bad);
         next
     }
 
@@ -500,6 +541,36 @@ impl AppConfig {
 
     pub fn engine_enabled(&self, engine: Engine) -> bool {
         self.toggles.snapshot().get(engine)
+    }
+
+    /// True when files should be looked up in the known-malware list.
+    pub fn known_bad_active(&self) -> bool {
+        !self.known_bad.is_empty() && self.engine_enabled(Engine::KnownBad)
+    }
+
+    /// Loads the known-malware list: `--hash-list` when given, otherwise the list this build
+    /// was made with. A build made without one runs with an empty list, which is not an error.
+    /// On error the list stays empty and every other engine keeps working.
+    pub fn load_known_bad(&mut self) -> Result<(), String> {
+        let (path, loaded) = match &self.hash_list {
+            Some(path) => (path.clone(), KnownBad::load(path)),
+            None if !known_bad::ships_list() => return Ok(()),
+            None => {
+                // Never the working folder: a privileged one-shot scan started from a folder
+                // someone else can write to would map their file, and a mapped file can be
+                // rewritten after it has passed the checksum.
+                let path = resolve_data_file(&self.base_dir, known_bad::FILE_NAME, false);
+                let loaded = KnownBad::load_shipped(&path);
+                (path, loaded)
+            }
+        };
+        match loaded {
+            Ok(list) => {
+                self.known_bad = Arc::new(list);
+                Ok(())
+            }
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
     }
 
     fn ensure_base_dirs(&self) -> Result<(), String> {
@@ -524,19 +595,25 @@ impl AppConfig {
 }
 
 pub fn resolve_model_path(base_dir: &Path) -> PathBuf {
-    let primary = base_dir.join(MODEL_FILE_NAME);
+    resolve_data_file(base_dir, MODEL_FILE_NAME, true)
+}
+
+/// A file shipped with the app: in the data folder, the working folder (`working_dir`), or
+/// next to the program.
+fn resolve_data_file(base_dir: &Path, name: &str, working_dir: bool) -> PathBuf {
+    let primary = base_dir.join(name);
     let mut candidates = vec![primary.clone()];
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(MODEL_FILE_NAME));
+    if let Some(cwd) = std::env::current_dir().ok().filter(|_| working_dir) {
+        candidates.push(cwd.join(name));
     }
     if let Some(exe_dir) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
     {
-        candidates.push(exe_dir.join(MODEL_FILE_NAME));
+        candidates.push(exe_dir.join(name));
         // TheNex.app/Contents/MacOS/the-nex -> TheNex.app/Contents/Resources/
         #[cfg(target_os = "macos")]
-        candidates.push(exe_dir.join("..").join("Resources").join(MODEL_FILE_NAME));
+        candidates.push(exe_dir.join("..").join("Resources").join(name));
     }
     candidates
         .into_iter()
@@ -693,6 +770,67 @@ mod tests {
         );
         assert!(args(&["--scan-file"]).is_err());
         assert!(args(&["--scan-file", "a.exe", "--dry-run"]).is_err());
+    }
+
+    #[test]
+    fn hash_list_is_never_accepted_by_the_service_modes() {
+        let parsed = args(&["--console", "--hash-list", "test.bin"]).unwrap();
+        assert_eq!(parsed.hash_list, Some(PathBuf::from("test.bin")));
+        assert_eq!(
+            args(&["--hash-list", "test.bin"]).unwrap().mode,
+            Mode::Console
+        );
+        assert!(args(&["--quick-scan", "--hash-list", "test.bin"]).is_ok());
+        for mode in ["--install", "--uninstall", "--notifier", "--tray"] {
+            assert!(args(&[mode, "--hash-list", "test.bin"]).is_err(), "{mode}");
+        }
+        assert!(args(&["--set", "canary=on", "--hash-list", "test.bin"]).is_err());
+        assert_eq!(args(&[]).unwrap().hash_list, None, "the service takes none");
+        assert!(args(&["--console", "--hash-list"]).is_err());
+        assert_eq!(
+            args(&["--set", "known_bad=off"]).unwrap().mode,
+            Mode::Set(Engine::KnownBad, false)
+        );
+        assert_eq!(Engine::parse("known-malware"), Some(Engine::KnownBad));
+        for engine in Engine::ALL {
+            assert_eq!(Engine::parse(engine.key()), Some(engine));
+        }
+    }
+
+    #[test]
+    fn the_known_malware_switch_defaults_on_and_old_settings_still_load() {
+        assert!(RuntimeToggles::default().known_bad_enabled);
+        // settings.json written before the switch existed
+        let old: RuntimeToggles =
+            serde_json::from_str(r#"{"zip_bomb_enabled":false,"dry_run":true}"#).unwrap();
+        assert!(old.known_bad_enabled && !old.zip_bomb_enabled && old.dry_run);
+
+        let dir = std::env::temp_dir().join(format!("thenex-kb-cfg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut cfg = AppConfig::for_base_dir(&dir.join("base"));
+        assert!(!cfg.known_bad_active(), "no list loaded yet");
+
+        let list = dir.join("list.bin");
+        let digest = [7u8; 32];
+        known_bad::write_list(&list, &[digest], 5).unwrap();
+        cfg.hash_list = Some(list.clone());
+        cfg.load_known_bad().unwrap();
+        assert!(cfg.known_bad_active() && cfg.known_bad.contains(&digest));
+
+        let mut toggles = cfg.toggles.snapshot();
+        toggles.set(Engine::KnownBad, false);
+        cfg.toggles.apply(toggles);
+        assert!(!cfg.known_bad_active(), "switched off");
+
+        // A damaged list is an error and leaves the list already loaded in place.
+        let damaged = dir.join("damaged.bin");
+        fs::write(&damaged, b"not a list").unwrap();
+        cfg.hash_list = Some(damaged);
+        let err = cfg.load_known_bad().unwrap_err();
+        assert!(err.contains("damaged.bin"), "{err}");
+        assert!(cfg.known_bad.contains(&digest));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -3,6 +3,7 @@ pub mod bin_ai;
 pub mod canary;
 pub mod config;
 pub mod engine;
+pub mod known_bad;
 pub mod logger;
 pub mod notifier;
 pub mod platform;

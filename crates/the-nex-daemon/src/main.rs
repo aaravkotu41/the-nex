@@ -161,11 +161,12 @@ fn set_toggle(engine: Engine, enabled: bool, args: &CliArgs) -> ExitCode {
 }
 
 fn scan(args: &CliArgs, kind: engine::ScanKind) -> ExitCode {
-    let cfg = cli_config(args);
+    let mut cfg = cli_config(args);
     if let Err(e) = cfg.ensure_dirs() {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
     }
+    engine::load_known_bad(&mut cfg);
     let scanner = BinaryAiScanner::load(&cfg.model_path).with_max_scan_bytes(cfg.max_ai_scan_bytes);
     let telemetry = the_nex_core::status::Telemetry::default();
     let result = engine::run_scan(&cfg, &scanner, &telemetry, kind, &mut |_, _| true);

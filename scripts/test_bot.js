@@ -34,7 +34,7 @@ function fakeDoc() {
 }
 const flat = (n) => [n, ...n.children.flatMap(flat)];
 
-const DASH = { daemon: { online: true }, dry_run: false, toggles: { zip_bomb_enabled: true, bin_ai_enabled: true, process_guard_enabled: false, canary_enabled: true }, canaries: [1, 2, 3], canaries_intact: 3, model_loaded: true, quarantined: 2 };
+const DASH = { daemon: { online: true }, dry_run: false, toggles: { known_bad_enabled: true, zip_bomb_enabled: true, bin_ai_enabled: true, process_guard_enabled: false, canary_enabled: true }, canaries: [1, 2, 3], canaries_intact: 3, model_loaded: true, quarantined: 2 };
 const EVENT = { id: "e1", timestamp: new Date(Date.now() - 5 * 60000).toISOString(), threat_type: "ZIP_BOMB", severity: "HIGH", target: "C:\\Users\\a\\Downloads\\bomb.zip", details: "ratio 900:1", action_taken: "QUARANTINED" };
 const QUAR = [{ id: "q1", original_path: "/home/a/old.exe", threat_type: "MALWARE_AI", quarantined_at: "2026-01-01T00:00:00Z" }, { id: "q2", original_path: "/home/a/new.exe", threat_type: "LOTL_SCRIPT", quarantined_at: "2026-02-01T00:00:00Z" }];
 function liveCall(over = {}) {
@@ -56,6 +56,8 @@ async function ask(q, over) {
   console.log("intents");
   let r = await ask("Am I protected?");
   check("protected: reads dashboard", r.call.calls.join() === "get_dashboard_state" && /Mostly/.test(text(r.reply)) && /Process guard/.test(text(r.reply)) && /3 of 3 intact/.test(text(r.reply)));
+  r = await ask("am i protected", { get_dashboard_state: { ...DASH, toggles: { ...DASH.toggles, known_bad_enabled: false } } });
+  check("protected: names the Known malware list when it is off", /Known malware list/.test(text(r.reply)) && /4 of 5 on|3 of 5 on/.test(text(r.reply)));
   r = await ask("am i protected", { get_dashboard_state: { ...DASH, dry_run: true } });
   check("protected: dry run is called out", /Dry run/.test(text(r.reply)));
   r = await ask("is it safe?", { get_dashboard_state: { daemon: { online: false } } });
@@ -68,7 +70,7 @@ async function ask(q, over) {
   check("quarantine: count + newest", /2 files/.test(text(r.reply)) && /new\.exe/.test(text(r.reply)) && !/old\.exe/.test(text(r.reply)));
   r = await ask("Explain ZIP_BOMB");
   check("explain ZIP_BOMB (no live call)", r.call.calls.length === 0 && /expand far beyond/.test(text(r.reply)));
-  for (const t of ["MALWARE_AI", "LOTL_SCRIPT", "RANSOMWARE_CANARY"]) {
+  for (const t of ["KNOWN_MALWARE", "MALWARE_AI", "LOTL_SCRIPT", "RANSOMWARE_CANARY"]) {
     r = await ask(`explain ${t.toLowerCase().replace("_", " ")}`);
     check(`explain ${t} via free text`, text(r.reply).includes(core.TYPE_NOTES[t].slice(0, 25)));
   }

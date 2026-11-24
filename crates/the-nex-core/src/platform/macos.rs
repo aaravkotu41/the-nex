@@ -1,5 +1,6 @@
 use crate::canary;
 use crate::config::{self, AppConfig};
+use crate::known_bad;
 use crate::logger;
 use crate::quarantine;
 use std::collections::BTreeSet;
@@ -230,9 +231,9 @@ pub fn send_desktop_notification(title: &str, body: &str) {
     }
 }
 
-fn has_apple_anchored_signature(path: &Path) -> bool {
+fn satisfies_requirement(path: &Path, requirement: &str) -> bool {
     Command::new("/usr/bin/codesign")
-        .args(["--verify", "--strict", "-R=anchor apple generic"])
+        .args(["--verify", "--strict", requirement])
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -240,6 +241,15 @@ fn has_apple_anchored_signature(path: &Path) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+fn has_apple_anchored_signature(path: &Path) -> bool {
+    satisfies_requirement(path, "-R=anchor apple generic")
+}
+
+/// Signed by Apple itself (macOS and Apple's own apps), not merely by a Developer ID.
+pub fn is_os_vendor_signed(path: &Path) -> bool {
+    satisfies_requirement(path, "-R=anchor apple")
 }
 
 /// SIP-protected system paths, or a valid signature chaining to Apple (Apple / Developer ID).
@@ -451,6 +461,20 @@ fn install_engine_copy(exe: &Path, cfg: &AppConfig) -> Result<PathBuf, String> {
         &cfg.base_dir.join(config::MODEL_FILE_NAME),
         0o644,
     )?;
+    // The known-malware list the app shipped with, if any. The service checks it against the
+    // checksum compiled into it, so a list swapped inside the app is refused at startup; a list
+    // left over from an older version is removed for the same reason.
+    let list = cfg.base_dir.join(known_bad::FILE_NAME);
+    let shipped = exe
+        .parent()
+        .and_then(Path::parent)
+        .map(|contents| contents.join("Resources").join(known_bad::FILE_NAME));
+    match shipped.and_then(|path| fs::File::open(path).ok()) {
+        Some(mut source) => write_root_file(&mut source, &list, 0o644)?,
+        None => {
+            let _ = fs::remove_file(&list);
+        }
+    }
     require_root_owned_chain(&engine)?;
     Ok(engine)
 }

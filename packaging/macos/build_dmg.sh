@@ -42,6 +42,12 @@ cp "${PACKAGING}/Info.plist" "${APP}/Contents/Info.plist"
 cp "${ROOT}/target/release/the-nex-gui" "${APP}/Contents/MacOS/the-nex-gui"
 cp "${ROOT}/target/release/the-nex" "${APP}/Contents/MacOS/the-nex"
 cp "${MODEL}" "${APP}/Contents/Resources/thenex_model.onnx"
+# Known-malware list: shipped only when one was built and pinned into this build
+# (scripts/fetch_hash_list.py --pin); the service refuses any other list.
+if [[ -f "${ROOT}/known_bad.bin" ]] && ! grep -qi '^none' "${ROOT}/crates/the-nex-core/known_bad.sha256"; then
+  cp "${ROOT}/known_bad.bin" "${APP}/Contents/Resources/known_bad.bin"
+  chmod 644 "${APP}/Contents/Resources/known_bad.bin"
+fi
 cp "${ICONS}/icon.icns" "${APP}/Contents/Resources/icon.icns"
 cp "${PACKAGING}/install_mac.sh" "${PACKAGING}/uninstall_mac.sh" "${APP}/Contents/Resources/"
 chmod 755 "${APP}/Contents/MacOS/the-nex-gui" \

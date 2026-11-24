@@ -114,6 +114,9 @@ Section "The Nex" SecMain
   File "${SRCDIR}\the-nex.exe"
   File "${SRCDIR}\the-nex-gui.exe"
   File "${SRCDIR}\thenex_model.onnx"
+  ; Known-malware list: present only in builds made with one (the service refuses any other).
+  Delete "$INSTDIR\known_bad.bin"
+  File /nonfatal "${SRCDIR}\known_bad.bin"
   File "${SRCDIR}\icon.ico"
   WriteUninstaller "$INSTDIR\${UNINSTALLER}"
 
@@ -172,6 +175,7 @@ Section "Uninstall"
   Delete "$INSTDIR\the-nex.exe"
   Delete "$INSTDIR\the-nex-gui.exe"
   Delete "$INSTDIR\thenex_model.onnx"
+  Delete "$INSTDIR\known_bad.bin"
   Delete "$INSTDIR\icon.ico"
   Delete "$INSTDIR\The Nex Tray.lnk"
   Delete "$INSTDIR\${UNINSTALLER}"

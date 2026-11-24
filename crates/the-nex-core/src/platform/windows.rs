@@ -407,6 +407,14 @@ pub fn is_trusted_binary(path: &Path) -> bool {
     is_in_trusted_root(path) || has_valid_authenticode(path)
 }
 
+/// shortcut: always false, so a Microsoft-signed file outside the Windows folders is not
+/// spared by a known-malware match (the Windows folders themselves are alert-only by path,
+/// see ai_policy). Upgrade by checking the signer's chain for the Microsoft root once a
+/// Windows machine is available to test it on.
+pub fn is_os_vendor_signed(_path: &Path) -> bool {
+    false
+}
+
 /// Windows command-line quoting for one argument (CommandLineToArgvW rules).
 fn quote_arg(arg: &str) -> String {
     if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
@@ -897,7 +905,12 @@ mod tray {
     const CMD_EXIT: usize = 1003;
     /// Resource ID of the icon embedded into the-nex.exe by the daemon's build script.
     const ICON_RESOURCE_ID: usize = 1;
-    const ALERT_TYPES: [&str; 3] = ["ZIP_BOMB", "LOTL_SCRIPT", "RANSOMWARE_CANARY"];
+    const ALERT_TYPES: [&str; 4] = [
+        "KNOWN_MALWARE",
+        "ZIP_BOMB",
+        "LOTL_SCRIPT",
+        "RANSOMWARE_CANARY",
+    ];
     const MAX_TOASTS_PER_POLL: usize = 3;
 
     static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);

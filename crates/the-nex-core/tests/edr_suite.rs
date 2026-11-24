@@ -593,3 +593,62 @@ fn bench_ai_hot_path() {
         t.elapsed().as_secs_f64() * 1e6 / 20_000.0
     );
 }
+
+/// Numbers quoted in README ("Known-malware list"). Build a list first, then:
+///   python scripts/fetch_hash_list.py --synthetic 1000000 --seed 1 --out /tmp/kb.bin
+///   THENEX_BENCH_LIST=/tmp/kb.bin cargo test --release -p the-nex-core --test edr_suite \
+///     bench_known_bad -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_known_bad() {
+    use std::time::Instant;
+    use the_nex_core::known_bad::{self, KnownBad};
+    let list_path = std::env::var_os("THENEX_BENCH_LIST").expect("set THENEX_BENCH_LIST");
+    let list_path = Path::new(&list_path);
+    println!(
+        "list file: {} bytes",
+        fs::metadata(list_path).unwrap().len()
+    );
+
+    let t = Instant::now();
+    let list = KnownBad::load(list_path).unwrap();
+    println!(
+        "load + verify (checksum and order): {:.1} ms for {} entries",
+        t.elapsed().as_secs_f64() * 1e3,
+        list.len()
+    );
+
+    // Misses (every real lookup of a clean file) over pseudo-random digests.
+    let n = 1_000_000u32;
+    let mut digest = [0u8; 32];
+    let t = Instant::now();
+    let mut hits = 0u32;
+    for i in 0..n {
+        digest[..4].copy_from_slice(&i.wrapping_mul(2_654_435_761).to_le_bytes());
+        digest[4..8].copy_from_slice(&i.to_be_bytes());
+        hits += u32::from(std::hint::black_box(list.contains(&digest)));
+    }
+    println!(
+        "lookup: {:.0} ns each ({hits} chance hits in {n})",
+        t.elapsed().as_secs_f64() * 1e9 / f64::from(n)
+    );
+
+    let dir = TempDir::new("bench-kb");
+    let big = dir.path().join("100mb.bin");
+    let block: Vec<u8> = (0..1024 * 1024).map(|i| (i * 31 % 251) as u8).collect();
+    let mut file = fs::File::create(&big).unwrap();
+    for _ in 0..100 {
+        file.write_all(&block).unwrap();
+    }
+    file.sync_all().unwrap();
+    drop(file);
+    for round in ["first", "second"] {
+        let t = Instant::now();
+        let digest = known_bad::hash_file(&big, u64::MAX).unwrap();
+        println!(
+            "hash 100 MB ({round} read): {:.0} ms, on the list: {}",
+            t.elapsed().as_secs_f64() * 1e3,
+            list.contains(&digest)
+        );
+    }
+}

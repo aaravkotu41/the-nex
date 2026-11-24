@@ -1,6 +1,8 @@
 /target
 /test_sandbox/
 /thenex_live_sandbox/
+# Known-malware list: built by scripts/fetch_hash_list.py, never committed
+/known_bad.bin
 __pycache__/
 *.pyc
 # On-device vision runtime, fetched and verified by scripts/fetch_vision_models.py
