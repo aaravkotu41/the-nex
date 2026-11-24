@@ -181,9 +181,40 @@
     return state.defaults.profiles[index >= 0 ? index : 0];
   }
 
+  // Saved rhythms: any number, named; one is in use (or none: the wearable's default rhythm).
+  const rhythms = {
+    list: (store.get("aegismesh.rhythms") || []).filter((r) => r && r.id && r.profile),
+    active: store.get("aegismesh.rhythm") || null,
+  };
+  // Earlier versions kept a single calibrated profile: keep it as a saved rhythm.
+  if (!rhythms.list.length && state.custom && state.custom.profile) {
+    rhythms.list.push({ id: `r${Date.now()}`, name: state.custom.profile.name || "My rhythm", profile: state.custom.profile, created: Date.now() });
+    rhythms.active = rhythms.list[0].id;
+    store.set("aegismesh.rhythms", rhythms.list);
+    store.set("aegismesh.rhythm", rhythms.active);
+    store.set("aegismesh.profile", null);
+  }
+
+  function saveRhythms() {
+    store.set("aegismesh.rhythms", rhythms.list);
+    store.set("aegismesh.rhythm", rhythms.active);
+  }
+
+  function activeRhythm() {
+    return rhythms.list.find((r) => r.id === rhythms.active) || null;
+  }
+
   function currentProfile() {
-    if (state.custom && state.custom.form === state.form && state.custom.profile) return state.custom.profile;
-    return defaultProfile(state.form);
+    const mine = activeRhythm();
+    return mine ? mine.profile : defaultProfile(state.form);
+  }
+
+  function useRhythm(id) {
+    rhythms.active = id;
+    saveRhythms();
+    state.profile = currentProfile();
+    renderProfile();
+    renderTriggers();
   }
 
   function renderForms() {
@@ -223,9 +254,9 @@
       bar += '<span class="tap"></span>';
       for (const ratio of p.ratios) bar += `<span class="gap" style="width:${(ratio * total * scale).toFixed(1)}px"></span><span class="tap"></span>`;
     }
-    const custom = state.custom && state.custom.form === state.form;
+    const custom = Boolean(activeRhythm());
     $("profile").innerHTML = `
-      <div class="name"><span>${esc(p.name)}</span><span class="muted">${custom ? "calibrated" : "default"}</span></div>
+      <div class="name"><span>${esc(p.name)}</span><span class="muted">${custom ? "yours, saved" : "default"}</span></div>
       <div class="rhythm-bar" aria-label="Rhythm: ${p.ratios.length + 1} taps, performed ${p.repeats} time(s)">${bar}</div>
       <div class="facts">
         <span><b>${p.ratios.length + 1}</b> taps</span>
@@ -387,23 +418,21 @@
       name: $("cal-name").value || "My rhythm",
       repeats: Number($("cal-repeats").value),
     });
-    state.custom = { form: state.form, profile };
-    store.set("aegismesh.profile", state.custom);
-    state.profile = profile;
+    const same = rhythms.list.find((r) => r.name.toLowerCase() === profile.name.toLowerCase());
+    const entry = { id: same ? same.id : `r${Date.now()}`, name: profile.name, profile, created: Date.now() };
+    rhythms.list = [...rhythms.list.filter((r) => r !== same), entry];
     state.samples = [];
+    $("cal-name").value = "";
     updateCalibration();
-    renderProfile();
-    toast(`Profile "${profile.name}" built. Run the benchmark to see how robust it is.`);
+    useRhythm(entry.id);
+    toast(`Saved "${profile.name}" in AegisMesh${same ? " (replacing the old one)" : ""}. It is now the rhythm in use; run the benchmark to see how robust it is.`);
   }
 
   function resetProfile() {
-    state.custom = null;
-    store.set("aegismesh.profile", null);
     state.samples = [];
-    state.profile = currentProfile();
     updateCalibration();
-    renderProfile();
-    toast("Back to the default rhythm for this form factor.");
+    useRhythm(null);
+    toast("Using the default rhythm for this wearable. Your saved rhythms are kept in My SOS triggers.");
   }
 
   // ---------------------------------------------------------------- camera
@@ -1062,17 +1091,24 @@
 
   function loadCustoms() {
     const saved = store.get("aegismesh.signs");
-    return Array.isArray(saved) ? saved.filter((m) => m && m.name && Array.isArray(m.pos) && Array.isArray(m.neg)) : [];
+    return Array.isArray(saved)
+      ? saved.filter((m) => m && m.name && (m.kind === "move" ? Array.isArray(m.templates) : Array.isArray(m.pos) && Array.isArray(m.neg)))
+      : [];
   }
+
+  /** Saved signs that are switched on (plus `also`, e.g. the one being tested). */
+  const activeCustoms = (also = null) => signs.customs.filter((m) => m.enabled !== false || m.name === also);
 
   function saveCustoms() {
     store.set("aegismesh.signs", signs.customs);
     store.set("aegismesh.builtins", signs.enabled);
     if (signs.watcher) {
       signs.watcher.enabled = new Set(signs.enabled);
-      signs.watcher.setCustoms(signs.customs);
+      signs.watcher.setCustoms(activeCustoms(signs.test && signs.test.target.startsWith("custom:") ? signs.test.target.slice(7) : null));
     }
   }
+
+  const KIND_LABEL = { hand: "hand sign", face: "expression", move: "movement" };
 
   function testBadge(key) {
     const r = signs.results[key];
@@ -1098,18 +1134,24 @@
     });
     for (const m of signs.customs) {
       const key = `custom:${m.name}`;
+      const move = m.kind === "move";
       const advice = m.quality === "poor"
-        ? " Too close to your ordinary pose or taught while moving: teach it again, holding it still, or pick a clearer sign."
+        ? (move
+          ? " The recordings differ a lot, or the movement is small: teach it again, the same way each time and a bit bigger."
+          : " Too close to your ordinary pose or taught while moving: teach it again, holding it still, or pick a clearer sign.")
         : m.quality === "fair" ? " Usable; more examples make it more reliable." : "";
-      rows.push(`<li class="${testing === key ? "testing" : ""}" data-key="${esc(key)}">
-        <span class="sign-toggle"><span><b>${esc(m.name)}</b><small>Hold it for about a second. Quality: <em class="q-${esc(m.quality)}">${esc(m.quality)}</em>.${esc(advice)}</small>
+      const how = move ? "Do the movement once, about the size and speed you taught." : "Hold it for about a second.";
+      const on = m.enabled !== false;
+      rows.push(`<li class="${on ? "" : "off"}${testing === key ? " testing" : ""}" data-key="${esc(key)}">
+        <span class="sign-toggle"><input type="checkbox" data-custom="${esc(m.name)}" ${on ? "checked" : ""} aria-label="Watch for ${esc(m.name)}"><span><b>${esc(m.name)}</b><small>${how} Quality: <em class="q-${esc(m.quality)}">${esc(m.quality)}</em>.${esc(advice)}</small>
           <span class="sign-links"><button class="link" data-improve="${esc(m.name)}" title="Teach more examples of this sign, e.g. from another angle">add examples</button><button class="link" data-reteach="${esc(m.name)}" title="Replace this sign with a fresh one">teach again</button><button class="link" data-forget="${esc(m.name)}" title="Forget this sign">forget</button></span></span></span>
-        <span class="tag">${m.kind === "hand" ? "hand" : "face"} · yours</span>
+        <span class="tag">${KIND_LABEL[m.kind] || m.kind} · yours</span>
         <div class="sign-actions">${testBadge(key)}<button class="btn small" data-test="${esc(key)}">Test</button></div>
         <span class="meter"><span style="width:0%"></span></span>
       </li>`);
     }
     $("sign-list").innerHTML = rows.join("");
+    renderTriggers();
   }
 
   // Built-in signs: progress through their steps. Your signs: how close the current frame is
@@ -1158,7 +1200,7 @@
     signs.lastTip = 0;
     signs.fpsFrames = 0;
     signs.fpsSince = performance.now();
-    signs.watcher = new window.AegisSigns.SignWatcher({ enabled: signs.enabled, customs: signs.customs });
+    signs.watcher = new window.AegisSigns.SignWatcher({ enabled: signs.enabled, customs: activeCustoms() });
     const video = $("sign-video");
     video.srcObject = stream;
     await video.play();
@@ -1276,8 +1318,8 @@
     return b ? { name: b.name, kind: b.kind } : null;
   }
 
-  function freshWatcher(extra = []) {
-    signs.watcher = new window.AegisSigns.SignWatcher({ enabled: [...new Set([...signs.enabled, ...extra])], customs: signs.customs });
+  function freshWatcher(extra = [], alsoCustom = null) {
+    signs.watcher = new window.AegisSigns.SignWatcher({ enabled: [...new Set([...signs.enabled, ...extra])], customs: activeCustoms(alsoCustom) });
   }
 
   async function startSignTest(target) {
@@ -1286,11 +1328,11 @@
     if (!signs.stream) await startSigns();
     // A fresh watcher, so the cool-down of an earlier trigger cannot hide this one; the tested
     // sign counts even if it is switched off for normal watching.
-    freshWatcher(target.startsWith("custom:") ? [] : [target]);
+    freshWatcher(target.startsWith("custom:") ? [] : [target], target.startsWith("custom:") ? target.slice(7) : null);
     signs.test = { target, ...info, run: window.AegisSigns.makeSignTest(target, info.kind, { timeoutMs: 10000 }) };
     renderSignList();
     $("sign-test").innerHTML = `<div class="box testing"><div class="title">Testing "${esc(info.name)}"</div>
-      <div class="detail">Make the ${info.kind === "face" ? "expression" : "sign"} now, the way you would in an emergency. You have 10 seconds. This is a test: no SOS is sent.</div></div>`;
+      <div class="detail">${info.kind === "move" ? "Do the movement now, about the size and speed you taught" : `Make the ${info.kind === "face" ? "expression" : "sign"} now`}, the way you would in an emergency. You have 10 seconds. This is a test: no SOS is sent.</div></div>`;
     hud(`Test: make "${info.name}" now`);
   }
 
@@ -1314,7 +1356,7 @@
     const secs = (r.ms / 1000).toFixed(1);
     $("sign-test").innerHTML = r.passed
       ? `<div class="box ok"><div class="title">✓ "${esc(T.name)}" recognised in ${secs} s</div>
-          <div class="detail">It works with this camera and light. When watching for real, this ${T.kind === "face" ? "expression" : "sign"} sends the silent SOS. (Test only: nothing was sent.)</div></div>`
+          <div class="detail">It works with this camera and light. When watching for real, this ${KIND_LABEL[T.kind] || "sign"} sends the silent SOS. (Test only: nothing was sent.)</div></div>`
       : `<div class="box no"><div class="title">✗ "${esc(T.name)}" not recognised in ${secs} s</div>
           <div class="detail">${esc(r.advice)} (Test only: nothing was sent.)</div></div>`;
     const item = document.createElement("li");
@@ -1429,8 +1471,38 @@
   // into and out of the sign is what makes a taught sign blurry and unreliable.
   const TEACH_PHASES = { ready: 3000, sign: 3000, release: 800, neutral: 3000 };
 
+  // A movement is taught by doing it three times, with a short still break between.
+  const MOVE_PHASES = { ready: 3000, move: 2600, gap: 1400 };
+  const MOVE_ROUNDS = 3;
+
+  function collectMovement(frame, now) {
+    const T = signs.teaching;
+    const S = window.AegisSigns;
+    if (T.phase === "move" && frame.hands[0]) T.recordings[T.round].push({ t: now, ...S.palmPoint(frame.hands[0].landmarks, frame.aspect) });
+    const left = Math.max(0, Math.ceil((T.until - now) / 1000));
+    if (T.phase === "ready") hud(`Get ready: do "${T.name}" in ${left}… (3 times, with a pause between)`);
+    else if (T.phase === "move") hud(`Do "${T.name}" now · ${left} s · ${T.round + 1} of ${MOVE_ROUNDS}`);
+    else hud(`Stop and hold still… ${T.round + 1} of ${MOVE_ROUNDS} done`);
+    if (now < T.until) return;
+    if (T.phase === "move") {
+      if (T.round + 1 >= MOVE_ROUNDS) {
+        finishTeaching();
+        return;
+      }
+      T.phase = "gap";
+    } else {
+      if (T.phase === "gap") T.round += 1;
+      T.phase = "move";
+    }
+    T.until = now + MOVE_PHASES[T.phase];
+  }
+
   function collectTeaching(frame, now) {
     const T = signs.teaching;
+    if (T.kind === "move") {
+      collectMovement(frame, now);
+      return;
+    }
     const what = T.kind === "hand" ? "hand" : "face";
     const thing = T.kind === "hand" ? "sign" : "expression";
     if (T.phase === "sign" || T.phase === "neutral") {
@@ -1466,7 +1538,11 @@
     signs.test = null;
     $("sign-test").innerHTML = "";
     const replacing = !improving && signs.customs.some((m) => m.name.toLowerCase() === name.toLowerCase());
-    signs.teaching = { name, kind, improving: Boolean(improving), replacing, phase: "ready", samples: [], neutral: [], until: performance.now() + TEACH_PHASES.ready };
+    signs.teaching = {
+      name, kind, improving: Boolean(improving), replacing, phase: "ready", samples: [], neutral: [],
+      round: 0, recordings: Array.from({ length: MOVE_ROUNDS }, () => []),
+      until: performance.now() + (kind === "move" ? MOVE_PHASES.ready : TEACH_PHASES.ready),
+    };
     $("teach-start").disabled = true;
     renderSignList();
   }
@@ -1476,8 +1552,10 @@
     signs.teaching = null;
     $("teach-start").disabled = false;
     const S = window.AegisSigns;
-    const what = T.kind === "hand" ? "hand" : "face";
-    const unseen = T.samples.length < 8 ? "while you held it" : T.neutral.length < 8 ? "while you relaxed" : null;
+    const what = T.kind === "face" ? "face" : "hand";
+    const unseen = T.kind === "move"
+      ? (T.recordings.filter((r) => r.length >= 8).length < 2 ? "while you moved it" : null)
+      : T.samples.length < 8 ? "while you held it" : T.neutral.length < 8 ? "while you relaxed" : null;
     if (unseen) {
       hud("");
       toast(`Could not learn "${T.name}": the camera saw your ${what} in too few frames ${unseen}. Keep your whole ${what} in view, about an arm's length away, in good light, and try again.`, true);
@@ -1486,14 +1564,16 @@
     }
     let model;
     try {
-      if (T.improving) {
-        const old = signs.customs.find((m) => m.name === T.name);
-        model = S.improveSign(old, { samples: T.samples, neutral: T.neutral });
-        signs.customs = signs.customs.map((m) => (m.name === T.name ? model : m));
+      const old = T.improving ? signs.customs.find((m) => m.name === T.name) : null;
+      if (T.kind === "move") {
+        model = S.trainMovement({ name: T.name, recordings: T.recordings, base: old });
       } else {
-        model = S.trainSign({ name: T.name, kind: T.kind, samples: T.samples, neutral: T.neutral });
-        signs.customs = [...signs.customs.filter((m) => m.name.toLowerCase() !== model.name.toLowerCase()), model];
+        model = old ? S.improveSign(old, { samples: T.samples, neutral: T.neutral }) : S.trainSign({ name: T.name, kind: T.kind, samples: T.samples, neutral: T.neutral });
       }
+      if (old && old.enabled === false) model.enabled = false;
+      signs.customs = old
+        ? signs.customs.map((m) => (m.name === T.name ? model : m))
+        : [...signs.customs.filter((m) => m.name.toLowerCase() !== model.name.toLowerCase()), model];
     } catch (error) {
       hud("");
       toast(`Could not learn "${T.name}": ${errorText(error)}`, true);
@@ -1506,15 +1586,193 @@
     renderSignList();
     if (!T.improving) $("teach-name").value = "";
     const verb = T.improving ? "Improved" : T.replacing ? "Re-taught" : "Learned";
-    const advice = model.quality === "poor"
-      ? "It is too close to your ordinary pose: try a more distinctive sign, or add examples."
-      : model.quality === "fair" ? "Usable; adding examples from another angle makes it more reliable." : "It stands clearly apart from your ordinary pose.";
-    toast(`${verb} "${model.name}" (${model.quality}). ${advice} Now testing it…`, model.quality === "poor");
+    const advice = model.kind === "move"
+      ? (model.quality === "poor"
+        ? "The three times differed a lot: teach it again, the same way each time."
+        : model.quality === "fair" ? "Usable; adding examples makes it more reliable." : "The three times matched well.")
+      : model.quality === "poor"
+        ? "It is too close to your ordinary pose: try a more distinctive sign, or add examples."
+        : model.quality === "fair" ? "Usable; adding examples from another angle makes it more reliable." : "It stands clearly apart from your ordinary pose.";
+    toast(`${verb} "${model.name}" and saved it in AegisMesh (${model.quality}). ${advice} Now testing it…`, model.quality === "poor");
     hud(`${verb} "${model.name}". Relax, then make it again to test it…`);
     // Check it straight away, the same way an emergency would use it.
     setTimeout(() => {
       if (signs.stream && !signs.teaching && !signs.test) startSignTest(`custom:${model.name}`).catch((error) => toast(errorText(error), true));
     }, 1800);
+  }
+
+  // ---------------------------------------------------------------- my SOS triggers
+
+  const TRIGGER_ICON = {
+    rhythm: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.5"/><path d="M12 5.5a6.5 6.5 0 0 1 6.5 6.5M5.5 12A6.5 6.5 0 0 1 12 5.5M12 2a10 10 0 0 1 10 10M2 12A10 10 0 0 1 12 2"/></svg>',
+    move: '<svg viewBox="0 0 24 24"><path d="M2.5 12c2-4.5 4-4.5 6 0s4 4.5 6 0 4-4.5 7 0"/><path d="M18 4.5l2.5 2.5L18 9.5M6 14.5 3.5 17 6 19.5"/></svg>',
+    face: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8.5 14.5c1 1.2 2.2 1.8 3.5 1.8s2.5-.6 3.5-1.8M9 9.5h.01M15 9.5h.01"/></svg>',
+    hand: '<svg viewBox="0 0 24 24"><path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V11m0-6a1.5 1.5 0 0 1 3 0v6m0-4.5a1.5 1.5 0 0 1 3 0V14c0 3.9-2.6 7-6.4 7-3 0-4.6-1.6-5.8-4L3.3 13.8a1.5 1.5 0 0 1 2.6-1.5L8 15"/></svg>',
+  };
+  const TRIGGER_TONE = { rhythm: "teal", move: "violet", face: "pink", hand: "blue" };
+
+  /** The rhythm as dots on a line (where each tap falls), for the trigger tiles. */
+  function rhythmDots(p) {
+    const taps = perform(p, 0, Math.min(burstGap(p) * 1.2, 900));
+    const end = taps[taps.length - 1] || 1;
+    return taps.map((t) => `<i style="left:${((t / end) * 100).toFixed(1)}%"></i>`).join("");
+  }
+
+  function renderTriggers() {
+    const grid = $("trigger-grid");
+    if (!grid) return;
+    const tiles = [];
+    for (const r of rhythms.list) {
+      const p = r.profile;
+      const inUse = r.id === rhythms.active;
+      tiles.push(`<li class="trigger${inUse ? " in-use" : ""}" data-kind="rhythm">
+        <span class="ico ${TRIGGER_TONE.rhythm}">${TRIGGER_ICON.rhythm}</span>
+        <div class="trigger-body">
+          <b>${esc(r.name)}</b>
+          <small>Tap rhythm · ${p.ratios.length + 1} taps · performed ${p.repeats}×</small>
+          <span class="mini-rhythm">${rhythmDots(p)}</span>
+        </div>
+        <div class="trigger-actions">
+          ${inUse ? '<span class="in-use-badge">In use</span>' : `<button class="btn small" data-use-rhythm="${esc(r.id)}">Use</button>`}
+          <button class="btn small ghost" data-show-rhythm="${esc(r.id)}" title="Plays it on the pad and the wearable">Show</button>
+          <button class="link danger" data-delete-rhythm="${esc(r.id)}">Delete</button>
+        </div>
+      </li>`);
+    }
+    for (const m of signs.customs) {
+      const key = `custom:${m.name}`;
+      const on = m.enabled !== false;
+      const r = signs.results[key];
+      const tested = !r ? "not tested yet" : r.passed ? `✓ works (${(r.ms / 1000).toFixed(1)} s)` : "✗ not recognised";
+      tiles.push(`<li class="trigger${on ? "" : " off"}" data-kind="${esc(m.kind)}">
+        <span class="ico ${TRIGGER_TONE[m.kind] || "blue"}">${TRIGGER_ICON[m.kind] || TRIGGER_ICON.hand}</span>
+        <div class="trigger-body">
+          <b>${esc(m.name)}</b>
+          <small>${esc(KIND_LABEL[m.kind] || m.kind)} · quality <em class="q-${esc(m.quality)}">${esc(m.quality)}</em> · <span class="${r ? (r.passed ? "good" : "bad") : ""}">${esc(tested)}</span></small>
+        </div>
+        <div class="trigger-actions">
+          <label class="mini-switch" title="${on ? "Watching for it" : "Switched off"}"><input type="checkbox" data-trigger-on="${esc(m.name)}" ${on ? "checked" : ""}><span></span>${on ? "On" : "Off"}</label>
+          <button class="btn small" data-test-trigger="${esc(key)}">Test</button>
+          <button class="link danger" data-delete-sign="${esc(m.name)}">Delete</button>
+        </div>
+      </li>`);
+    }
+    grid.innerHTML = tiles.length
+      ? tiles.join("")
+      : '<li class="trigger-empty">Nothing saved yet. Make your first one with a button above: it is saved here, in AegisMesh, as soon as it is learned.</li>';
+    const n = rhythms.list.length + signs.customs.length;
+    $("trigger-count").textContent = n
+      ? `${n} saved in AegisMesh on this device · ${rhythms.list.length} rhythm${rhythms.list.length === 1 ? "" : "s"}, ${signs.customs.length} camera trigger${signs.customs.length === 1 ? "" : "s"}`
+      : "Your own rhythms, movements, expressions and hand signs, saved in AegisMesh on this device.";
+  }
+
+  function setCustomOn(name, on) {
+    signs.customs = signs.customs.map((m) => (m.name === name ? { ...m, enabled: on } : m));
+    saveCustoms();
+    renderSignList();
+  }
+
+  function forgetSign(name) {
+    signs.customs = signs.customs.filter((m) => m.name !== name);
+    delete signs.results[`custom:${name}`];
+    store.set("aegismesh.signtests", signs.results);
+    if (signs.test && signs.test.target === `custom:${name}`) signs.test = null;
+    saveCustoms();
+    renderSignList();
+    toast(`Deleted "${name}".`);
+  }
+
+  function deleteRhythm(id) {
+    const r = rhythms.list.find((x) => x.id === id);
+    if (!r) return;
+    rhythms.list = rhythms.list.filter((x) => x.id !== id);
+    if (rhythms.active === id) rhythms.active = null;
+    saveRhythms();
+    state.profile = currentProfile();
+    renderProfile();
+    renderTriggers();
+    toast(`Deleted the rhythm "${r.name}".${rhythms.active ? "" : " Using the default rhythm."}`);
+  }
+
+  /** Delete buttons ask once: the first click arms them for 3 seconds. */
+  function confirmed(button) {
+    if (button.dataset.armed) return true;
+    button.dataset.armed = "1";
+    const label = button.textContent;
+    button.textContent = "Sure? Click again";
+    setTimeout(() => { delete button.dataset.armed; button.textContent = label; }, 3000);
+    return false;
+  }
+
+  function goTo(id, focusId) {
+    const target = $(id);
+    if (target) target.scrollIntoView({ behavior: "smooth", block: "center" });
+    if (focusId) setTimeout(() => $(focusId) && $(focusId).focus({ preventScroll: true }), 450);
+  }
+
+  const TEACH_HINTS = {
+    hand: "After a 3-second countdown, hold your sign still for 3 seconds; then let go and stay relaxed, still in view, for 3 seconds so it learns what not to react to. It is tested straight away, and every sign has a Test button. Tests never send an SOS. Only landmark numbers are kept, never pictures.",
+    face: "After a 3-second countdown, hold the expression for 3 seconds; then relax your face, still in view, for 3 seconds so it learns your ordinary face. It is tested straight away. Tests never send an SOS. Only landmark numbers are kept, never pictures.",
+    move: "After a 3-second countdown, do your movement (a wave, a circle, a swipe…) three times when asked, holding still in between; keep your whole hand in view and make it at least a hand's length. It is tested straight away. Tests never send an SOS. Only the path of your palm is kept, never pictures.",
+  };
+
+  function updateTeachHint() {
+    $("teach-hint").textContent = TEACH_HINTS[$("teach-kind").value] || TEACH_HINTS.hand;
+    $("teach-name").placeholder = $("teach-kind").value === "move" ? "Name, e.g. Wave twice" : $("teach-kind").value === "face" ? "Name, e.g. Puffed cheeks" : "Name, e.g. Two fingers";
+  }
+
+  function newTrigger(kind) {
+    if (kind === "rhythm") {
+      goTo("card-tap", "cal-name");
+      toast("Name your rhythm, tap it once on the pad and press Add sample. Do that 3 times, then Save rhythm.");
+      return;
+    }
+    $("teach-kind").value = kind;
+    updateTeachHint();
+    goTo("teach-start", "teach-name");
+    toast(`Name your ${KIND_LABEL[kind]}, then press Teach it: the camera starts and guides you.`);
+  }
+
+  async function showRhythm(id) {
+    const r = rhythms.list.find((x) => x.id === id);
+    if (!r) return;
+    goTo("card-tap");
+    const saved = state.profile;
+    state.profile = r.profile;
+    try {
+      await demoRhythm();
+    } finally {
+      state.profile = currentProfile();
+      if (saved !== state.profile) drawTaps($("tap-timeline"), state.taps);
+    }
+  }
+
+  function wireTriggers() {
+    for (const button of document.querySelectorAll("[data-new]")) button.addEventListener("click", () => newTrigger(button.dataset.new));
+    $("teach-kind").addEventListener("change", updateTeachHint);
+    $("trigger-grid").addEventListener("change", (event) => {
+      const name = event.target.dataset && event.target.dataset.triggerOn;
+      if (name) setCustomOn(name, event.target.checked);
+    });
+    $("trigger-grid").addEventListener("click", (event) => {
+      const button = event.target.closest("button");
+      if (!button) return;
+      const d = button.dataset;
+      if (d.useRhythm) {
+        useRhythm(d.useRhythm);
+        const r = activeRhythm();
+        toast(`"${r ? r.name : "Rhythm"}" is now the rhythm in use.`);
+      } else if (d.showRhythm) {
+        showRhythm(d.showRhythm).catch((error) => toast(errorText(error), true));
+      } else if (d.deleteRhythm) {
+        if (confirmed(button)) deleteRhythm(d.deleteRhythm);
+      } else if (d.testTrigger) {
+        goTo("sign-viewport");
+        startSignTest(d.testTrigger).catch((error) => toast(errorText(error), true));
+      } else if (d.deleteSign) {
+        if (confirmed(button)) forgetSign(d.deleteSign);
+      }
+    });
   }
 
   async function onSignTriggered(event) {
@@ -1782,6 +2040,11 @@
     $("teach-start").addEventListener("click", () => startTeaching().catch((error) => toast(errorText(error), true)));
     $("sign-discreet").addEventListener("change", () => { if ($("sign-discreet").checked && !signs.test && !signs.teaching) hud(""); });
     $("sign-list").addEventListener("change", (event) => {
+      const own = event.target.dataset && event.target.dataset.custom;
+      if (own) {
+        setCustomOn(own, event.target.checked);
+        return;
+      }
       const key = event.target.dataset && event.target.dataset.builtin;
       if (!key) return;
       signs.enabled = event.target.checked ? [...new Set([...signs.enabled, key])] : signs.enabled.filter((k) => k !== key);
@@ -1803,13 +2066,7 @@
       } else if (improve) {
         startTeaching(improve).catch((error) => toast(errorText(error), true));
       } else if (forget) {
-        signs.customs = signs.customs.filter((m) => m.name !== forget);
-        delete signs.results[`custom:${forget}`];
-        store.set("aegismesh.signtests", signs.results);
-        if (signs.test && signs.test.target === `custom:${forget}`) signs.test = null;
-        saveCustoms();
-        renderSignList();
-        toast(`Forgot "${forget}".`);
+        if (confirmed(button)) forgetSign(forget);
       }
     });
     $("bench-run").addEventListener("click", (e) => guarded(e.currentTarget, "Running…", runBenchmark));
@@ -1855,6 +2112,54 @@
     if (query && query.addEventListener) query.addEventListener("change", () => applyTheme(resolved()));
   }
 
+  // The section bar's highlight slides to the section you are reading.
+  function movePill() {
+    const pill = $("nav-pill");
+    const active = document.querySelector(".section-nav a.active");
+    if (!pill || !active) return;
+    pill.style.transform = `translateX(${active.offsetLeft}px)`;
+    pill.style.width = `${active.offsetWidth}px`;
+    if (!pill.classList.contains("ready")) requestAnimationFrame(() => pill.classList.add("ready"));
+  }
+
+  // Cards fade up as they scroll into view, and the glass under the mouse gets a soft light.
+  function watchMotion() {
+    document.querySelector(".section-nav").classList.add("has-pill");
+    movePill();
+    window.addEventListener("resize", movePill);
+    const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!reduce && "IntersectionObserver" in window) {
+      const reveal = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          entry.target.classList.add("in");
+          reveal.unobserve(entry.target);
+        }
+      }, { threshold: 0.06 });
+      for (const card of document.querySelectorAll(".card")) {
+        card.classList.add("reveal");
+        reveal.observe(card);
+      }
+      // never leave a card hidden (a frame that is not laid out reports nothing)
+      setTimeout(() => { for (const card of document.querySelectorAll(".card.reveal")) card.classList.add("in"); }, 2500);
+    }
+    let pending = null;
+    document.addEventListener("pointermove", (event) => {
+      if (pending === null) {
+        requestAnimationFrame(() => {
+          const card = pending.target && pending.target.closest ? pending.target.closest(".card, .section-nav") : null;
+          if (card) {
+            const box = card.getBoundingClientRect();
+            card.style.setProperty("--mx", `${Math.round(pending.clientX - box.left)}px`);
+            card.style.setProperty("--my", `${Math.round(pending.clientY - box.top)}px`);
+          }
+          pending = null;
+        });
+      }
+      pending = event;
+    }, { passive: true });
+  }
+
   function watchSections() {
     const links = [...document.querySelectorAll(".section-nav a")];
     const byId = new Map(links.map((a) => [a.getAttribute("href").slice(1), a]));
@@ -1866,7 +2171,10 @@
         const ratio = seen.get(id) || 0;
         if (ratio > 0 && (best === null || ratio > (seen.get(best) || 0))) best = id;
       }
-      if (best) for (const [id, a] of byId) a.classList.toggle("active", id === best);
+      if (best) {
+        for (const [id, a] of byId) a.classList.toggle("active", id === best);
+        movePill();
+      }
     }, { threshold: [0, 0.25, 0.5, 0.75, 1], rootMargin: "-60px 0px -35% 0px" });
     for (const id of byId.keys()) {
       const section = $(id);
@@ -1876,7 +2184,10 @@
 
   async function init() {
     wire();
+    wireTriggers();
+    updateTeachHint();
     watchSections();
+    watchMotion();
     watchTheme();
     drawEnergyIdle();
     setCamStep(1);
