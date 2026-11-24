@@ -219,6 +219,16 @@ stealers, so on macOS the model leans on packing and code structure, and CI chec
 the runner's own OS and third-party programs on every push. The fallback used when the model
 file is missing is a fixed formula that still trusts signature blocks.
 
+**Not scored: compiler object files.** On macOS a `.o` file (Mach-O type "object") is build
+output waiting to be linked. It cannot run, is never signed, and its one segment is always
+marked readable, writable and executable, which the model reads as an injector. A Full Scan of
+a developer's Mac reported 12,451 findings, 12,408 of them object files; in a watched folder
+they would have been quarantined mid-build. They are now left out by file type (read from the
+header, not the name). Measured on the same Unity editor folder (197,031 files, 29 GB): 1,254
+findings before, 28 after, and the scan took 290 s instead of 339 s. The 28 that remain are
+vendor libraries (Microsoft .NET and DirectML DLLs, Unity's own runtime libraries): real false
+positives of the model, listed by a Full Scan but never moved by one.
+
 **Running programs:** stopping a process cannot be undone, so the AI only terminates (and
 quarantines) a newly started program at a score of 0.90 or more; between 0.65 and 0.90, and for
 anything already running when protection starts, it raises an alert instead. The Nex never acts

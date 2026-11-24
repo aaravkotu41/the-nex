@@ -700,19 +700,26 @@ fn add_macho_slice(macho: &goblin::mach::MachO<'_>, stats: &mut MachStats) {
 
 /// Fat (multi-arch) binaries combine their slices: maxima of the numeric facts and the union
 /// of suspicious symbols and packer names.
+///
+/// Object-file slices (compiler output, MH_OBJECT) are left out, so a file made only of them
+/// has no profile and is never scored: it cannot run, and its one segment is always readable,
+/// writable and executable, which the model reads as an injector. `engine::classify_file`
+/// already drops thin object files before they are read; this also covers universal ones.
 fn mach_profile(bytes: &[u8], mach: &goblin::mach::Mach<'_>) -> Option<BinaryProfile> {
     let mut stats = MachStats::default();
     let mut slices = 0;
-    match mach {
-        goblin::mach::Mach::Binary(macho) => {
+    let mut add = |macho: &goblin::mach::MachO<'_>| {
+        if macho.header.filetype != goblin::mach::header::MH_OBJECT {
             add_macho_slice(macho, &mut stats);
-            slices = 1;
+            slices += 1;
         }
+    };
+    match mach {
+        goblin::mach::Mach::Binary(macho) => add(macho),
         goblin::mach::Mach::Fat(fat) => {
             for index in 0..fat.narches {
                 if let Ok(goblin::mach::SingleArch::MachO(macho)) = fat.get(index) {
-                    add_macho_slice(&macho, &mut stats);
-                    slices += 1;
+                    add(&macho);
                 }
             }
         }
@@ -1075,6 +1082,59 @@ mod tests {
 
         let details = detection_details(0.97, 0.65, "onnx", Some(&prototypes::packed_injector()));
         assert!(details.starts_with("score=0.970 threshold=0.65 engine=onnx; packed"));
+    }
+
+    /// A Mach-O header with no load commands: just enough for the file type to be read.
+    fn macho_header(cpu: u32, file_type: u32) -> Vec<u8> {
+        [0xFEED_FACF, cpu, 0, file_type, 0, 0, 0, 0]
+            .iter()
+            .flat_map(|field: &u32| field.to_le_bytes())
+            .collect()
+    }
+
+    /// A universal file holding `slices` one after another (fat headers are big-endian).
+    fn universal(slices: &[Vec<u8>]) -> Vec<u8> {
+        let table = 8 + 20 * slices.len();
+        let mut out = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        out.extend_from_slice(&(slices.len() as u32).to_be_bytes());
+        let mut offset = table;
+        for slice in slices {
+            let cpu = u32::from_le_bytes(slice[4..8].try_into().unwrap());
+            for field in [cpu, 0, offset as u32, slice.len() as u32, 0] {
+                out.extend_from_slice(&field.to_be_bytes());
+            }
+            offset += slice.len();
+        }
+        for slice in slices {
+            out.extend_from_slice(slice);
+        }
+        out
+    }
+
+    #[test]
+    fn object_files_are_never_scored_thin_or_universal() {
+        const ARM64: u32 = 0x0100_000C;
+        const X86_64: u32 = 0x0100_0007;
+        const OBJECT: u32 = 1;
+        const EXECUTABLE: u32 = 2;
+        const LIBRARY: u32 = 6;
+        assert_eq!(extract_profile(&macho_header(ARM64, OBJECT)), None);
+        assert!(extract_profile(&macho_header(ARM64, EXECUTABLE)).is_some());
+        assert!(extract_profile(&macho_header(ARM64, LIBRARY)).is_some());
+
+        let objects = universal(&[macho_header(ARM64, OBJECT), macho_header(X86_64, OBJECT)]);
+        assert_eq!(extract_profile(&objects), None, "universal object file");
+        // A universal program still has a profile, from its program slices only.
+        let program = universal(&[
+            macho_header(ARM64, EXECUTABLE),
+            macho_header(X86_64, EXECUTABLE),
+        ]);
+        assert!(extract_profile(&program).is_some());
+        let mixed = universal(&[
+            macho_header(ARM64, OBJECT),
+            macho_header(X86_64, EXECUTABLE),
+        ]);
+        assert!(extract_profile(&mixed).is_some());
     }
 
     #[test]

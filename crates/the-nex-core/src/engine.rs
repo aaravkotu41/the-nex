@@ -41,22 +41,34 @@ pub const QUICK_SCAN_REPORT_FILE: &str = "last_quick_scan.json";
 pub const FULL_SCAN_REPORT_FILE: &str = "last_full_scan.json";
 pub const SCAN_PROGRESS_FILE: &str = "scan_progress.json";
 
-/// Thin (32/64-bit, either byte order) and fat/universal Mach-O headers.
+/// True for a Mach-O program or library, from the start of the file: thin (32/64-bit, either
+/// byte order) and fat/universal headers.
+///
+/// Object files (file type MH_OBJECT, usually `.o`) are left out. They are compiler output
+/// waiting to be linked: they cannot run, are never signed, and their single segment is always
+/// readable, writable and executable, which the model reads as an injector. A build folder
+/// holds thousands of them; scoring them flagged 12,408 on one developer's Mac, and in a
+/// watched folder would quarantine a build as it was being made.
 #[cfg(target_os = "macos")]
-fn is_macho_magic(magic: &[u8; 4]) -> bool {
-    matches!(
-        magic,
-        [0xCF, 0xFA, 0xED, 0xFE]
-            | [0xCE, 0xFA, 0xED, 0xFE]
-            | [0xFE, 0xED, 0xFA, 0xCF]
-            | [0xFE, 0xED, 0xFA, 0xCE]
-            | [0xCA, 0xFE, 0xBA, 0xBE]
-            | [0xCA, 0xFE, 0xBA, 0xBF]
-    )
+fn is_macho_program(head: &[u8]) -> bool {
+    const MH_OBJECT: u32 = 1;
+    // The file type is the fourth 32-bit field of a thin header. A header cut short (a file
+    // still being written) counts as a program, as it did before.
+    let file_type = |decode: fn([u8; 4]) -> u32| {
+        head.get(12..16)
+            .and_then(|field| field.try_into().ok())
+            .map(decode)
+    };
+    match head.get(..4) {
+        Some([0xCF | 0xCE, 0xFA, 0xED, 0xFE]) => file_type(u32::from_le_bytes) != Some(MH_OBJECT),
+        Some([0xFE, 0xED, 0xFA, 0xCF | 0xCE]) => file_type(u32::from_be_bytes) != Some(MH_OBJECT),
+        Some([0xCA, 0xFE, 0xBA, 0xBE | 0xBF]) => true,
+        _ => false,
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn is_macho_magic(_magic: &[u8; 4]) -> bool {
+fn is_macho_program(_head: &[u8]) -> bool {
     false
 }
 
@@ -73,15 +85,16 @@ pub fn classify_file(path: &Path) -> FileKind {
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    let mut magic = [0u8; 4];
+    let mut head = [0u8; 16];
     // No-follow, non-blocking: a FIFO or symlink swapped in after the lstat must not hang the scan.
     let read = quarantine::open_nofollow(path)
-        .and_then(|mut f| f.read(&mut magic))
+        .and_then(|mut f| f.read(&mut head))
         .unwrap_or(0);
-    if (read >= 2 && &magic[..2] == b"MZ") || (read == 4 && is_macho_magic(&magic)) {
+    let head = &head[..read];
+    if head.starts_with(b"MZ") || is_macho_program(head) {
         return FileKind::Binary;
     }
-    if (read == 4 && (&magic == b"PK\x03\x04" || &magic == b"PK\x05\x06")) || ext == "zip" {
+    if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") || ext == "zip" {
         return FileKind::Archive;
     }
     if BINARY_EXTENSIONS.contains(&ext.as_str()) {
@@ -934,6 +947,51 @@ mod tests {
             fs::write(&path, bytes).unwrap();
             assert_eq!(classify_file(&path), expected, "{name}");
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn object_files_are_not_programs() {
+        let dir = temp_root("macho");
+        // magic, cpu type, cpu subtype, file type (2 = executable, 6 = library, 1 = object)
+        let header = |magic: [u8; 4], file_type: [u8; 4]| {
+            let mut bytes = magic.to_vec();
+            bytes.extend_from_slice(&[0u8; 8]);
+            bytes.extend_from_slice(&file_type);
+            bytes.extend_from_slice(&[0u8; 16]);
+            bytes
+        };
+        let (le64, le32) = ([0xCF, 0xFA, 0xED, 0xFE], [0xCE, 0xFA, 0xED, 0xFE]);
+        let be64 = [0xFE, 0xED, 0xFA, 0xCF];
+        let cases = [
+            ("tool", header(le64, [2, 0, 0, 0]), FileKind::Binary),
+            ("lib.dylib", header(le64, [6, 0, 0, 0]), FileKind::Binary),
+            ("unit.o", header(le64, [1, 0, 0, 0]), FileKind::Other),
+            ("unit32.o", header(le32, [1, 0, 0, 0]), FileKind::Other),
+            ("unit_be.o", header(be64, [0, 0, 0, 1]), FileKind::Other),
+            // A big-endian executable is not misread as a little-endian object, or back.
+            ("tool_be", header(be64, [0, 0, 0, 2]), FileKind::Binary),
+            // Named like an object but linked: the header decides, not the name.
+            ("renamed.o", header(le64, [2, 0, 0, 0]), FileKind::Binary),
+            // Universal files are sorted out slice by slice in bin_ai::mach_profile.
+            (
+                "fat",
+                vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 2],
+                FileKind::Binary,
+            ),
+            ("half_written", le64.to_vec(), FileKind::Binary),
+        ];
+        for (name, bytes, expected) in cases {
+            let path = dir.join(name);
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(classify_file(&path), expected, "{name}");
+        }
+        // The real thing: this test program is a Mach-O executable.
+        assert_eq!(
+            classify_file(&std::env::current_exe().unwrap()),
+            FileKind::Binary
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
