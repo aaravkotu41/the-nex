@@ -10,8 +10,9 @@ mod quitguard;
 
 use chrono::Utc;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use the_nex_core::bin_ai::BinaryAiScanner;
 use the_nex_core::canary;
@@ -325,6 +326,77 @@ fn get_events(
         .collect())
 }
 
+#[derive(Serialize, Default, Debug, PartialEq)]
+struct DayCounts {
+    critical: u64,
+    high: u64,
+    other: u64,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct ThreatChart {
+    days: Vec<DayCounts>,
+    by_type: BTreeMap<String, u64>,
+}
+
+/// Counts non-LOW events per day (`day_starts`: ascending ms since epoch; the last day has no
+/// upper bound) and per threat type, streaming so a huge log never sits in memory. Lines that
+/// do not parse are skipped.
+fn count_threats(mut reader: impl BufRead, day_starts: &[i64]) -> io::Result<ThreatChart> {
+    let mut chart = ThreatChart {
+        days: day_starts.iter().map(|_| DayCounts::default()).collect(),
+        by_type: BTreeMap::new(),
+    };
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let Ok(event) = serde_json::from_slice::<ThreatEvent>(&line) else {
+            continue;
+        };
+        let day = day_starts.partition_point(|&s| s <= event.timestamp.timestamp_millis());
+        if event.severity == Severity::Low || day == 0 {
+            continue;
+        }
+        let counts = &mut chart.days[day - 1];
+        match event.severity {
+            Severity::Critical => counts.critical += 1,
+            Severity::High => counts.high += 1,
+            _ => counts.other += 1,
+        }
+        *chart.by_type.entry(event.threat_type).or_insert(0) += 1;
+    }
+    Ok(chart)
+}
+
+/// Threat counts for the Overview chart. `day_starts` are the seven local-midnight starts the UI
+/// draws (ascending), so no timezone logic lives here. The rotated log (`events.jsonl.1`) can
+/// still hold part of the week, so it is counted first.
+#[tauri::command]
+async fn get_threat_chart(day_starts: Vec<i64>) -> Result<ThreatChart, String> {
+    if day_starts.len() != 7 || day_starts.windows(2).any(|w| w[0] >= w[1]) {
+        return Err("expected 7 ascending day starts".into());
+    }
+    blocking(move || {
+        let cfg = config();
+        let rotated: Box<dyn BufRead> =
+            match fs::File::open(cfg.events_log.with_extension("jsonl.1")) {
+                Ok(f) => Box::new(BufReader::new(f)),
+                Err(_) => Box::new(io::empty()),
+            };
+        let current: Box<dyn BufRead> = match fs::File::open(&cfg.events_log) {
+            Ok(f) => Box::new(BufReader::new(f)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Box::new(io::empty()),
+            Err(e) => return Err(format!("{}: {e}", cfg.events_log.display())),
+        };
+        count_threats(rotated.chain(current), &day_starts)
+            .map_err(|e| format!("{}: {e}", cfg.events_log.display()))
+    })
+    .await
+}
+
 #[tauri::command]
 async fn toggle_engine(engine: String, enabled: bool) -> Result<RuntimeToggles, String> {
     blocking(move || {
@@ -579,6 +651,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_dashboard_state,
             get_events,
+            get_threat_chart,
             toggle_engine,
             run_quick_scan,
             list_quarantine,
@@ -636,5 +709,39 @@ mod tests {
     fn offline_daemon_reports_no_figures() {
         let info = daemon_info(None);
         assert!(!info.online && info.pid.is_none() && info.memory_mb.is_none());
+    }
+
+    #[test]
+    fn threat_chart_counts_every_event_by_exact_day() {
+        const DAY: i64 = 86_400_000;
+        let starts: Vec<i64> = (0..7).map(|i| 1_700_000_000_000 + i * DAY).collect();
+        let line = |ms: i64, kind: &str, severity: Severity| {
+            let mut e = event(kind, severity, "t");
+            e.timestamp = chrono::DateTime::from_timestamp_millis(ms).unwrap();
+            serde_json::to_string(&e).unwrap() + "\n"
+        };
+        let mut log = String::new();
+        for _ in 0..3000 {
+            log += &line(starts[6] + 5, "KNOWN_MALWARE", Severity::Medium);
+        }
+        log += &line(starts[6] + 5, "KNOWN_MALWARE", Severity::Low);
+        log += &line(starts[0] - 1, "ZIP_BOMB", Severity::High);
+        log += &line(starts[0], "ZIP_BOMB", Severity::High);
+        log += &line(starts[1] - 1, "ZIP_BOMB", Severity::Critical);
+        log += &line(starts[1], "LOTL_SCRIPT", Severity::Critical);
+        log += "not json\n{\"id\":\n";
+        let chart = count_threats(log.as_bytes(), &starts).unwrap();
+        let counts = |c, h, o| DayCounts {
+            critical: c,
+            high: h,
+            other: o,
+        };
+        assert_eq!(chart.days[0], counts(1, 1, 0));
+        assert_eq!(chart.days[1], counts(1, 0, 0));
+        assert_eq!(chart.days[6], counts(0, 0, 3000));
+        assert_eq!(chart.by_type["KNOWN_MALWARE"], 3000);
+        assert_eq!(chart.by_type["ZIP_BOMB"], 2);
+        assert_eq!(chart.by_type["LOTL_SCRIPT"], 1);
+        assert_eq!(chart.by_type.values().sum::<u64>(), 3003);
     }
 }

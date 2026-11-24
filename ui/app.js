@@ -6,6 +6,7 @@ const invoke = tauri && tauri.core && typeof tauri.core.invoke === "function" ? 
 const REFRESH_MS = 2000;
 const CONFIRM_MS = 4000;
 const OVERVIEW_EVENTS = 8;
+const ACTIVITY_LIMIT = 1000;
 const PAGE_TITLES = {
   overview: "Overview",
   engines: "Engines",
@@ -565,36 +566,22 @@ function renderScore(d) {
 const CHART_REFRESH_MS = 30000;
 
 async function loadChart(force) {
-  if (!force && state.chartAt && Date.now() - state.chartAt < CHART_REFRESH_MS) return;
+  // Each load reads the whole event log; forced refreshes (after any action) come in bursts.
+  if (state.chartAt && Date.now() - state.chartAt < (force ? 2000 : CHART_REFRESH_MS)) return;
   state.chartAt = Date.now();
   const seq = refreshSeq;
-  const events = await call("get_events", { limit: 1000, query: null, severity: "ALL" }).catch(() => []);
-  if (seq !== refreshSeq) return;
   const days = [];
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   for (let i = 6; i >= 0; i--) {
     const day = new Date(today);
     day.setDate(day.getDate() - i);
-    days.push({ start: day.getTime(), label: day.toLocaleDateString(undefined, { weekday: "short" }), critical: 0, high: 0, other: 0 });
+    days.push({ start: day.getTime(), label: day.toLocaleDateString(undefined, { weekday: "short" }) });
   }
-  for (const event of events) {
-    const severity = String(event.severity || "").toLowerCase();
-    if (severity === "low") continue; // restores, deletions and scan summaries are not threats
-    const t = Date.parse(event.timestamp);
-    for (let i = days.length - 1; i >= 0; i--) {
-      if (t >= days[i].start) {
-        if (i === days.length - 1 || t < days[i + 1].start) days[i][severity === "critical" ? "critical" : severity === "high" ? "high" : "other"]++;
-        break;
-      }
-    }
-  }
-  const byType = new Map();
-  for (const event of events) {
-    if (String(event.severity || "").toLowerCase() === "low") continue;
-    if (Date.parse(event.timestamp) < days[0].start) continue;
-    byType.set(event.threat_type, (byType.get(event.threat_type) || 0) + 1);
-  }
+  const chart = await call("get_threat_chart", { dayStarts: days.map((d) => d.start) }).catch(() => ({ days: days.map(() => ({ critical: 0, high: 0, other: 0 })), by_type: {} }));
+  if (seq !== refreshSeq) return;
+  days.forEach((d, i) => Object.assign(d, chart.days[i]));
+  const byType = new Map(Object.entries(chart.by_type));
   renderChartFacts(days, byType);
   const max = Math.max(1, ...days.map((d) => d.critical + d.high + d.other));
   replaceIfChanged($("threat-chart"), JSON.stringify(days), () => days.map((d, index) => {
@@ -603,15 +590,15 @@ async function loadChart(force) {
     for (const kind of ["critical", "high", "other"]) {
       if (!d[kind]) continue;
       const seg = el("div", { className: `seg ${kind}` });
-      seg.style.height = `${(d[kind] / max) * 100}%`;
+      seg.style.height = `${Math.max(2, (d[kind] / max) * 100)}%`; // a quiet day stays visible beside a huge one
       stack.append(seg);
     }
     const col = el("button", {
       className: `bar-col${index === days.length - 1 ? " today" : ""}`,
-      title: `${d.label}: ${total} threat${total === 1 ? "" : "s"}. Click to see them.`,
+      title: `${d.label}: ${count(total)} threat${total === 1 ? "" : "s"}. Click to see them.`,
       attrs: { type: "button" },
     }, [
-      el("b", { className: total ? "mono" : "mono zero", text: String(total) }),
+      el("b", { className: total ? "mono" : "mono zero", text: count(total) }),
       stack,
       el("span", { text: d.label }),
     ]);
@@ -639,7 +626,7 @@ function renderChartFacts(days, byType) {
     [count(week), "threats this week"],
     [count(totals[totals.length - 1]), "today"],
     [count(critical), "critical"],
-    [week ? days[busiest].label : "—", week ? `busiest day (${totals[busiest]})` : "busiest day"],
+    [week ? days[busiest].label : "—", week ? `busiest day (${count(totals[busiest])})` : "busiest day"],
   ];
   replaceIfChanged($("chart-facts"), JSON.stringify(facts), () => facts.map(([value, label]) => el("div", {}, [
     el("b", { text: value }),
@@ -652,7 +639,7 @@ function renderChartFacts(days, byType) {
     bar.style.setProperty("--w", `${Math.max(6, (n / top) * 100)}%`);
     if (TYPE_COLOURS[type]) bar.style.setProperty("--bar", TYPE_COLOURS[type]);
     const button = el("button", { title: `${TYPE_NOTES[type] || type} Click to see these events.`, attrs: { type: "button" } }, [
-      el("span", { text: type }), el("b", { text: String(n) }), bar,
+      el("span", { text: type }), el("b", { text: count(n) }), bar,
     ]);
     button.addEventListener("click", () => openActivity({ type }));
     return el("li", {}, [button]);
@@ -813,8 +800,9 @@ async function loadEvents() {
   replaceIfChanged($("overview-events"), eventsSignature(overview), () => overview.map((e) => eventRow(e)));
   $("overview-empty").hidden = overview.length > 0;
   if (state.page === "activity") {
-    const fetched = await call("get_events", { limit: 1000, query: state.query || null, severity: "ALL" });
+    const fetched = await call("get_events", { limit: ACTIVITY_LIMIT, query: state.query || null, severity: "ALL" });
     if (seq !== refreshSeq) return;
+    const capped = fetched.length >= ACTIVITY_LIMIT; // there are more: every count below is a minimum
     const all = fetched.filter((e) => {
       if (state.activityType && e.threat_type !== state.activityType) return false;
       if (state.activityDay !== null) {
@@ -828,12 +816,15 @@ async function loadEvents() {
     for (const e of all) counts[severityKey(e.severity)] = (counts[severityKey(e.severity)] || 0) + 1;
     for (const [key, value] of Object.entries(counts)) {
       const holder = $(`count-${key}`);
-      if (holder) holder.textContent = count(value);
+      if (holder) holder.textContent = count(value) + (capped && value ? "+" : "");
     }
     const shown = state.severity === "ALL" ? all : all.filter((e) => severityKey(e.severity) === state.severity);
-    $("activity-range").textContent = all.length
+    const range = all.length
       ? `Newest ${relativeTime(all[0].timestamp)} · oldest ${formatWhen(all[all.length - 1].timestamp)} · click a row for details`
       : "";
+    $("activity-range").textContent = capped
+      ? `Only the newest ${count(ACTIVITY_LIMIT)} events are listed; the Overview chart counts all of them. ${range}`
+      : range;
     replaceIfChanged($("activity-events"), `${eventsSignature(shown)}|${state.openEvent}`, () => shown.flatMap(activityRows));
     $("activity-empty").hidden = shown.length > 0;
   }
