@@ -627,7 +627,7 @@ fn absolutize(path: &Path) -> PathBuf {
 
 /// True when running as root (Unix), or on Windows with an elevated token (UAC "run as
 /// administrator") or as a machine account such as SYSTEM (account name ends in `$`).
-fn running_privileged() -> bool {
+pub fn running_privileged() -> bool {
     #[cfg(unix)]
     {
         extern "C" {

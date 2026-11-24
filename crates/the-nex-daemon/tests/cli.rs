@@ -198,6 +198,13 @@ fn restore_and_delete_round_trip_through_the_cli() {
 
 #[test]
 fn set_writes_settings_json() {
+    // A privileged run ignores THENEX_DATA_DIR on purpose (config::data_dir), and Windows CI
+    // runners are elevated: there `--set` would edit the machine's real settings.json, which
+    // the live verifier then inherits (zip bombs off, dry run on). Nothing to sandbox, so
+    // nothing to run; RuntimeToggles save/load is covered by the core's unit tests.
+    if the_nex_core::config::running_privileged() {
+        return;
+    }
     let sandbox = Sandbox::new("set");
     let output = sandbox.run(&["--set", "zip_bomb=off"]);
     assert!(output.status.success(), "{}", describe(&output));
