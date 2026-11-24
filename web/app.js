@@ -39,17 +39,4 @@
       }
     }, 1500);
   });
-
-  // Download control: stays a disabled button until data-download-url holds an https link.
-  const btn = $("download-btn");
-  const url = (btn.dataset.downloadUrl || "").trim();
-  if (/^https:\/\//.test(url)) {
-    const a = document.createElement("a");
-    a.className = "btn";
-    a.id = btn.id;
-    a.href = url;
-    a.rel = "noopener noreferrer";
-    a.textContent = "Download for Mac";
-    btn.replaceWith(a);
-  }
 })();

@@ -44,6 +44,8 @@ a.btn:hover, button.btn:enabled:hover { background: var(--mint); color: #0E0F0E;
 .btn:disabled { background: transparent; color: var(--muted); border-color: var(--muted); border-style: dashed; cursor: not-allowed; }
 .dl { background: var(--mint-soft); border-radius: 24px; padding: 40px 32px; margin-block: 24px 56px; }
 .dl p { margin: 12px 0 0; }
+.dl-row { display: flex; flex-wrap: wrap; gap: 12px; }
+.dl .dl-note { color: var(--muted); font-size: 0.9rem; }
 .mobile-note { display: none; font-weight: 600; }
 @media (max-width: 760px), (hover: none) and (pointer: coarse) {
   .dl-area { display: none; }
