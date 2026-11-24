@@ -59,6 +59,8 @@ jobs:
           python -m pip install --disable-pip-version-check numpy onnx
           python scripts/train_onnx.py --out thenex_model.onnx
           python scripts/gen_test_zipbomb.py
+          python scripts/fetch_hash_list.py --self-test
+          python scripts/ember_eval.py --self-test
 
       # On-device hand/face models for AegisMesh's emergency signs: pinned, SHA-256 verified,
       # embedded into the apps at build time.
@@ -66,6 +68,11 @@ jobs:
         run: |
           python scripts/fetch_vision_models.py
           node scripts/test_signs.js
+          node scripts/test_report.js
+          node scripts/test_setup.js
+          node scripts/test_filecheck.js
+          node scripts/test_startup.js
+          node scripts/test_summary.js
 
       - name: cargo check
         id: check
@@ -80,6 +87,11 @@ jobs:
           RUST_TEST_THREADS: "1"
           RUST_BACKTRACE: "1"
         run: cargo test --workspace --locked --no-fail-fast
+
+      # Real-malware regression floor: scores the committed EMBER2024 sample with the model
+      # trained above. No download; the full evaluation only ever runs locally.
+      - name: Binary AI on the EMBER2024 sample
+        run: python scripts/ember_eval.py check
 
       # A native crash (e.g. STATUS_ACCESS_VIOLATION) has no Rust backtrace, so rerun the
       # core unit tests under cdb and print the faulting stack. Diagnostic only.
@@ -119,6 +131,7 @@ jobs:
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           $stage = New-Item -ItemType Directory -Force -Path target\installer-stage
           Copy-Item target\release\the-nex.exe, target\release\the-nex-gui.exe, thenex_model.onnx, crates\the-nex-gui\icons\icon.ico -Destination $stage
+          if (Test-Path known_bad.bin) { Copy-Item known_bad.bin -Destination $stage }
           $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
           if (-not (Test-Path $makensis)) { choco install nsis -y --no-progress | Out-Host }
           & $makensis /V3 "/DVERSION=$version" "/DSRCDIR=$($stage.FullName)" "/DOUTFILE=$((Resolve-Path target).Path)\TheNexSetup.exe" packaging\windows\installer.nsi
@@ -244,11 +257,18 @@ jobs:
           python -m pip install --disable-pip-version-check numpy onnx
           python scripts/train_onnx.py --out thenex_model.onnx
           python scripts/gen_test_zipbomb.py
+          python scripts/fetch_hash_list.py --self-test
+          python scripts/ember_eval.py --self-test
 
       - name: Fetch the vision runtime and test the sign recogniser
         run: |
           python scripts/fetch_vision_models.py
           node scripts/test_signs.js
+          node scripts/test_report.js
+          node scripts/test_setup.js
+          node scripts/test_filecheck.js
+          node scripts/test_startup.js
+          node scripts/test_summary.js
 
       - name: cargo check
         id: check
@@ -259,6 +279,11 @@ jobs:
           THENEX_MODEL_PATH: ${{ github.workspace }}/thenex_model.onnx
           RUST_BACKTRACE: "1"
         run: cargo test --workspace --locked --no-fail-fast
+
+      # Real-malware regression floor: scores the committed EMBER2024 sample with the model
+      # trained above. No download; the full evaluation only ever runs locally.
+      - name: Binary AI on the EMBER2024 sample
+        run: python scripts/ember_eval.py check
 
       # Runs even when tests fail (the job stays failed) so one CI run reports on
       # packaging and the live verifier too.
