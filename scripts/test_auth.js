@@ -82,7 +82,9 @@ const tokens = (extra) => ({ access_token: "A", refresh_token: "R", expires_in: 
   e = env(CFG, [{ status: 200, body: tokens({ access_token: "NEW", refresh_token: "R1" }) }]);
   e.store.set("thenex.session", JSON.stringify(old));
   let s = await e.auth.restore();
-  check("expired session uses refresh grant", s && s.access_token === "NEW" && e.calls[0].url.endsWith("grant_type=refresh_token") && e.calls[0].body.refresh_token === "R0");
+  check("expired session opens at once, before the refresh answers", s && s.access_token === "OLD" && e.auth.getSession() === s);
+  await e.auth.refresh(); // the renewal restore() started
+  check("expired session uses refresh grant", e.calls.length === 1 && e.calls[0].url.endsWith("grant_type=refresh_token") && e.calls[0].body.refresh_token === "R0" && e.auth.getSession().access_token === "NEW");
   check("refreshed session persisted", JSON.parse(e.store.get("thenex.session")).refresh_token === "R1");
 
   const fresh = { ...old, expires_at: now() + 3000 };
@@ -93,8 +95,10 @@ const tokens = (extra) => ({ access_token: "A", refresh_token: "R", expires_in: 
 
   e = env(CFG, [{ status: 400, body: { error: "invalid_grant", error_description: "Invalid Refresh Token" } }]);
   e.store.set("thenex.session", JSON.stringify(old));
+  let signedOut = 0; e.auth.onSessionLost(() => signedOut++);
   s = await e.auth.restore();
-  check("failed refresh clears session", s === null && !e.store.has("thenex.session"));
+  await e.auth.refresh();
+  check("rejected refresh after restore clears the session and signs out", s && !e.store.has("thenex.session") && e.auth.getSession() === null && signedOut === 1 && e.calls.length === 1);
 
   // refresh: only 400/401 end the session; 429/5xx keep it and report offline
   for (const status of [429, 500, 503]) {

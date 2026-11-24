@@ -106,15 +106,18 @@
     return inflight;
   }
 
-  // Stored session if still fresh, else one refresh attempt. -> session or null
+  // Stored session -> session at once, or null. One that expired while the app was closed is
+  // renewed behind the dashboard (which works without the cloud): waiting for that request
+  // kept the sign-in screen up for seconds on every launch, as if the user had been signed
+  // out. A definite rejection still signs out, through onLost.
   async function restore() {
     if (!isConfigured()) return null;
     const s = load();
     if (!s) return null;
     if (s.expires_at - now() > SKEW) { adopt(s); return s; }
-    const r = await refresh();
-    if (r.offline) { session = s; schedule(); return s; } // keep the stored session so the local dashboard opens offline
-    return r.ok ? r.session : null;
+    session = s;
+    refresh().then((r) => { if (r.offline) schedule(); }); // unreachable: keep the session, retry
+    return s;
   }
 
   async function signIn(email, password) {
