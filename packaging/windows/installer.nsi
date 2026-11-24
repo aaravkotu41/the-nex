@@ -1,7 +1,7 @@
 ; The Nex - one-click Windows installer (NSIS 3, Unicode).
 ;
 ; Build (CI does this):
-;   makensis /DVERSION=0.3.0 /DSRCDIR=<folder> /DOUTFILE=<path>\TheNexSetup.exe installer.nsi
+;   makensis /DVERSION=0.4.0 /DSRCDIR=<folder> /DOUTFILE=<path>\TheNexSetup.exe installer.nsi
 ; where <folder> holds the-nex.exe, the-nex-gui.exe, thenex_model.onnx and icon.ico.
 ;
 ; Double-click -> one administrator prompt -> files go to %ProgramData%\TheNex (the folder the
@@ -15,7 +15,7 @@ RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 
 !ifndef VERSION
-  !define VERSION "0.3.0"
+  !define VERSION "0.4.0"
 !endif
 !ifndef SRCDIR
   !error "Pass /DSRCDIR=<folder with the-nex.exe, the-nex-gui.exe, thenex_model.onnx and icon.ico>"

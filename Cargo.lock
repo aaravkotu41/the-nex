@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aegismesh-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "getrandom 0.2.17",
@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "aegismesh-gui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aegismesh-core",
  "serde_json",
@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "aegismesh-sim"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aegismesh-core",
  "chrono",
@@ -4452,7 +4452,7 @@ dependencies = [
 
 [[package]]
 name = "the-nex-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "goblin",
@@ -4472,7 +4472,7 @@ dependencies = [
 
 [[package]]
 name = "the-nex-daemon"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "embed-resource",
  "serde_json",
@@ -4481,7 +4481,7 @@ dependencies = [
 
 [[package]]
 name = "the-nex-gui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aegismesh-core",
  "block2",
