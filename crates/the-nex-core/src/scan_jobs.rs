@@ -318,7 +318,9 @@ mod tests {
     fn a_requested_full_scan_runs_reports_and_never_moves_files() {
         let (root, cfg) = sandbox("full");
         let (jobs, shared, scanner, telemetry) = service(&cfg);
-        assert!(available(&cfg));
+        // The app only hands scans to the service on Unix (see `available`); the service side
+        // below is the same on every OS.
+        assert_eq!(available(&cfg), cfg!(unix));
         jobs.poll(&shared, &scanner, &telemetry); // nothing requested: nothing happens
         assert!(read_progress(&cfg).is_none());
 
