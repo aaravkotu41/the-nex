@@ -21,7 +21,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: wallpaper: http://wallpaper.localhost; media-src 'self' blob: mediastream:; connect-src 'self' ipc: http://ipc.localhost https://nnftdhyfjfzjalxvhhmz.supabase.co blob: data:; font-src 'self' data:; frame-src 'self'; child-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: wallpaper: http://wallpaper.localhost https://gravatar.com; media-src 'self' blob: mediastream:; connect-src 'self' ipc: http://ipc.localhost https://nnftdhyfjfzjalxvhhmz.supabase.co blob: data:; font-src 'self' data:; frame-src 'self'; child-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"
     }
   },
   "bundle": {

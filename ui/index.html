@@ -24,7 +24,7 @@
         var dim = Number(saved.bg_dim), blur = Number(saved.card_blur), alpha = Number(saved.card_alpha);
         if (dim >= 0 && dim <= 0.9) root.setProperty("--bg-dim", String(dim));
         if (blur >= 0 && blur <= 24) root.setProperty("--card-blur", blur + "px");
-        if (alpha >= 0.85 && alpha <= 0.95) root.setProperty("--card-alpha", String(alpha));
+        if (alpha >= 0.85 && alpha <= 1) root.setProperty("--card-alpha", String(alpha));
         if (typeof saved.css === "string" && saved.css.length < 200000) root.setProperty("--wallpaper", saved.css);
       }
     } catch (error) { /* first launch or storage unavailable: defaults from styles.css */ }
@@ -75,8 +75,9 @@
         <button class="nav-item" data-page="settings"><span>Settings</span></button>
       </nav>
       <div class="topbar-actions">
-        <div class="account" title="Signed in">
-          <span class="account-email" id="account-email"></span>
+        <div class="account">
+          <span class="avatar" aria-hidden="true"><span id="account-initials"></span><img id="account-photo" alt="" referrerpolicy="no-referrer" hidden></span>
+          <span class="account-name" id="account-name"></span>
           <button class="btn btn-small" id="signout" type="button">Sign out</button>
         </div>
         <label class="search" id="search-box">
@@ -418,7 +419,7 @@
                 <div class="sliders">
                   <label class="slider"><span>Background dim</span><input id="bg-dim" type="range" min="0" max="90" step="1" value="0"><output id="bg-dim-value" for="bg-dim">0%</output></label>
                   <label class="slider"><span>Card blur</span><input id="card-blur" type="range" min="0" max="24" step="1" value="12"><output id="card-blur-value" for="card-blur">12px</output></label>
-                  <label class="slider"><span>Card opacity</span><input id="card-alpha" type="range" min="85" max="95" step="1" value="95"><output id="card-alpha-value" for="card-alpha">95%</output></label>
+                  <label class="slider"><span>Card opacity</span><input id="card-alpha" type="range" min="85" max="100" step="1" value="95"><output id="card-alpha-value" for="card-alpha">95%</output></label>
                 </div>
                 <div class="appearance-actions">
                   <span class="small" id="appearance-status" role="status"></span>
@@ -451,6 +452,14 @@
         <section class="page" id="page-aegismesh">
           <iframe class="aegis-frame" id="aegismesh-frame" title="AegisMesh simulation console" allow="camera"></iframe>
         </section>
+        <dialog class="sheet-dialog" id="camera-dialog" aria-labelledby="camera-dialog-title">
+          <h2 id="camera-dialog-title">Camera access is off</h2>
+          <p>AegisMesh uses the camera for tap rhythms, hand signs and expressions. Video stays on this Mac. Turn on The Nex in System Settings, then reopen the app.</p>
+          <div class="button-group end">
+            <button class="btn btn-small" id="camera-later" type="button">Not now</button>
+            <button class="btn btn-small btn-ink" id="camera-settings" type="button">Open Camera Settings</button>
+          </div>
+        </dialog>
       </div>
     </main>
   </div>

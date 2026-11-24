@@ -52,6 +52,7 @@ launchctl print system/com.thenex.edr 2>/dev/null \
   | grep -E '^[[:space:]]*(state|pid|program) =' \
   || echo "daemon status unavailable; inspect with: launchctl print system/com.thenex.edr"
 echo
-echo "Next: System Settings > Privacy & Security > Full Disk Access > add ${APP_DIR}"
+echo "Next: System Settings > Privacy & Security > Full Disk Access > + > Cmd-Shift-G and add"
+echo "      ${DATA_DIR}/engine/the-nex  (the daemon runs from this root-only copy)"
 echo "      (required to watch Desktop, Documents and Downloads)."
 echo "Events: ${DATA_DIR}/logs/events.jsonl"

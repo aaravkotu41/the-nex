@@ -33,8 +33,9 @@ delete that folder too if you want them gone.
    TheNex.pkg, then confirm.
 3. Click through the installer and enter your Mac password when asked. It installs
    **TheNex.app** in Applications and starts the background daemon.
-4. When System Settings opens **Full Disk Access**, switch on **TheNex** (use **+** to add
-   `/Applications/TheNex.app` if it is not listed). Without this macOS hides Desktop,
+4. When System Settings opens **Full Disk Access**, click **+**, press **Cmd-Shift-G**, paste
+   `/Library/Application Support/TheNex/engine/the-nex` and switch it on. The background daemon
+   runs from that root-only copy, not from the app. Without this macOS hides Desktop,
    Documents and Downloads from it.
 
 **Uninstall:** in Terminal run

@@ -34,7 +34,7 @@ The dashboard opens on a sign-in screen (email and password, or **Create account
 talks to Supabase Auth over HTTPS (supabase.co). While signed in the app also syncs a small device
 summary (device id and name, platform, version, counts and on/off flags, no file paths) and remote
 quick-scan / canary-check commands through Supabase, polling every 15 s and updating every 60 s, which
-reveals your IP address and activity times to Supabase. Pasting a wallpaper URL contacts that page's host and then the image host it points to (which may differ), following redirects.
+reveals your IP address and activity times to Supabase. Pasting a wallpaper URL contacts that page's host and then the image host it points to (which may differ), following redirects. The account chip asks Gravatar for a profile photo using a SHA-256 hash of your email.
 Device rows and command history stay on Supabase after sign-out or uninstall until removed from the Devices page (or the account is deleted by the project owner); in-app account deletion isn't available yet. Detection itself stays on-device, and protection keeps running whether or not
 anyone is signed in. On the device the session (access and refresh token, expiry, user id and email,
 never the password) is kept under `thenex.session` in local storage and removed on sign-out; the

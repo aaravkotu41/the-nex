@@ -210,6 +210,12 @@ fn osascript_notification(title: &str, body: &str) -> io::Result<()> {
 }
 
 pub fn send_desktop_notification(title: &str, body: &str) {
+    // Without this the library looks up an app named "use_default", and macOS answers with a
+    // "Where is use_default?" Choose Application window.
+    static APP_SET: std::sync::Once = std::sync::Once::new();
+    APP_SET.call_once(|| {
+        let _ = notify_rust::set_application("com.thenex.edr");
+    });
     let primary = notify_rust::Notification::new()
         .summary(title)
         .body(body)
@@ -410,16 +416,84 @@ fn require_root_owned_chain(exe: &Path) -> Result<(), String> {
     for dir in exe.ancestors().filter(|p| !p.as_os_str().is_empty()) {
         let meta = fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let mode = meta.mode();
-        let group_ok = mode & 0o020 == 0 || matches!(meta.gid(), 0 | 80);
-        if meta.uid() != 0 || mode & 0o002 != 0 || !group_ok {
+        if meta.uid() != 0 || mode & 0o022 != 0 {
             return Err(format!(
-                "{} is not root-owned or is writable by other users, so the root daemon cannot run from it. \
-                 Move The Nex to /Applications and run the installer, or install with the .pkg",
+                "{} is not root-owned or is writable by a group or other users, so the root daemon cannot run from it",
                 dir.display()
             ));
         }
     }
     Ok(())
+}
+
+/// Built in, so the root daemon never loads a model file a user could have swapped in the app.
+const EMBEDDED_MODEL: &[u8] = include_bytes!("../../../../thenex_model.onnx");
+
+/// The daemon runs as root from its own copy in a root-only folder. /Applications is group-writable
+/// by admin (and a dragged-in app is user-owned), so the app's copy could be swapped without a password.
+fn install_engine_copy(exe: &Path, cfg: &AppConfig) -> Result<PathBuf, String> {
+    require_root_owned_chain(&cfg.base_dir)?;
+    let dir = cfg.base_dir.join("engine");
+    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    require_root_owned_chain(&dir)?;
+    let engine = dir.join("the-nex");
+    let mut source = fs::File::open(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+    write_root_file(&mut source, &engine, 0o755)?;
+    // The file at `exe` may have been replaced since this process started; install only the exact
+    // program the administrator approved, i.e. the one running now.
+    let running = code_hash(&std::process::id().to_string());
+    if running.is_none() || running != code_hash(&engine.to_string_lossy()) {
+        let _ = fs::remove_file(&engine);
+        return Err("the app changed during install; nothing was installed, try again".to_string());
+    }
+    write_root_file(
+        &mut io::Cursor::new(EMBEDDED_MODEL),
+        &cfg.base_dir.join(config::MODEL_FILE_NAME),
+        0o644,
+    )?;
+    require_root_owned_chain(&engine)?;
+    Ok(engine)
+}
+
+/// The code directory hash of a running pid or of a file, as codesign reports it.
+fn code_hash(target: &str) -> Option<String> {
+    let out = Command::new("/usr/bin/codesign")
+        // A universal file reports its first slice unless told which one is running here.
+        .args([
+            "-d",
+            "--verbose=3",
+            "-a",
+            if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "x86_64"
+            },
+            target,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .find_map(|l| l.strip_prefix("CDHash=").map(str::to_string))
+}
+
+/// A new root-owned file (no ACLs or xattrs, no inode another user holds open), renamed into place.
+fn write_root_file(src: &mut dyn io::Read, dest: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = dest.with_extension("new");
+    let _ = fs::remove_file(&tmp);
+    let err = |e: io::Error| format!("{}: {e}", dest.display());
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)
+        .map_err(err)?;
+    io::copy(src, &mut out).map_err(err)?;
+    out.sync_all().map_err(err)?;
+    fs::set_permissions(&tmp, Permissions::from_mode(mode)).map_err(err)?; // umask-proof
+    fs::rename(&tmp, dest).map_err(err)
 }
 
 pub fn install_service() -> Result<String, String> {
@@ -434,12 +508,11 @@ pub fn install_service() -> Result<String, String> {
         );
     }
 
-    require_root_owned_chain(&exe)?;
-
     let cfg = AppConfig::for_base_dir(&config::default_base_dir());
     let mut notes = harden_data_dirs(&cfg);
-    write_job_file(DAEMON_PLIST, &daemon_plist(&exe, &cfg))?;
-    write_job_file(AGENT_PLIST, &agent_plist(&exe))?;
+    let engine = install_engine_copy(&exe, &cfg)?;
+    write_job_file(DAEMON_PLIST, &daemon_plist(&engine, &cfg))?;
+    write_job_file(AGENT_PLIST, &agent_plist(&engine))?;
     notes.push(format!("wrote {DAEMON_PLIST} and {AGENT_PLIST}"));
 
     let daemon_target = format!("system/{DAEMON_LABEL}");
@@ -461,9 +534,9 @@ pub fn install_service() -> Result<String, String> {
         }
         None => notes.push("notifier starts at next login".to_string()),
     }
-    notes.push(format!("executable: {}", exe.display()));
+    notes.push(format!("executable: {}", engine.display()));
     notes.push(
-        "Grant Full Disk Access to this executable (System Settings > Privacy & Security > Full Disk Access) so Desktop, Documents and Downloads can be protected"
+        "Grant Full Disk Access to this executable (System Settings > Privacy & Security > Full Disk Access, + then Cmd-Shift-G to paste the path) so Desktop, Documents and Downloads can be protected"
             .to_string(),
     );
     Ok(notes.join("\n"))
@@ -502,6 +575,12 @@ pub fn uninstall_service() -> Result<String, String> {
         .count();
     if stopped > 0 {
         notes.push(format!("stopped {stopped} notifier process(es)"));
+    }
+    let engine_dir = config::default_base_dir().join("engine");
+    match fs::remove_dir_all(&engine_dir) {
+        Ok(()) => notes.push(format!("removed {}", engine_dir.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => notes.push(format!("cannot remove {}: {e}", engine_dir.display())),
     }
     let removed = canary::remove_canaries(&discover_canary_dirs());
     notes.push(format!("removed {removed} canary file(s)"));
@@ -613,6 +692,60 @@ pub fn run_elevated_with_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_file_copy_is_fresh_and_has_no_acl() {
+        let dir = env::temp_dir().join(format!("thenex-copy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("src"), dir.join("the-nex"));
+        fs::write(&src, b"engine").unwrap();
+        let acl = Command::new("/bin/chmod")
+            .args(["+a", "everyone allow write"])
+            .arg(&src)
+            .status();
+        fs::write(&dest, b"old").unwrap();
+        write_root_file(&mut fs::File::open(&src).unwrap(), &dest, 0o755).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"engine");
+        assert_eq!(fs::metadata(&dest).unwrap().mode() & 0o777, 0o755);
+        assert_ne!(
+            fs::metadata(&dest).unwrap().ino(),
+            fs::metadata(&src).unwrap().ino()
+        );
+        if acl.is_ok_and(|s| s.success()) {
+            let ls = Command::new("/bin/ls")
+                .arg("-le")
+                .arg(&dest)
+                .output()
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&ls.stdout).contains("allow"),
+                "ACL copied"
+            );
+        }
+        assert!(!dir.join("the-nex.new").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn code_hash_matches_between_a_running_process_and_its_file() {
+        let mut child = Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        let running = code_hash(&child.id().to_string());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(running.is_some());
+        assert_eq!(running, code_hash("/bin/sleep"));
+        assert_ne!(running, code_hash("/bin/ls"));
+        assert!(EMBEDDED_MODEL.len() > 1000);
+    }
+
+    #[test]
+    fn group_writable_folders_like_applications_are_refused() {
+        // /Applications is root:admin 0775: an admin process could swap what the daemon runs.
+        if fs::metadata("/Applications").unwrap().mode() & 0o020 != 0 {
+            assert!(require_root_owned_chain(Path::new("/Applications")).is_err());
+        }
+    }
 
     #[test]
     fn tray_is_windows_only() {

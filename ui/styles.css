@@ -571,8 +571,15 @@ h1, h2, h3 { margin: 0; }
 .login-card .link:focus-visible, .login .btn:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
 .login { animation: drop-in 180ms ease-out; }
 .account { display: flex; align-items: center; gap: 8px; }
-.account-email { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--muted); }
-@media (max-width: 1220px) { .account-email { max-width: 90px; } }
+.avatar { position: relative; display: grid; place-items: center; flex: none; width: 28px; height: 28px; border-radius: 50%; overflow: hidden; background: var(--mint); color: #0E0F0E; font-size: 12px; font-weight: 600; }
+.avatar img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.account-name { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; color: var(--ink); }
+@media (max-width: 1220px) { .account-name { max-width: 90px; } }
+.sheet-dialog { max-width: 420px; padding: 22px 24px; border: 0; border-radius: var(--radius); background: rgb(var(--surface-rgb)); color: var(--ink); box-shadow: var(--shadow), inset 0 0 0 1px var(--line); }
+.sheet-dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
+.sheet-dialog h2 { margin: 0 0 8px; font-size: 17px; font-weight: 500; }
+.sheet-dialog p { margin: 0 0 18px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+.btn-ink { background: var(--ink); color: var(--on-ink); }
 @media (max-width: 760px) {
   .login { grid-template-columns: minmax(0, 1fr); }
   .login-hero { display: none; }

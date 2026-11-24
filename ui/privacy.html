@@ -48,6 +48,11 @@
     </section>
 
     <section class="panel">
+      <h2>Profile photo (Gravatar)</h2>
+      <p>To show your profile photo, the app asks Gravatar (gravatar.com, run by Automattic) for the picture linked to a SHA-256 hash of your email. Gravatar sees that hash and your IP address. If there is no picture, your initials are shown instead.</p>
+    </section>
+
+    <section class="panel">
       <h2>Wallpaper downloads</h2>
       <p>If you paste a wallpaper URL, that page's host is contacted, then the image host it points to (which may differ), following redirects; the image is stored locally. Those hosts see your IP address.</p>
       <p>Device rows and command history stay on Supabase after sign-out or uninstall until you remove them from the Devices page (or the project owner deletes the account). In-app account deletion is not available yet.</p>
@@ -65,6 +70,7 @@
         <li>three.js: MIT</li>
         <li>MediaPipe Tasks Vision and the hand and face models: Apache-2.0</li>
         <li>Supabase: hosted service (sign-in and device sync)</li>
+        <li>Gravatar: hosted service (profile photo)</li>
         <li>Rust crate licences: see <code>Cargo.lock</code> / cargo-about (not yet generated)</li>
       </ul>
     </section>

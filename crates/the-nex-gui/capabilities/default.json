@@ -2,5 +2,5 @@
   "identifier": "default",
   "description": "Main window: core IPC only; every action is an app command defined in src/main.rs.",
   "windows": ["main"],
-  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "core:window:allow-set-theme"]
 }

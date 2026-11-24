@@ -41,6 +41,7 @@ if [[ "${CONSOLE_UID}" != "0" ]]; then
 fi
 launchctl bootout system/com.thenex.edr 2>/dev/null || true
 rm -f "${DAEMON_PLIST}" "${AGENT_PLIST}"
+rm -rf "${DATA_DIR}/engine"
 pkill -x the-nex 2>/dev/null || true
 
 for dir in /Users/*/Desktop /Users/*/Documents; do

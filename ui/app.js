@@ -980,10 +980,37 @@ function showPage(page) {
   $("page-title").textContent = PAGE_TITLES[page];
   $("page-sub").textContent = page === "overview" ? greeting() : PAGE_SUBS[page] || "";
   $("search-box").hidden = !SEARCH_PAGES.has(page);
-  // The AegisMesh console loads on first visit only (it can open the camera).
+  // The AegisMesh console loads when visited and unloads when left: three.js, MediaPipe and the
+  // camera hold a lot of memory, and the camera turns off with it.
   const frame = $("aegismesh-frame");
-  if (page === "aegismesh" && frame && !frame.getAttribute("src")) frame.setAttribute("src", "aegismesh/index.html");
+  const CONSOLE = "aegismesh/index.html";
+  const loaded = frame && frame.getAttribute("src") === CONSOLE;
+  if (page !== "aegismesh" && loaded) frame.setAttribute("src", "about:blank");
+  if (page === "aegismesh" && frame && !loaded) {
+    // Ask macOS for the camera (its popup) while the console loads.
+    frame.setAttribute("src", CONSOLE);
+    checkCamera();
+  }
   refresh(true);
+}
+
+async function checkCamera() {
+  if (!invoke) return;
+  try {
+    const access = await call("camera_access");
+    if (access !== "granted") $("camera-dialog").showModal();
+  } catch {
+    /* no answer to the popup: the console shows its own camera message */
+  }
+}
+
+function wireCameraDialog() {
+  const dialog = $("camera-dialog");
+  $("camera-later").addEventListener("click", () => dialog.close());
+  $("camera-settings").addEventListener("click", () => {
+    dialog.close();
+    call("open_camera_settings").catch((error) => notice(errorText(error), true));
+  });
 }
 
 async function toggleEngine(button) {
@@ -1006,6 +1033,7 @@ async function toggleEngine(button) {
 
 function wire() {
   buildEngineRows();
+  wireCameraDialog();
   for (const item of document.querySelectorAll(".nav-item")) item.addEventListener("click", () => showPage(item.dataset.page));
   // Anything with data-goto opens that page (tiles, engine cards, score items, links); a switch
   // inside a card still only toggles. data-focus also highlights one engine on the Engines page.
@@ -1198,7 +1226,7 @@ function normalizeAppearance(value) {
     wallpaper_source: source,
     bg_dim: clampNumber(a.bg_dim, 0, 0.9, DEFAULT_APPEARANCE.bg_dim),
     card_blur: clampNumber(a.card_blur, 0, 24, DEFAULT_APPEARANCE.card_blur),
-    card_alpha: clampNumber(a.card_alpha, 0.85, 0.95, DEFAULT_APPEARANCE.card_alpha),
+    card_alpha: clampNumber(a.card_alpha, 0.85, 1, DEFAULT_APPEARANCE.card_alpha),
   };
 }
 
@@ -1475,6 +1503,9 @@ function isLight() {
 
 function applyTheme() {
   document.documentElement.dataset.theme = isLight() ? "light" : "dark";
+  // The macOS glass behind the page follows the window theme, not the page; keep them matched.
+  const win = tauri && tauri.window && tauri.window.getCurrentWindow ? tauri.window.getCurrentWindow() : null;
+  if (win) win.setTheme(themePref() === "system" ? null : isLight() ? "light" : "dark").catch(() => {});
   for (const button of document.querySelectorAll("[data-theme-choice]")) {
     button.setAttribute("aria-pressed", String(button.dataset.themeChoice === themePref()));
   }
@@ -1515,6 +1546,11 @@ async function initAppearance() {
 }
 
 let refreshTimer = null;
+function openMenuPage(page) {
+  if (page === "activity") openActivity();
+  else if (["quarantine", "settings"].includes(page)) showPage(page);
+}
+
 function startDashboard() {
   wire();
   if (window.NexSync) window.NexSync.start(call);
@@ -1528,11 +1564,9 @@ function startDashboard() {
   const events = window.__TAURI__ && window.__TAURI__.event;
   if (events) {
     // Menu-bar shortcuts (macOS); only known pages are honoured.
-    events.listen("menubar://navigate", (e) => {
-      const page = e.payload;
-      if (page === "activity") openActivity();
-      else if (["quarantine", "settings"].includes(page)) showPage(page);
-    });
+    events.listen("menubar://navigate", (e) => openMenuPage(e.payload));
+    // A window the menu bar just rebuilt names its page in the address instead.
+    openMenuPage(location.hash.slice(1));
     events.listen("menubar://refresh", () => refresh(true));
   }
 }

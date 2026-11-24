@@ -28,6 +28,17 @@
   <true/>
   <key>NSCameraUsageDescription</key>
   <string>The AegisMesh page uses the camera to recognise tap rhythms, emergency hand signs and facial expressions on this Mac. Video never leaves the app and is not recorded.</string>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>com.thenex.edr.open</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>thenex</string>
+      </array>
+    </dict>
+  </array>
   <key>NSHumanReadableCopyright</key>
   <string>The Nex endpoint protection</string>
 </dict>

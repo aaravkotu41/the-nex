@@ -4473,8 +4473,11 @@ name = "the-nex-gui"
 version = "0.3.0"
 dependencies = [
  "aegismesh-core",
+ "block2",
  "chrono",
  "native-tls",
+ "objc2",
+ "objc2-foundation",
  "serde",
  "serde_json",
  "tauri",

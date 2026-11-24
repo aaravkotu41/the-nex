@@ -159,6 +159,31 @@
     el.dataset.tone = tone || "";
   }
 
+  // "jane.doe42@x" -> "Jane Doe": the email's name part, split on . _ - +, digits dropped.
+  function nameFromEmail(email) {
+    const local = String(email).split("@")[0];
+    const words = local.split(/[._+-]+/).map((w) => w.replace(/\d+/g, "")).filter(Boolean);
+    const name = words.map((w) => w[0].toUpperCase() + w.slice(1).toLowerCase()).join(" ");
+    return name || local;
+  }
+
+  // Gravatar photo for the email (sent as a SHA-256 hash); initials stay if there is none.
+  async function showAccount(email) {
+    const name = nameFromEmail(email);
+    $("account-name").textContent = name;
+    $("account-name").parentElement.title = email;
+    $("account-initials").textContent = name.split(" ").slice(0, 2).map((w) => w[0]).join("").toUpperCase();
+    if (!(window.crypto && crypto.subtle)) return;
+    try {
+      const bytes = new TextEncoder().encode(String(email).trim().toLowerCase());
+      const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)), (b) => b.toString(16).padStart(2, "0")).join("");
+      const img = $("account-photo");
+      img.onload = () => { img.hidden = false; };
+      img.src = `https://gravatar.com/avatar/${hash}?s=64&d=404`;
+    } catch { /* keep the initials */ }
+  }
+  window.NexAuth.nameFromEmail = nameFromEmail;
+
   window.NexAuth.gate = async function (start) {
     const form = $("login-form"), msg = $("login-msg"), submit = $("login-submit"), toggle = $("login-toggle");
     const email = $("login-email"), pass = $("login-password"), lock = $("login");
@@ -169,8 +194,7 @@
       lock.hidden = true;
       document.querySelector(".app").hidden = false;
       const title = $("page-title"); title.tabIndex = -1; title.focus();
-      $("account-email").textContent = s.user.email;
-      $("account-email").title = s.user.email;
+      showAccount(s.user.email);
       start();
     };
     $("signout").addEventListener("click", async () => { await signOut(); location.reload(); });

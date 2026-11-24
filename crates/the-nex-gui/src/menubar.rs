@@ -1,10 +1,16 @@
 //! macOS menu-bar item. Windows already has the daemon's `--tray` notification-area icon.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{ActivationPolicy, App, AppHandle, Emitter, Manager, RunEvent, WindowEvent, Wry};
+use tauri::{
+    ActivationPolicy, App, AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder,
+    WindowEvent, Wry,
+};
+
+use crate::quitguard::IN_MENU_BAR;
 
 // Each refresh reads canaries and quarantine; 15 s keeps the menu current without busy work.
 const STATUS_REFRESH: Duration = Duration::from_secs(15);
@@ -54,6 +60,7 @@ fn scan_text(report: Result<the_nex_core::engine::QuickScanReport, String>) -> S
 }
 
 pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
+    crate::quitguard::install();
     let status = MenuItem::with_id(app, "status", "Checking…", false, None::<&str>)?;
     let last_scan = MenuItem::with_id(app, "last_scan", "No scan run yet", false, None::<&str>)?;
     let scan = MenuItem::with_id(app, "scan", "Quick Scan", true, None::<&str>)?;
@@ -91,10 +98,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "open" => show_main(app),
             "scan" => quick_scan(app, &scan, &status, &last_scan),
-            page @ ("activity" | "quarantine" | "settings") => {
-                show_main(app);
-                let _ = app.emit("menubar://navigate", page);
-            }
+            page @ ("activity" | "quarantine" | "settings") => open_main(app, Some(page)),
             "quit" => app.exit(0),
             _ => {}
         })
@@ -122,25 +126,51 @@ fn quick_scan(
 }
 
 pub fn show_main(app: &AppHandle) {
+    open_main(app, None);
+}
+
+/// Shows the main window, building it again if it was closed; `page` opens a dashboard page.
+fn open_main(app: &AppHandle, page: Option<&str>) {
+    IN_MENU_BAR.store(false, Ordering::SeqCst);
+    let _ = app.set_activation_policy(ActivationPolicy::Regular);
     if let Some(window) = app.get_webview_window("main") {
-        let _ = app.set_activation_policy(ActivationPolicy::Regular);
         let _ = window.unminimize();
         let _ = window.show();
+        let _ = window.set_focus();
+        if let Some(page) = page {
+            let _ = app.emit("menubar://navigate", page);
+        }
+        return;
+    }
+    let Some(mut config) = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "main")
+        .cloned()
+    else {
+        return;
+    };
+    // A fresh page has no listener yet, so it reads the page from its address (app.js).
+    if let Some(page) = page {
+        config.url = WebviewUrl::App(format!("index.html#{page}").into());
+    }
+    if let Ok(window) = WebviewWindowBuilder::from_config(app, &config).and_then(|b| b.build()) {
         // From Accessory the app is not frontmost; set_focus on the window activates it.
         let _ = window.set_focus();
     }
 }
 
-/// Closing the window hides it so the app stays alive in the menu bar.
+/// Closing the window really closes it, which frees the web view's memory (~160 MB). The app
+/// stays in the menu bar (see on_run_event) and open_main() builds the window again.
 pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
-    if let WindowEvent::CloseRequested { api, .. } = event {
+    if let WindowEvent::CloseRequested { .. } = event {
         if window.label() != "main" {
             return;
         }
-        api.prevent_close();
-        let _ = window.hide();
-        // Leave the Dock while hidden: a pure menu-bar app, which window-closing quit
-        // utilities (e.g. Vorssaint) leave running. show_main() restores the Dock icon.
+        IN_MENU_BAR.store(true, Ordering::SeqCst);
+        // Leave the Dock while closed; open_main() restores the Dock icon.
         let _ = window
             .app_handle()
             .set_activation_policy(ActivationPolicy::Accessory);
@@ -149,7 +179,19 @@ pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
 
 /// Dock-icon click re-shows the hidden window.
 pub fn on_run_event(app: &AppHandle, event: &RunEvent) {
-    if let RunEvent::Reopen { .. } = event {
+    // thenex:// links (from the email-confirmed page) only bring the window forward;
+    // the URL itself is ignored so a web page can never pass data into the app.
+    if matches!(event, RunEvent::Reopen { .. } | RunEvent::Opened { .. }) {
         show_main(app);
+    }
+    // Closing the last window is not quitting: stay in the menu bar. The menu's Quit passes an
+    // exit code and still exits; quit requests from other apps go through quitguard.
+    if let RunEvent::ExitRequested {
+        code: None, api, ..
+    } = event
+    {
+        if IN_MENU_BAR.load(Ordering::SeqCst) {
+            api.prevent_exit();
+        }
     }
 }

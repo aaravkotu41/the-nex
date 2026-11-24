@@ -2,7 +2,11 @@
 
 mod appearance;
 #[cfg(target_os = "macos")]
+mod camera;
+#[cfg(target_os = "macos")]
 mod menubar;
+#[cfg(target_os = "macos")]
+mod quitguard;
 
 use chrono::Utc;
 use serde::Serialize;
@@ -82,9 +86,19 @@ fn is_permission_error(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::PermissionDenied
 }
 
-/// Runs `the-nex <args>` (installed next to this app) through the OS administrator prompt.
+/// Runs `the-nex <args>` through the OS administrator prompt: the root-only engine copy once the
+/// service is installed (the app's own copy may be user-writable), the app's copy to install it.
 fn elevated(args: &[&str]) -> Result<(), String> {
-    let exe = platform::sibling_executable(platform::DAEMON_EXE_STEM);
+    let engine = config()
+        .base_dir
+        .join("engine")
+        .join(platform::DAEMON_EXE_STEM);
+    let exe = if cfg!(target_os = "macos") && args.first() != Some(&"--install") && engine.is_file()
+    {
+        engine
+    } else {
+        platform::sibling_executable(platform::DAEMON_EXE_STEM)
+    };
     if !exe.is_file() {
         return Err(format!("{} was not found next to the app", exe.display()));
     }
@@ -461,6 +475,24 @@ async fn uninstall_service() -> Result<String, String> {
     .await
 }
 
+/// Camera permission for the AegisMesh page: "granted", "denied" or "restricted".
+/// Shows the macOS camera popup if the user has not answered it yet.
+#[tauri::command]
+async fn camera_access() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    return blocking(|| camera::ensure_access().map(str::to_string)).await;
+    #[cfg(not(target_os = "macos"))]
+    Ok("granted".to_string())
+}
+
+#[tauri::command]
+async fn open_camera_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return blocking(camera::open_settings).await;
+    #[cfg(not(target_os = "macos"))]
+    Err("Open your system camera settings and allow The Nex.".to_string())
+}
+
 /// The embedded AegisMesh console (ui/aegismesh) calls this through the parent window.
 /// Every operation is a local, in-memory simulation in aegismesh-core.
 #[tauri::command]
@@ -494,7 +526,9 @@ fn main() {
             appearance::resolve_wallpaper_url,
             appearance::download_wallpaper,
             appearance::save_wallpaper_file,
-            aegismesh
+            aegismesh,
+            camera_access,
+            open_camera_settings
         ])
         .build(tauri::generate_context!())
         .expect("failed to start The Nex desktop app");

@@ -3,10 +3,10 @@
    paints translucent panes on top. Tokens come from styles.css. */
 :root[data-glass="mac"] {
   --glass-rgb: 255, 255, 255;
-  --glass-a: 0.82;
+  --glass-a: var(--card-alpha); /* Settings > Card opacity */
   --glass-edge: rgba(255, 255, 255, 0.7);
   --glass-hi: rgba(255, 255, 255, 0.85);
-  --glass-blur: blur(24px) saturate(1.6);
+  --glass-blur: blur(var(--card-blur)) saturate(1.6); /* Settings > Card blur */
   --glass-shadow: 0 1px 2px rgba(14, 15, 14, 0.05), 0 10px 28px rgba(14, 15, 14, 0.07);
   --glass: rgba(var(--glass-rgb), var(--glass-a));
   --faint: var(--muted);
@@ -16,7 +16,6 @@
 }
 :root[data-glass="mac"][data-theme="dark"] {
   --glass-rgb: 18, 20, 18;
-  --glass-a: 0.8;
   --glass-edge: rgba(255, 255, 255, 0.14);
   --glass-hi: rgba(255, 255, 255, 0.16);
   --glass-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 10px 30px rgba(0, 0, 0, 0.3);
@@ -28,7 +27,8 @@
 /* Let the native glass through; a user wallpaper (--wallpaper) still paints on #bg-wallpaper. */
 :root[data-glass="mac"], :root[data-glass="mac"] body, :root[data-glass="mac"] #bg-scrim,
 :root[data-glass="mac"] .login { background: transparent; }
-:root[data-glass="mac"] #bg-wallpaper { background: transparent var(--wallpaper) center / cover no-repeat; }
+/* 88% theme tint: with no wallpaper, page text stays >=4.5:1 even over a desktop of the opposite colour. */
+:root[data-glass="mac"] #bg-wallpaper { background: rgba(var(--scrim-rgb), 0.88) var(--wallpaper) center / cover no-repeat; }
 :root[data-glass="mac"] #bg-scrim { background: rgba(var(--scrim-rgb), var(--bg-dim)); }
 
 :root[data-glass="mac"] :is(.panel, .stat, .aegis-tile, .scan-sheet, .notice, .search, .icon-btn, .top-status, .service-icon, .login-card, .account) {

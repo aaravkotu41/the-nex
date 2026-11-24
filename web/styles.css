@@ -1,0 +1,69 @@
+:root {
+  --bg: #EFEFED; --card: #FFFFFF; --ink: #0E0F0E; --muted: #55585A;
+  --mint: #7CEB8E; --mint-soft: #DDF7E2; --line: rgba(14, 15, 14, 0.14);
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0F110F; --card: #181B18; --ink: #F1F3F0; --muted: #A9ADA8; --mint-soft: #1E3324; --line: rgba(241, 243, 240, 0.18); }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 17px/1.6 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
+a { color: var(--ink); text-underline-offset: 3px; }
+:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; border-radius: 4px; }
+.skip { position: absolute; left: 8px; top: -80px; padding: 12px 18px; background: var(--ink); color: var(--bg); border-radius: 999px; z-index: 2; }
+.skip:focus { top: 8px; }
+.wrap { width: min(1040px, 100% - 32px); margin-inline: auto; }
+.narrow { width: min(680px, 100% - 32px); }
+.bar { width: min(1040px, 100% - 32px); margin-inline: auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 16px; }
+.top { border-bottom: 1px solid var(--line); }
+.brand { display: inline-flex; align-items: center; gap: 10px; min-height: 44px; font-weight: 700; text-decoration: none; }
+.logo { width: 28px; height: 28px; flex: none; }
+nav a, .foot a { display: inline-flex; align-items: center; min-height: 44px; padding: 0 10px; }
+nav a[aria-current] { font-weight: 700; }
+h1, h2 { line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 16px; }
+h1 { font-size: clamp(2rem, 6vw, 3.4rem); max-width: 16ch; }
+h2 { font-size: clamp(1.4rem, 3.5vw, 1.9rem); }
+.lead { max-width: 52ch; color: var(--muted); font-size: 1.1rem; }
+main > section { padding-block: 40px; }
+.hero { display: grid; grid-template-columns: 1.4fr 1fr; gap: 48px; align-items: end; padding-block: 72px 56px; }
+.facts { margin: 0; }
+.facts div { padding: 14px 0; border-top: 1px solid var(--line); }
+.facts dt { color: var(--muted); font-size: 0.9rem; }
+.facts dd { margin: 0; font-weight: 600; }
+.list div { display: grid; grid-template-columns: 11rem 1fr; gap: 4px 24px; padding: 18px 0; border-top: 1px solid var(--line); }
+.list dt { font-weight: 700; }
+.list dd { margin: 0; color: var(--muted); }
+.band { max-width: none; width: 100%; background: var(--card); padding-block: 56px; }
+.band > * { width: min(1040px, 100% - 32px); margin-inline: auto; }
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 48px; }
+.cols p { margin: 0 0 16px; }
+.btn { display: inline-flex; align-items: center; justify-content: center; min-height: 48px; padding: 0 28px; border: 2px solid var(--ink); border-radius: 999px; background: var(--ink); color: var(--bg); font: inherit; font-weight: 600; text-decoration: none; transition: background-color 150ms, color 150ms; }
+a.btn:hover, button.btn:enabled:hover { background: var(--mint); color: #0E0F0E; border-color: var(--mint); }
+.btn:disabled { background: transparent; color: var(--muted); border-color: var(--muted); border-style: dashed; cursor: not-allowed; }
+.dl { background: var(--mint-soft); border-radius: 24px; padding: 40px 32px; margin-block: 24px 56px; }
+.dl p { margin: 12px 0 0; }
+.mobile-note { display: none; font-weight: 600; }
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
+  .dl-area { display: none; }
+  .mobile-note { display: block; }
+}
+.status { display: none; }
+.status.on { display: block; margin-top: 24px; padding: 24px; border-radius: 20px; background: var(--mint-soft); border: 1px solid var(--line); }
+.status h2 { margin-bottom: 8px; }
+.status p { margin: 0 0 16px; }
+.status .hint { margin: 12px 0 0; min-height: 1.6em; color: var(--muted); font-size: 0.95rem; }
+.doc { padding-block: 48px; }
+.doc ul { padding-left: 1.2em; }
+.doc li { margin-bottom: 10px; }
+.doc h2 { margin-top: 36px; }
+.foot { border-top: 1px solid var(--line); padding-block: 16px; color: var(--muted); }
+.foot p { margin: 0; }
+.foot a { color: var(--ink); }
+@media (max-width: 760px) {
+  .hero, .cols { grid-template-columns: 1fr; gap: 24px; }
+  .hero { padding-block: 40px 24px; }
+  .list div { grid-template-columns: 1fr; }
+  .dl { padding: 28px 20px; border-radius: 20px; }
+}

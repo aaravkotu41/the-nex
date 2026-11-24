@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Privacy - The Nex</title>
+  <meta name="description" content="How the website and The Nex app handle your data.">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="top">
+    <div class="bar">
+      <a class="brand" href="index.html">
+      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+        <g fill="none" stroke="currentColor" stroke-width="2.4">
+          <circle cx="16" cy="16" r="11.5"/>
+          <ellipse cx="16" cy="16" rx="11.5" ry="4.6" transform="rotate(35 16 16)"/>
+          <ellipse cx="16" cy="16" rx="11.5" ry="4.6" transform="rotate(-35 16 16)"/>
+        </g>
+        <circle cx="16" cy="16" r="3" fill="currentColor"/>
+      </svg>
+      <span>The Nex</span></a>
+      <nav aria-label="Site">
+        <a href="index.html#download">Download</a>
+        <a href="privacy.html" aria-current="page">Privacy</a>
+        <a href="terms.html">Terms</a>
+      </nav>
+    </div>
+  </header>
+  <main id="main" class="wrap narrow doc">
+    <h1>Privacy</h1>
+    <p>Last updated 2026-11-24. Operator and contact details: to be added by the project owner.</p>
+
+    <h2>This website</h2>
+    <ul>
+      <li>No cookies, no localStorage, no analytics, and no third-party requests. Nothing is stored on your device, so there is no consent banner.</li>
+      <li>The site is hosted on Vercel. Vercel receives your IP address and standard request logs when you load a page.</li>
+      <li>Email confirmation links put a token in the address after the # sign. The page reads it in your browser only to choose a message, then removes it from the address bar. It is never stored and never sent anywhere.</li>
+    </ul>
+
+    <h2>The desktop app</h2>
+    <ul>
+      <li>Detection runs on your device. Files are not uploaded and nothing is scanned in the cloud.</li>
+      <li>Settings, the event log (file paths and hashes), quarantined files and the last scan report stay in the app data folder on your computer.</li>
+      <li>Sign-in is optional. If you sign in, Supabase (a hosted service) receives your email, a hash of your password and authentication logs including your IP address and user agent.</li>
+      <li>While you are signed in, a device summary is synced about every 60 seconds: device id and name, platform, app version, whether it is online, and counts of threats, quarantined files and canaries. No file paths or event details are included. The app also contacts Supabase about every 15 seconds, which reveals your IP address and activity times to Supabase.</li>
+      <li>Commands you send to a device, such as a quick scan, are stored with a status and a small result summary.</li>
+      <li>To show your profile photo, the app asks Gravatar for the picture linked to a SHA-256 hash of your email. Gravatar sees that hash and your IP address.</li>
+      <li>If you paste a wallpaper URL, that page host and the image host it points to see your IP address.</li>
+      <li>Device rows and command history stay on Supabase after sign-out or uninstall until you remove them from the Devices page or the project owner deletes the account. In-app account deletion is not available yet.</li>
+      <li>On your device the app keeps its session, a device id, and theme and appearance settings in local storage. The session is removed when you sign out and your password is never stored.</li>
+      <li>The AegisMesh demo is a simulation. Camera frames are processed on your device and are never recorded or sent anywhere.</li>
+    </ul>
+    <p>The app has no cookies, no analytics and no ads.</p>
+  </main>
+  <footer class="foot">
+    <div class="bar">
+      <p>The Nex is a hackathon project.</p>
+      <nav aria-label="Legal">
+        <a href="privacy.html">Privacy</a>
+        <a href="terms.html">Terms</a>
+      </nav>
+    </div>
+  </footer>
+</body>
+</html>
