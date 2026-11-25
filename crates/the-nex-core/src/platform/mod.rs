@@ -1,6 +1,6 @@
 //! OS abstraction used by every core module. Each target provides the same function set:
 //! discover_watched_dirs, discover_canary_dirs, discover_quick_scan_dirs, set_hidden_file,
-//! program_file,
+//! program_file, vouched_file,
 //! lock_quarantined_file, unlock_restored_file, send_desktop_notification, is_trusted_binary,
 //! path_key, path_is_within, install_service, uninstall_service, service_installed,
 //! run_service, run_tray, tray_is_running, run_elevated, install_ctrlc_handler, detach_console.
@@ -57,6 +57,21 @@ const PROTECTED_PROCESS_NAMES: &[&str] = &[
     "the-nex-gui",
     "the-nex-gui.exe",
 ];
+
+/// Which file a path leads to, however it is spelled: a hard link, a rename and a moved folder
+/// all keep it. None where the system gives no such number (Windows) or the file is gone.
+pub(crate) fn file_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
 
 /// True when a path contains `..`; containment checks reject such paths instead of resolving them.
 pub(crate) fn has_parent_dir(path: &std::path::Path) -> bool {

@@ -199,6 +199,15 @@ fn process_name(process: &Process) -> String {
     OsStr::new(process.name()).to_string_lossy().into_owned()
 }
 
+/// The name that can earn protection: that of the file the kernel vouches for, so a link called
+/// "dock" to a shell is the shell.
+pub(crate) fn program_name(process: &Process, vouched: Option<&Path>) -> String {
+    match vouched.and_then(Path::file_name) {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => process_name(process),
+    }
+}
+
 fn command_line(process: &Process) -> String {
     process
         .cmd()
@@ -246,14 +255,35 @@ fn real_path(reported: &Path, data_dir: &Path) -> PathBuf {
     }
 }
 
+/// What a process runs: where the file is, and which file that is.
+#[derive(Clone, PartialEq)]
+struct Program {
+    path: Option<PathBuf>,
+    identity: Option<(u64, u64)>,
+}
+
+impl Program {
+    fn of(process: &Process) -> Self {
+        let path = platform::program_file(process);
+        let identity = path.as_deref().and_then(platform::file_identity);
+        Self { path, identity }
+    }
+
+    /// Another program, not the same file under another name (a hard link, a rename, a moved
+    /// bundle) and not one that can no longer be read (deleted, or the process has ended).
+    fn became(&self, now: &Program) -> bool {
+        self.path != now.path && now.identity.is_some() && self.identity != now.identity
+    }
+}
+
 pub struct ProcessGuard {
     cfg: Arc<AppConfig>,
     scanner: Arc<BinaryAiScanner>,
     telemetry: Arc<Telemetry>,
     sys: System,
-    /// pid -> start time and program file. A recycled PID is a new process, and so is one that
-    /// became another program (`exec` keeps the PID and the start time).
-    seen: HashMap<Pid, (u64, Option<PathBuf>)>,
+    /// pid -> start time and program. A recycled PID is a new process, and so is one that became
+    /// another program (`exec` keeps the PID and the start time).
+    seen: HashMap<Pid, (u64, Program)>,
     trust_cache: HashMap<PathBuf, (bin_ai::FileStamp, bool)>,
     /// Program file -> its SHA-256 when it is on the known-malware list, so each version of a
     /// program is hashed once however often it starts.
@@ -305,13 +335,17 @@ impl ProcessGuard {
         let (mut fresh, mut became) = (Vec::new(), Vec::new());
         for (pid, process) in self.sys.processes() {
             let started = process.start_time();
-            let file = platform::program_file(process);
-            match self.seen.get(pid) {
-                Some((s, f)) if *s == started && (*f == file || file.is_none()) => continue,
-                Some((s, _)) if *s == started => became.push(*pid),
-                _ => {}
+            let known = self.seen.get(pid).filter(|(s, _)| *s == started);
+            if known.is_some_and(|(_, p)| p.path == platform::program_file(process)) {
+                continue;
             }
-            self.seen.insert(*pid, (started, file));
+            let program = Program::of(process);
+            match known {
+                Some((_, before)) if !before.became(&program) => continue,
+                Some(_) => became.push(*pid),
+                None => {}
+            }
+            self.seen.insert(*pid, (started, program));
             fresh.push(*pid);
         }
         if !became.is_empty() {
@@ -377,11 +411,11 @@ impl ProcessGuard {
                 self.pending_ai.push_back((pid, true));
             } else {
                 // One that was running when protection started keeps that status.
-                let preexisting = self
-                    .sys
-                    .process(pid)
-                    .is_some_and(|p| self.baseline.contains(&(pid, p.start_time())));
-                self.pending_ai.insert(next_new, (pid, preexisting));
+                if self.was_running(pid) {
+                    self.pending_ai.push_back((pid, true));
+                    continue;
+                }
+                self.pending_ai.insert(next_new, (pid, false));
                 next_new += 1;
             }
         }
@@ -397,30 +431,52 @@ impl ProcessGuard {
         }
     }
 
+    /// Running since before protection started, whatever it has become since.
+    fn was_running(&self, pid: Pid) -> bool {
+        self.sys
+            .process(pid)
+            .is_some_and(|p| self.baseline.contains(&(pid, p.start_time())))
+    }
+
     /// LotL command-line check. True when the process needs nothing more (handled, protected
     /// or gone).
     fn inspect_command(&mut self, pid: Pid) -> bool {
         let Some(process) = self.sys.process(pid) else {
             return true;
         };
-        let name = process_name(process);
-        let exe = platform::program_file(process);
-        if is_protected(pid.as_u32(), &name, exe.as_deref(), |e| self.is_trusted(e)) {
+        let vouched = platform::vouched_file(process);
+        let protected_name = program_name(process, vouched.as_deref());
+        if is_protected(pid.as_u32(), &protected_name, vouched.as_deref(), |e| {
+            self.is_trusted(e)
+        }) {
             return true;
         }
         let Some(process) = self.sys.process(pid) else {
             return true;
         };
         let cmdline = command_line(process);
-        // By the name it was started by (kept after an exec) and by its program's own name.
-        let own = exe
+        // The name it was started by, and the one that leads to (a link to an interpreter).
+        // Never sysinfo's name: it stays that of the first program after an exec, and the new
+        // program's arguments would be judged as a shell's.
+        let started_by = process.exe().map(Path::to_path_buf);
+        let name = match started_by.as_deref().and_then(Path::file_name) {
+            Some(name) if cfg!(target_os = "macos") => name.to_string_lossy().into_owned(),
+            _ => process_name(process),
+        };
+        let real = started_by
+            .filter(|p| p.is_absolute())
+            .and_then(|p| fs::canonicalize(p).ok())
+            .or_else(|| vouched.clone());
+        let real_name = real
             .as_deref()
             .and_then(Path::file_name)
             .map(OsStr::to_string_lossy);
         let pattern = check_lotl_command(&name, &cmdline)
-            .or_else(|| check_lotl_command(own.as_deref()?, &cmdline));
+            .or_else(|| check_lotl_command(real_name.as_deref()?, &cmdline));
         if let Some(pattern) = pattern {
-            self.respond_lotl(pid, &name, &cmdline, pattern);
+            let program = Program::of(process);
+            let started = process.start_time();
+            self.respond_lotl(pid, started, &program, &name, &cmdline, pattern);
             // An alert-only match proves nothing: the program must still reach the list and AI checks.
             return !is_alert_only(pattern);
         }
@@ -497,12 +553,30 @@ impl ProcessGuard {
         true
     }
 
-    fn respond_lotl(&mut self, pid: Pid, name: &str, cmdline: &str, pattern: &str) {
+    /// Ends a process only while it is still the one that was judged: it may have ended (its
+    /// number reused) or become another program in the meantime.
+    fn kill_if_still(&mut self, pid: Pid, started: u64, is_it: impl Fn(&Program) -> bool) -> bool {
+        self.sys
+            .refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        self.sys
+            .process(pid)
+            .is_some_and(|p| p.start_time() == started && is_it(&Program::of(p)) && p.kill())
+    }
+
+    fn respond_lotl(
+        &mut self,
+        pid: Pid,
+        started: u64,
+        program: &Program,
+        name: &str,
+        cmdline: &str,
+        pattern: &str,
+    ) {
         let action = if is_alert_only(pattern) {
             "ALERT_ONLY: command line is only suspicious, not conclusive; alert only".to_string()
         } else if self.cfg.is_dry_run() {
             "DRY_RUN: would terminate process".to_string()
-        } else if self.sys.process(pid).is_some_and(|p| p.kill()) {
+        } else if self.kill_if_still(pid, started, |now| !program.became(now)) {
             "TERMINATED".to_string()
         } else {
             "TERMINATE_FAILED".to_string()
@@ -628,32 +702,41 @@ impl ProcessGuard {
 
     fn kill_all_with_exe(&mut self, exe: &Path) -> Vec<Pid> {
         let target = platform::path_key(exe);
-        let candidates: Vec<(Pid, u64)> = self
+        let identity = platform::file_identity(exe);
+        let base_dir = self.cfg.base_dir.clone();
+        // By place or by file: the kernel may name another hard link to it.
+        let is_it = |program: &Program| {
+            (identity.is_some() && program.identity == identity)
+                || program
+                    .path
+                    .as_deref()
+                    .is_some_and(|p| platform::path_key(&real_path(p, &base_dir)) == target)
+        };
+        let candidates: Vec<(Pid, u64, Program)> = self
             .sys
             .processes()
             .iter()
-            .filter(|(pid, process)| {
-                platform::program_file(process).is_some_and(|file| {
-                    platform::path_key(&real_path(&file, &self.cfg.base_dir)) == target
-                        && !is_protected(pid.as_u32(), &process_name(process), Some(&file), |_| {
-                            false
-                        })
-                }) && !self.ancestors.contains(pid)
-                    && !self.baseline.contains(&(**pid, process.start_time()))
+            .filter_map(|(pid, process)| {
+                let (started, now) = (process.start_time(), Program::of(process));
+                // As it was when first seen, while it has not become another program: after a
+                // rename the kernel may not name the file for a moment.
+                let known = self
+                    .seen
+                    .get(pid)
+                    .filter(|(s, p)| *s == started && !p.became(&now))
+                    .map_or_else(|| now.clone(), |(_, p)| p.clone());
+                let vouched = platform::vouched_file(process);
+                let name = program_name(process, vouched.as_deref());
+                ((is_it(&now) || is_it(&known))
+                    && !is_protected(pid.as_u32(), &name, vouched.as_deref(), |_| false)
+                    && !self.ancestors.contains(pid)
+                    && !self.baseline.contains(&(*pid, started)))
+                .then_some((*pid, started, known))
             })
-            .map(|(pid, process)| (*pid, process.start_time()))
             .collect();
         let mut killed = Vec::new();
-        for (pid, started) in candidates {
-            // The list may be stale: re-read this pid and kill only the same process instance
-            // (a recycled PID has a different start time).
-            self.sys
-                .refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-            if self
-                .sys
-                .process(pid)
-                .is_some_and(|p| p.start_time() == started && p.kill())
-            {
+        for (pid, started, known) in candidates {
+            if self.kill_if_still(pid, started, |now| is_it(now) || !known.became(now)) {
                 killed.push(pid);
             }
         }
@@ -1169,15 +1252,34 @@ mod tests {
                 .map(|e| e.action_taken)
                 .collect()
         };
-        g.respond_lotl(pid, "zsh", "zsh -c x", OSASCRIPT_SHELL_MENTION);
+        let sleeper = g.sys.process(pid).unwrap();
+        let (started, program) = (sleeper.start_time(), Program::of(sleeper));
+        g.respond_lotl(
+            pid,
+            started,
+            &program,
+            "zsh",
+            "zsh -c x",
+            OSASCRIPT_SHELL_MENTION,
+        );
         let seen = actions(&g);
         assert!(seen[0].starts_with("ALERT_ONLY: "), "{seen:?}");
         assert!(
             child.try_wait().unwrap().is_none(),
             "alert-only never kills"
         );
-        g.respond_lotl(pid, "osascript", "osascript -e x", OSASCRIPT_SHELL_FETCH);
-        assert_eq!(actions(&g)[1], "TERMINATED");
+        // Not the one that was judged any more: another start time, or another program.
+        let other = Program {
+            path: Some("/bin/ls".into()),
+            identity: platform::file_identity(Path::new("/bin/ls")),
+        };
+        let fetch = OSASCRIPT_SHELL_FETCH;
+        g.respond_lotl(pid, started + 1, &program, "osascript", "x", fetch);
+        g.respond_lotl(pid, started, &other, "osascript", "x", fetch);
+        assert_eq!(actions(&g)[1..], ["TERMINATE_FAILED", "TERMINATE_FAILED"]);
+        assert!(child.try_wait().unwrap().is_none());
+        g.respond_lotl(pid, started, &program, "osascript", "x", fetch);
+        assert_eq!(actions(&g)[3], "TERMINATED");
         assert!(child.wait().is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1535,7 +1637,7 @@ mod tests {
         let exe = dir.join("napper");
         fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
         let mut g = guard_with_list(&dir, &[&exe], BinaryAiScanner::heuristic_only());
-        let mut child = std::process::Command::new("/bin/sh")
+        let mut child = std::process::Command::new("/bin/bash")
             .args([
                 "-c",
                 "read go; exec ./napper --ignored --exact process_guard::tests::napper",
@@ -1548,7 +1650,6 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = Pid::from_u32(child.id());
-        thread::sleep(Duration::from_millis(300)); // macOS's sh becomes another shell first
         refresh_until_seen(&mut g, &[pid]);
         // Never `poll` here: it would judge every process on this computer.
         assert!(g.fresh_processes().contains(&pid), "the shell, at first");
@@ -1574,6 +1675,109 @@ mod tests {
             actions(&g)
         );
         assert!(child.wait().is_ok() && !exe.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_program_is_judged_by_its_own_name_not_by_what_the_process_was_before() {
+        let dir = std::env::temp_dir().join(format!("thenex-pg-name-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut g = guard_with_list(&dir, &[], BinaryAiScanner::heuristic_only());
+        // A harmless script that hands over to a search for a suspicious word.
+        let mut child = std::process::Command::new("/bin/bash")
+            .args(["-c", "read go; exec /usr/bin/grep 'base64 -d' /dev/stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_u32(child.id());
+        refresh_until_seen(&mut g, &[pid]);
+        assert!(g.fresh_processes().contains(&pid));
+        assert_eq!(process_name(g.sys.process(pid).unwrap()), "bash");
+        let mut stdin = child.stdin.take().unwrap();
+        std::io::Write::write_all(&mut stdin, b"go\n").unwrap();
+        let begun = Instant::now();
+        loop {
+            g.sys
+                .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
+            if g.fresh_processes().contains(&pid) {
+                break;
+            }
+            assert!(begun.elapsed() < Duration::from_secs(5), "never seen again");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let grep = g.sys.process(pid).unwrap();
+        assert!(
+            command_line(grep).contains("base64 -d"),
+            "{}",
+            command_line(grep)
+        );
+        assert!(!g.inspect_command(pid));
+        assert!(actions(&g).is_empty(), "{:?}", actions(&g));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "grep must be left alone"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn another_name_for_the_same_file_is_not_another_program() {
+        let dir = std::env::temp_dir().join(format!("thenex-pg-same-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
+        let (exe, second, moved) = (dir.join("napper"), dir.join("second"), dir.join("moved"));
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        fs::hard_link(&exe, &second).unwrap();
+        let mut g = guard_with_list(&dir, &[&exe], BinaryAiScanner::heuristic_only());
+        let mut child = spawn_napper(&exe);
+        let pid = Pid::from_u32(child.id());
+        refresh_until_seen(&mut g, &[pid]);
+        assert!(g.fresh_processes().contains(&pid));
+        // Looking a hard link up makes the kernel name it; a rename moves the path.
+        let _ = fs::metadata(&second);
+        assert!(!g.fresh_processes().contains(&pid));
+        fs::rename(&exe, &moved).unwrap();
+        assert!(!g.fresh_processes().contains(&pid));
+        assert!(g.sys.process(pid).is_some() && !g.was_running(pid));
+        g.baseline
+            .insert((pid, g.sys.process(pid).unwrap().start_time()));
+        assert!(g.was_running(pid));
+        g.baseline.clear();
+        // Found by the file, whichever of its names the kernel gives.
+        assert_eq!(g.kill_all_with_exe(&second), vec![pid]);
+        assert!(child.wait().is_ok());
+        // An ended process is not a new program either.
+        assert!(!g.fresh_processes().contains(&pid));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_link_with_a_protected_name_does_not_protect_a_shell() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("thenex-pg-dock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dock = dir.join("dock");
+        symlink("/bin/bash", &dock).unwrap();
+        let mut g = guard_with_list(&dir, &[], BinaryAiScanner::heuristic_only());
+        let mut child = std::process::Command::new(&dock)
+            .args(["-c", "read x; : base64 -d"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_u32(child.id());
+        refresh_until_seen(&mut g, &[pid]);
+        assert!(g.inspect_command(pid));
+        assert_eq!(actions(&g), ["LOTL_SCRIPT: TERMINATED"]);
+        assert!(child.wait().is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 

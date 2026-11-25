@@ -4,7 +4,6 @@ use crate::platform;
 use crate::quarantine::{self, Severity, ThreatEvent};
 use crate::status::{CanaryStatus, Telemetry};
 use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
@@ -534,20 +533,22 @@ pub fn select_suspect(sys: &System) -> Option<WriterSuspect> {
     sys.processes()
         .iter()
         .filter_map(|(pid, process)| {
-            let name = OsStr::new(process.name()).to_string_lossy().into_owned();
             let written = process.disk_usage().written_bytes;
             if written <= ACTIVE_WRITE_BYTES {
                 return None;
             }
-            let exe = platform::program_file(process);
+            let vouched = platform::vouched_file(process);
+            let name = crate::process_guard::program_name(process, vouched.as_deref());
             if is_exempt(
                 pid.as_u32(),
                 &name,
-                exe.as_deref(),
+                vouched.as_deref(),
                 platform::is_trusted_binary,
             ) {
                 return None;
             }
+            // A signed app whose files its updater just replaced is still known by how it started.
+            let exe = platform::program_file(process);
             Some(WriterSuspect {
                 pid: *pid,
                 name,

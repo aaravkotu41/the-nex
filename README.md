@@ -120,13 +120,20 @@ under the link's name and skipped.
 On macOS a running program was looked up by the path in its own memory: one started by a relative
 path (`./x`) was not found and so not checked, one that became another program (`exec`) kept its
 first verdict, and a program could rewrite that path. The process guard and the ransomware
-response now ask the kernel, and look again when a process becomes another program. Limits: a
-program that starts and ends between two looks (0.4 s) is still missed, and one already running
-when protection starts is only reported, also if it later becomes another program. None of the
-397 programs running on the developer's Mac lost protection by this
-(`no_running_program_loses_its_protection`, run by hand).
+response now ask the kernel, look again when a process becomes another program (judging it by its
+own name, not by what it was), treat another name for the same file as the same program, and
+check that a process is still the one they judged before ending it. No program running on the
+developer's Mac lost protection at the moments this was tried (as a normal user, 18 of 425 paths
+differed; `no_running_program_loses_its_protection`, run by hand).
 
-Checked on macOS only: 349 Rust tests, the Node tests and 14 live checks. Windows code is
+What an ordinary user's malware can still do: end within 0.4 s; replace or delete its own file
+that fast; run the same shell again with other arguments (`exec bash -c …`), which is not seen as
+another program; run as a script, a library or inside a signed app or interpreter, which the AI
+does not score (perl, ruby, node and others have no command-line rules either); or flood the
+queue of programs to check. For programs already running when protection starts the AI and the
+malware list only report, but the command-line rules still stop them.
+
+Checked on macOS only: 352 Rust tests, the Node tests and 14 live checks. Windows code is
 type-checked, never run. The administrator prompts, the real window and dropping a real file were
 not exercised.
 

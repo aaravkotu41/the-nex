@@ -256,7 +256,14 @@ fn kernel_path(pid: u32) -> Option<PathBuf> {
         )
     };
     buffer.truncate(usize::try_from(len).ok().filter(|&len| len > 0)?);
+    buffer.shrink_to_fit();
     Some(std::ffi::OsString::from_vec(buffer).into())
+}
+
+/// The file a process runs, only as far as the kernel vouches for it: nothing a program writes
+/// into its own memory may earn it protection.
+pub fn vouched_file(process: &sysinfo::Process) -> Option<PathBuf> {
+    kernel_path(process.pid().as_u32())
 }
 
 /// The file a process runs; what it was started by when the kernel no longer knows (deleted).
