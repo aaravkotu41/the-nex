@@ -75,6 +75,7 @@ const TYPE_NOTES = {
   RANSOMWARE_SUSPECT: "A program changed many files in a way that looks like ransomware.",
   QUARANTINE_RESTORE: "You restored this file from quarantine to where it was found.",
   QUARANTINE_DELETE: "You deleted this file from quarantine for good.",
+  SCHEDULED_SCAN: "A scan The Nex started by itself on your schedule. It only reports what it finds and never moves or deletes anything.",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -903,6 +904,72 @@ async function loadAllowed() {
   }));
 }
 
+/* ---- Scheduled scan and summary report (Settings) ------------------------------------------ */
+
+function renderSchedule(info) {
+  state.schedule = info;
+  for (const button of document.querySelectorAll("[data-schedule]")) {
+    button.setAttribute("aria-pressed", String(button.dataset.schedule === info.schedule));
+  }
+  const online = Boolean(state.dashboard && state.dashboard.daemon.online);
+  $("schedule-next").textContent = NexSummary.nextRunText(info, online, new Date(), formatDateTime);
+  $("schedule-last").textContent = NexSummary.lastScanText(info, formatDateTime);
+}
+
+async function loadSchedule() {
+  try {
+    renderSchedule(await call("get_scan_schedule"));
+    const progress = await call("scan_progress").catch(() => null);
+    if (progress && progress.kind === "scheduled" && progress.running) {
+      $("schedule-next").textContent = `A scheduled scan is running now: ${count(progress.files_examined)} files looked at so far.`;
+    }
+  } catch (error) {
+    $("schedule-next").textContent = errorText(error);
+  }
+}
+
+async function chooseSchedule(button) {
+  const buttons = document.querySelectorAll("[data-schedule]");
+  for (const other of buttons) other.disabled = true;
+  try {
+    renderSchedule(await call("set_scan_schedule", { schedule: button.dataset.schedule }));
+  } catch (error) {
+    notice(errorText(error), true);
+    await loadSchedule();
+  }
+  for (const other of buttons) other.disabled = false;
+}
+
+async function saveReport() {
+  const result = $("report-result");
+  const button = $("save-report");
+  button.disabled = true;
+  button.textContent = "Saving…";
+  try {
+    const pressed = document.querySelector("[data-report-days][aria-pressed='true']");
+    const path = await call("save_summary_report", {
+      days: Number(pressed ? pressed.dataset.reportDays : 7),
+      includeFolders: $("report-folders").checked,
+    });
+    result.replaceChildren(el("span", { text: `Saved: ${path}` }), copyButton(path, "Copy path"));
+    result.hidden = false;
+  } catch (error) {
+    notice(errorText(error), true);
+  }
+  button.disabled = false;
+  button.textContent = "Save report";
+}
+
+function wireScheduleAndReport() {
+  for (const button of document.querySelectorAll("[data-schedule]")) button.addEventListener("click", () => chooseSchedule(button));
+  for (const button of document.querySelectorAll("[data-report-days]")) {
+    button.addEventListener("click", () => {
+      for (const other of document.querySelectorAll("[data-report-days]")) other.setAttribute("aria-pressed", String(other === button));
+    });
+  }
+  $("save-report").addEventListener("click", saveReport);
+}
+
 async function refresh(force) {
   if (state.refreshing && !force) return;
   state.refreshing = true;
@@ -924,7 +991,10 @@ async function refresh(force) {
     if (seq !== refreshSeq) return;
     state.quarantine = quarantine;
     renderQuarantine();
-    if (state.page === "settings") await loadAllowed();
+    if (state.page === "settings") {
+      await loadAllowed();
+      await loadSchedule();
+    }
   } catch (error) {
     renderOffline(invoke ? `Unavailable — ${errorText(error)}` : "Open The Nex from its desktop app to manage protection.");
   } finally {
@@ -1310,6 +1380,7 @@ function wire() {
     const intact = canaries.filter((c) => c.state === "Intact").length;
     notice(`${intact} of ${canaries.length} canary files intact.`, intact !== canaries.length);
   }));
+  wireScheduleAndReport();
   $("report-problem").addEventListener("click", () => {
     call("open_report_page", { kind: "bug" }).catch((error) => notice(errorText(error), true));
   });

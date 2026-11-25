@@ -435,6 +435,11 @@ h1, h2, h3 { margin: 0; }
 .row:last-child { border-bottom: 0; }
 .row h3 { font-size: 15.5px; font-weight: 500; }
 .row p { margin: 4px 0 0; font-size: 13.5px; }
+.row.wrap { flex-wrap: wrap; }
+.report-controls { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+.check { display: inline-flex; align-items: center; gap: 8px; font-size: 13.5px; cursor: pointer; }
+.check input { accent-color: var(--ink); }
+.report-result { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 8px; font-size: 13.5px; overflow-wrap: anywhere; }
 .row-title { display: flex; align-items: center; gap: 10px; }
 .row.flash { animation: flash 1.6s ease-out; border-radius: 12px; }
 .thresholds { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }

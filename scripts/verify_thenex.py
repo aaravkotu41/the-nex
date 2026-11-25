@@ -7,7 +7,8 @@ Runs the real release binary against harmless decoys confined to ./thenex_live_s
   3 ratio zip bomb            7 LotL process kill         12 always-allowed file
   4 nested zip bomb           8 canary trip & recovery
   11 --check-file (read-only report on a bomb outside the watched folder)
-Exit status is 0 only when all twelve checks pass.
+  13 scheduled scan (reports a bomb and a listed decoy, moves nothing, runs once)
+Exit status is 0 only when all thirteen checks pass.
 
 Note: like the real product, the console engine watches every process on the machine while
 it runs; checks 7 and 8 rely on that and only target the decoy processes this script starts.
@@ -381,6 +382,41 @@ def check_always_allow(daemon):
         f"disallow={removed.returncode} requarantined={bool(requarantined)} hash_in_event={recorded} {added.stderr.strip()[:120]}")
 
 
+def check_scheduled_scan(daemon):
+    """A due scheduled scan reports a decoy bomb and a listed decoy, moves nothing, logs one
+    summary and is not repeated. The sandbox state file (an old last run and a one-second quiet
+    wait, which only --console honours) makes it due at once; the installed service waits ten
+    minutes."""
+    report_file = SANDBOX / "last_scheduled_scan.json"
+    state_file = DATA / "scheduled_scan.json"
+    bomb, decoy = WATCH / "scheduled_bomb.zip", WATCH / "scheduled_decoy.docm"
+    bomb.write_bytes(ratio_bomb(50))
+    decoy.write_bytes(DECOY)
+    chosen = nex("--set", "scan_schedule=daily")
+    state_file.write_text(json.dumps({"last_run": "2020-01-01T00:00:00Z", "quiet_secs": 1}))
+    daemon.start()
+    ran = wait_until(lambda: report_file.exists() and find_event("SCHEDULED_SCAN"), 20)
+    time.sleep(3)  # a second run would add a second summary
+    summaries = [e for e in read_events() if e.get("threat_type") == "SCHEDULED_SCAN"]
+    daemon.stop()
+    try:
+        report = json.loads(report_file.read_text())
+        state = json.loads(state_file.read_text())
+    except (OSError, ValueError):
+        report, state = {}, {}
+    found = {Path(f.get("path", "")).name for f in report.get("findings", [])}
+    untouched = (bomb.exists() and decoy.exists()
+                 and not quarantined("scheduled_bomb.zip") and not quarantined("scheduled_decoy.docm"))
+    nex("--set", "scan_schedule=off")
+    state_file.unlink(missing_ok=True)
+    ok = (chosen.returncode == 0 and bool(ran) and {"scheduled_bomb.zip", "scheduled_decoy.docm"} <= found
+          and untouched and len(summaries) == 1 and "scheduled" in summaries[0].get("details", "")
+          and state.get("last_run", "") > "2021")
+    return ok, "bomb and decoy reported, nothing moved, one summary" if ok else (
+        f"set={chosen.returncode} ran={bool(ran)} found={sorted(found)} untouched={untouched} "
+        f"summaries={len(summaries)} state={state}")
+
+
 def ensure_assets(skip_build):
     if not MODEL.exists():
         subprocess.run([sys.executable, str(ROOT / "scripts" / "train_onnx.py"), "--out", str(MODEL)], check=True)
@@ -490,6 +526,7 @@ def main():
         ("Live dry-run mode", lambda: check_dry_run(daemon)),
         ("Live file check (read-only)", check_file_report),
         ("Live always-allowed file", lambda: check_always_allow(daemon)),
+        ("Live scheduled scan (report only)", lambda: check_scheduled_scan(daemon)),
     ]
     results = []
     try:

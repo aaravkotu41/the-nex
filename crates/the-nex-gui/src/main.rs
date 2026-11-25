@@ -8,6 +8,7 @@ mod filecheck;
 mod menubar;
 #[cfg(target_os = "macos")]
 mod quitguard;
+mod summary;
 
 use chrono::Utc;
 use serde::Serialize;
@@ -853,7 +854,10 @@ fn main() {
             start_full_scan,
             scan_progress,
             cancel_scan,
-            last_full_scan
+            last_full_scan,
+            summary::get_scan_schedule,
+            summary::set_scan_schedule,
+            summary::save_summary_report
         ])
         .build(tauri::generate_context!())
         .expect("failed to start The Nex desktop app");

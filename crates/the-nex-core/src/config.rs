@@ -1,11 +1,12 @@
 use crate::allowlist::{self, LiveAllowed};
 use crate::known_bad::{self, Digest32, KnownBad};
+use crate::schedule::{self, ScanSchedule};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
@@ -48,6 +49,8 @@ Modes:
   --delete <ID>             permanently delete a quarantined file by its quarantine ID
   --set <ENGINE>=<on|off>   toggle known_bad, zip_bomb, bin_ai, process_guard, canary or
                             dry_run
+  --set scan_schedule=<off|daily|weekly>
+                            run a report-only scan of Downloads and Desktop on a schedule
   --allow <SHA256>          never flag the one file with this SHA-256 again (needs
                             administrator rights); with --allow-name NAME and --allow-type TYPE
   --disallow <SHA256>       remove a file from the always-allowed list
@@ -135,6 +138,7 @@ pub enum Mode {
     Restore(String),
     Delete(String),
     Set(Engine, bool),
+    SetSchedule(ScanSchedule),
     Allow(String),
     Disallow(String),
     AllowQuarantined(String),
@@ -230,11 +234,17 @@ where
             "--set" => {
                 let value = take_value(&mut iter, "--set")?;
                 let (name, state) = value.split_once('=').ok_or("--set expects ENGINE=on|off")?;
-                let engine =
-                    Engine::parse(name).ok_or_else(|| format!("unknown engine: {name}"))?;
-                let enabled = parse_switch(state)
-                    .ok_or_else(|| format!("expected on or off, got {state}"))?;
-                Some(Mode::Set(engine, enabled))
+                if name.trim() == "scan_schedule" {
+                    let schedule = ScanSchedule::parse(state)
+                        .ok_or_else(|| format!("expected off, daily or weekly, got {state}"))?;
+                    Some(Mode::SetSchedule(schedule))
+                } else {
+                    let engine =
+                        Engine::parse(name).ok_or_else(|| format!("unknown engine: {name}"))?;
+                    let enabled = parse_switch(state)
+                        .ok_or_else(|| format!("expected on or off, got {state}"))?;
+                    Some(Mode::Set(engine, enabled))
+                }
             }
             "--dry-run" => {
                 dry_run = true;
@@ -321,6 +331,9 @@ pub struct RuntimeToggles {
     pub process_guard_enabled: bool,
     pub canary_enabled: bool,
     pub dry_run: bool,
+    /// Missing in files from before the schedule existed: off.
+    #[serde(deserialize_with = "schedule::lenient")]
+    pub scan_schedule: ScanSchedule,
 }
 
 impl Default for RuntimeToggles {
@@ -332,6 +345,7 @@ impl Default for RuntimeToggles {
             process_guard_enabled: true,
             canary_enabled: true,
             dry_run: false,
+            scan_schedule: ScanSchedule::Off,
         }
     }
 }
@@ -409,6 +423,7 @@ pub struct LiveToggles {
     process_guard: AtomicBool,
     canary: AtomicBool,
     dry_run: AtomicBool,
+    scan_schedule: AtomicU8,
     loaded_mtime: AtomicU64,
 }
 
@@ -421,6 +436,7 @@ impl LiveToggles {
             process_guard: AtomicBool::new(true),
             canary: AtomicBool::new(true),
             dry_run: AtomicBool::new(false),
+            scan_schedule: AtomicU8::new(0),
             loaded_mtime: AtomicU64::new(0),
         };
         live.apply(toggles);
@@ -444,6 +460,12 @@ impl LiveToggles {
             .store(toggles.process_guard_enabled, Ordering::SeqCst);
         self.canary.store(toggles.canary_enabled, Ordering::SeqCst);
         self.dry_run.store(toggles.dry_run, Ordering::SeqCst);
+        self.scan_schedule
+            .store(toggles.scan_schedule as u8, Ordering::SeqCst);
+    }
+
+    pub fn scan_schedule(&self) -> ScanSchedule {
+        ScanSchedule::from_u8(self.scan_schedule.load(Ordering::SeqCst))
     }
 
     pub fn snapshot(&self) -> RuntimeToggles {
@@ -454,6 +476,7 @@ impl LiveToggles {
             process_guard_enabled: self.process_guard.load(Ordering::SeqCst),
             canary_enabled: self.canary.load(Ordering::SeqCst),
             dry_run: self.dry_run.load(Ordering::SeqCst),
+            scan_schedule: self.scan_schedule(),
         }
     }
 
@@ -1026,6 +1049,57 @@ mod tests {
 
         fs::write(&path, b"{ not json").unwrap();
         assert!(RuntimeToggles::load(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_scan_schedule_defaults_off_and_settings_files_work_both_ways() {
+        assert_eq!(
+            args(&["--set", "scan_schedule=weekly"]).unwrap().mode,
+            Mode::SetSchedule(ScanSchedule::Weekly)
+        );
+        assert!(args(&["--set", "scan_schedule=hourly"]).is_err());
+        assert!(args(&["--set", "scan_schedule=on"]).is_err());
+        assert!(args(&["--set", "scan_schedule=daily", "--set", "canary=on"]).is_err());
+
+        // A file from before the schedule existed, one with an unknown value, and one with a
+        // setting a newer version added all load; only the known name switches it on.
+        let old: RuntimeToggles = serde_json::from_str(r#"{"dry_run":true}"#).unwrap();
+        assert!(old.dry_run && old.scan_schedule == ScanSchedule::Off);
+        let odd: RuntimeToggles =
+            serde_json::from_str(r#"{"scan_schedule":"monthly","from_the_future":1}"#).unwrap();
+        assert_eq!(odd.scan_schedule, ScanSchedule::Off);
+        let daily: RuntimeToggles = serde_json::from_str(r#"{"scan_schedule":"daily"}"#).unwrap();
+        assert_eq!(daily.scan_schedule, ScanSchedule::Daily);
+
+        // What an older app does with a newer file: it reads the engine switches it knows and
+        // ignores the schedule (modelled by a reader that lacks the field).
+        #[derive(Deserialize)]
+        struct Before {
+            canary_enabled: bool,
+            dry_run: bool,
+        }
+        let json = serde_json::to_string(&daily).unwrap();
+        assert!(json.contains(r#""scan_schedule":"daily""#));
+        let before: Before = serde_json::from_str(&json).unwrap();
+        assert!(before.canary_enabled && !before.dry_run);
+
+        // Changing an engine switch keeps the schedule, and the service hot-reloads it.
+        let dir = std::env::temp_dir().join(format!("thenex-sched-set-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        let live = LiveToggles::load(&path);
+        assert_eq!(live.scan_schedule(), ScanSchedule::Off);
+        daily.save(&path).unwrap();
+        assert_eq!(live.reload_if_changed(&path), Some(daily));
+        assert_eq!(live.scan_schedule(), ScanSchedule::Daily);
+        let mut loaded = RuntimeToggles::load(&path).unwrap();
+        loaded.set(Engine::Canary, false);
+        loaded.save(&path).unwrap();
+        assert_eq!(
+            RuntimeToggles::load(&path).unwrap().scan_schedule,
+            ScanSchedule::Daily
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

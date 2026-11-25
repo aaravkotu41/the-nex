@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use the_nex_core::allowlist::{self, AllowedFile};
 use the_nex_core::bin_ai::BinaryAiScanner;
-use the_nex_core::config::{self, AppConfig, CliArgs, Engine, Mode, RuntimeToggles};
+use the_nex_core::config::{self, AppConfig, CliArgs, Mode, RuntimeToggles};
 use the_nex_core::engine;
 use the_nex_core::quarantine::{self, QuarantineMeta, Severity, ThreatEvent};
 use the_nex_core::{canary, logger, notifier, platform};
@@ -33,7 +33,8 @@ fn main() -> ExitCode {
         Mode::Disallow(sha256) => disallow(sha256, &args),
         Mode::AllowQuarantined(id) => allow_quarantined(id, &args),
         Mode::ListAllowed => list_allowed(&args),
-        Mode::Set(engine, enabled) => set_toggle(*engine, *enabled, &args),
+        Mode::Set(engine, enabled) => update_settings(&args, |t| t.set(*engine, *enabled)),
+        Mode::SetSchedule(schedule) => update_settings(&args, |t| t.scan_schedule = *schedule),
         Mode::QuickScan => scan(&args, engine::ScanKind::Quick),
         Mode::FullScan => scan(&args, engine::ScanKind::Full),
         Mode::RearmCanaries => rearm_canaries(&args),
@@ -215,7 +216,7 @@ fn delete(id: &str, args: &CliArgs) -> ExitCode {
     }
 }
 
-fn set_toggle(engine: Engine, enabled: bool, args: &CliArgs) -> ExitCode {
+fn update_settings(args: &CliArgs, change: impl FnOnce(&mut RuntimeToggles)) -> ExitCode {
     let cfg = AppConfig::from_cli(args);
     let mut toggles = match RuntimeToggles::load(&cfg.settings_file) {
         Ok(t) => t,
@@ -224,7 +225,7 @@ fn set_toggle(engine: Engine, enabled: bool, args: &CliArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    toggles.set(engine, enabled);
+    change(&mut toggles);
     match toggles.save(&cfg.settings_file) {
         Ok(()) => {
             println!(

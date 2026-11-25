@@ -7,6 +7,7 @@ use crate::platform;
 use crate::process_guard;
 use crate::quarantine::{self, Severity, ThreatEvent};
 use crate::scan_jobs::{self, ScanJobs};
+use crate::schedule::Scheduler;
 use crate::status::{self, ResourceUsage, Telemetry};
 use crate::zip_bomb;
 use chrono::Utc;
@@ -39,7 +40,10 @@ const BINARY_EXTENSIONS: &[&str] = &["exe", "dll", "scr", "sys", "cpl", "ocx", "
 /// Written next to events.jsonl by `--quick-scan` so callers that cannot read stdout (UAC) get the report.
 pub const QUICK_SCAN_REPORT_FILE: &str = "last_quick_scan.json";
 pub const FULL_SCAN_REPORT_FILE: &str = "last_full_scan.json";
+pub const SCHEDULED_SCAN_REPORT_FILE: &str = "last_scheduled_scan.json";
 pub const SCAN_PROGRESS_FILE: &str = "scan_progress.json";
+/// Marks the summary event (and its notification) of a scan the service started by itself.
+pub const SCHEDULED_SCAN_EVENT: &str = "SCHEDULED_SCAN";
 
 /// True for a Mach-O program or library, from the start of the file: thin (32/64-bit, either
 /// byte order) and fat/universal headers.
@@ -182,6 +186,8 @@ pub struct QuickScanReport {
 pub enum ScanKind {
     Quick,
     Full,
+    /// Started by the service on the user's schedule: a quick scan's folders, report only.
+    Scheduled,
 }
 
 impl ScanKind {
@@ -189,6 +195,7 @@ impl ScanKind {
         match self {
             ScanKind::Quick => QUICK_SCAN_REPORT_FILE,
             ScanKind::Full => FULL_SCAN_REPORT_FILE,
+            ScanKind::Scheduled => SCHEDULED_SCAN_REPORT_FILE,
         }
     }
 }
@@ -475,7 +482,7 @@ pub fn run_scan(
     kind: ScanKind,
     on_dir: &mut dyn FnMut(&QuickScanReport, &Path) -> bool,
 ) -> QuickScanReport {
-    // A full scan only reports. The model wrongly flags about 1 clean program in 200, so moving
+    // A full or scheduled scan only reports. The model wrongly flags about 1 clean program in 200, so moving
     // files across the whole disk on its word would break installed software. Its findings are
     // logged without a notification each; the summary event below is the one alert.
     let report_only = AppConfig {
@@ -490,6 +497,12 @@ pub fn run_scan(
             full_scan_roots(cfg),
             &FULL_LIMITS,
             "FULL_SCAN",
+        ),
+        ScanKind::Scheduled => (
+            &report_only,
+            quick_scan_roots(cfg),
+            &QUICK_LIMITS,
+            SCHEDULED_SCAN_EVENT,
         ),
     };
     let mut report = scan_tree(scan_cfg, scanner, &roots, telemetry, limits, on_dir);
@@ -511,7 +524,12 @@ pub fn run_scan(
                 .join("; "),
             format!("{} threat(s) found", report.findings.len()),
             format!(
-                "examined={} scanned={} truncated={} cancelled={} unreadable_folders={} cloud_skipped={} duration_ms={}",
+                "{}examined={} scanned={} truncated={} cancelled={} unreadable_folders={} cloud_skipped={} duration_ms={}",
+                if kind == ScanKind::Scheduled {
+                    "scheduled, report only; "
+                } else {
+                    ""
+                },
                 report.files_examined,
                 report.files_scanned,
                 report.truncated,
@@ -829,6 +847,7 @@ pub fn run(mut cfg: AppConfig, shutdown: Arc<AtomicBool>) {
     }
     // On-demand scans requested by the desktop app (see scan_jobs).
     let jobs = Arc::new(ScanJobs::default());
+    let mut scheduler = Scheduler::load(&cfg);
     if let Err(e) = scan_jobs::prepare(&cfg) {
         logger::warn(format!("on-demand scans are unavailable: {e}"));
     }
@@ -848,6 +867,7 @@ pub fn run(mut cfg: AppConfig, shutdown: Arc<AtomicBool>) {
         if last_requests.elapsed() >= SCAN_REQUEST_INTERVAL {
             last_requests = Instant::now();
             jobs.poll(&cfg, &scanner, &telemetry);
+            scheduler.tick(&cfg, &jobs, &scanner, &telemetry);
         }
         if last_settings.elapsed() >= SETTINGS_RELOAD_INTERVAL {
             last_settings = Instant::now();

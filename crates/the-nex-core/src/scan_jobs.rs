@@ -12,6 +12,7 @@ use crate::bin_ai::BinaryAiScanner;
 use crate::config::AppConfig;
 use crate::engine::{self, QuickScanReport, ScanKind, SCAN_PROGRESS_FILE};
 use crate::logger;
+use crate::schedule;
 use crate::status::Telemetry;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,8 @@ fn request_name(kind: ScanKind) -> &'static str {
     match kind {
         ScanKind::Quick => "quick-scan",
         ScanKind::Full => "full-scan",
+        // Never read by `poll`: only the schedule starts one, so nobody can ask for it.
+        ScanKind::Scheduled => "scheduled-scan",
     }
 }
 
@@ -149,36 +152,56 @@ impl ScanJobs {
         }
         for kind in [ScanKind::Full, ScanKind::Quick] {
             // A request that arrives during a scan is dropped, not queued.
-            if !take_request(&dir, request_name(kind)) || self.running.swap(true, Ordering::SeqCst)
-            {
-                continue;
-            }
-            self.cancel.store(false, Ordering::SeqCst);
-            let (jobs, cfg, scanner, telemetry) = (
-                Arc::clone(self),
-                Arc::clone(cfg),
-                Arc::clone(scanner),
-                Arc::clone(telemetry),
-            );
-            let spawned = thread::Builder::new()
-                .name("nex-scan-job".to_string())
-                .spawn(move || {
-                    // Cleared on drop, so a panic in the scan cannot leave the service refusing
-                    // every later request.
-                    struct Idle(Arc<ScanJobs>);
-                    impl Drop for Idle {
-                        fn drop(&mut self) {
-                            self.0.running.store(false, Ordering::SeqCst);
-                        }
-                    }
-                    let idle = Idle(jobs);
-                    idle.0.run(kind, &cfg, &scanner, &telemetry);
-                });
-            if let Err(e) = spawned {
-                logger::warn(format!("cannot start the requested scan: {e}"));
-                self.running.store(false, Ordering::SeqCst);
+            if take_request(&dir, request_name(kind)) {
+                self.start(kind, cfg, scanner, telemetry);
             }
         }
+    }
+
+    /// Starts a scan on its own thread unless one is running; true when it was started.
+    pub fn start(
+        self: &Arc<Self>,
+        kind: ScanKind,
+        cfg: &Arc<AppConfig>,
+        scanner: &Arc<BinaryAiScanner>,
+        telemetry: &Arc<Telemetry>,
+    ) -> bool {
+        if self.running.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        self.cancel.store(false, Ordering::SeqCst);
+        let (jobs, cfg, scanner, telemetry) = (
+            Arc::clone(self),
+            Arc::clone(cfg),
+            Arc::clone(scanner),
+            Arc::clone(telemetry),
+        );
+        let spawned = thread::Builder::new()
+            .name("nex-scan-job".to_string())
+            .spawn(move || {
+                // Cleared on drop, so a panic in the scan cannot leave the service refusing
+                // every later request.
+                struct Idle(Arc<ScanJobs>);
+                impl Drop for Idle {
+                    fn drop(&mut self) {
+                        self.0.running.store(false, Ordering::SeqCst);
+                    }
+                }
+                let idle = Idle(jobs);
+                if kind == ScanKind::Scheduled {
+                    schedule::lower_priority();
+                }
+                idle.0.run(kind, &cfg, &scanner, &telemetry);
+            });
+        if let Err(e) = &spawned {
+            logger::warn(format!("cannot start the scan: {e}"));
+            self.running.store(false, Ordering::SeqCst);
+        }
+        spawned.is_ok()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
     }
 
     /// Stops a running scan at the next folder (service shutdown).
