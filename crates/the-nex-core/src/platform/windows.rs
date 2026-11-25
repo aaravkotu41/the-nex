@@ -280,6 +280,13 @@ fn is_link_or_missing(path: &Path) -> bool {
     fs::symlink_metadata(path).map_or(true, |m| m.file_type().is_symlink())
 }
 
+/// Lets any local user create a file in `dir`, but no folder and nothing below it. SYSTEM has
+/// full control of `dir` and so can delete what is left there whatever its own ACL says.
+pub fn let_users_add_files(dir: &Path) -> bool {
+    let add_file = format!("{SID_USERS}:(WD)");
+    !is_link_or_missing(dir) && icacls(dir, &["/grant", add_file.as_str()])
+}
+
 /// Read-only, owned by Administrators, readable only by SYSTEM/Administrators, execute denied to everyone.
 pub fn lock_quarantined_file(path: &Path) {
     if is_link_or_missing(path) {
@@ -1087,12 +1094,6 @@ mod tray {
     const CMD_EXIT: usize = 1003;
     /// Resource ID of the icon embedded into the-nex.exe by the daemon's build script.
     const ICON_RESOURCE_ID: usize = 1;
-    const ALERT_TYPES: [&str; 4] = [
-        "KNOWN_MALWARE",
-        "ZIP_BOMB",
-        "LOTL_SCRIPT",
-        "RANSOMWARE_CANARY",
-    ];
     const MAX_TOASTS_PER_POLL: usize = 3;
 
     static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -1236,7 +1237,7 @@ mod tray {
                     .tail
                     .poll()
                     .into_iter()
-                    .filter(|e| !e.quiet && ALERT_TYPES.contains(&e.threat_type.as_str()))
+                    .filter(ThreatEvent::is_alert)
                     .collect();
                 state.alerts += fresh.len() as u64;
                 if let Some(last) = fresh.last() {

@@ -90,6 +90,12 @@ impl ThreatEvent {
         }
     }
 
+    /// Worth a person's attention: every detection, and nothing that is only a record (a restore,
+    /// a scan that found nothing).
+    pub fn is_alert(&self) -> bool {
+        !self.quiet && self.severity > Severity::Low
+    }
+
     /// Quarantine ID recorded in `action_taken` ("QUARANTINED id=<ID>"), if any.
     pub fn quarantine_id(&self) -> Option<&str> {
         let rest = self.action_taken.split("id=").nth(1)?;
@@ -1080,6 +1086,25 @@ mod tests {
         let root = std::env::temp_dir().join(format!("thenex-q-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         root
+    }
+
+    #[test]
+    fn every_detection_is_an_alert_and_a_record_is_not() {
+        let event = |kind: &str, severity| ThreatEvent::new(kind, severity, "t", "a", "d");
+        for kind in [
+            "MALWARE_AI",
+            "MALWARE_AI_PROCESS",
+            "RANSOMWARE_SUSPECT",
+            "INTEGRITY",
+        ] {
+            assert!(event(kind, Severity::Medium).is_alert(), "{kind}");
+        }
+        assert!(!event("QUARANTINE_RESTORE", Severity::Low).is_alert());
+        let quiet = ThreatEvent {
+            quiet: true,
+            ..event("ZIP_BOMB", Severity::High)
+        };
+        assert!(!quiet.is_alert());
     }
 
     #[test]

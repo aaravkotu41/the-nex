@@ -104,6 +104,15 @@ pub fn prepare(cfg: &AppConfig) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o1733))?;
     }
+    // The installed service only: run by hand, the folder is already the user's own.
+    #[cfg(windows)]
+    if crate::config::running_privileged() && !crate::platform::let_users_add_files(&dir) {
+        // Without the folder the app knows not to ask (see `available`).
+        fs::remove_dir(&dir)?;
+        return Err(io::Error::other(
+            "could not open the request folder to users",
+        ));
+    }
     Ok(())
 }
 
@@ -331,10 +340,8 @@ impl ScanJobs {
 // ---- client side (desktop app) -----------------------------------------------------------
 
 /// True when the service that owns `cfg`'s data folder accepts scan requests.
-/// shortcut: Unix only. On Windows the folder inherits an admin-only ACL, so the app keeps its
-/// elevation prompt there; grant Users "create files" on it to switch Windows over.
 pub fn available(cfg: &AppConfig) -> bool {
-    cfg!(unix) && request_dir(cfg).is_dir()
+    request_dir(cfg).is_dir()
 }
 
 fn drop_request(cfg: &AppConfig, name: &str) -> Result<(), String> {
@@ -430,9 +437,7 @@ mod tests {
     fn a_requested_full_scan_runs_reports_and_never_moves_files() {
         let (root, cfg) = sandbox("full");
         let (jobs, shared, scanner, telemetry) = service(&cfg);
-        // The app only hands scans to the service on Unix (see `available`); the service side
-        // below is the same on every OS.
-        assert_eq!(available(&cfg), cfg!(unix));
+        assert!(available(&cfg));
         jobs.poll(&shared, &scanner, &telemetry); // nothing requested: nothing happens
         assert!(read_progress(&cfg).is_none());
 
