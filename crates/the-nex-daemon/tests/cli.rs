@@ -254,6 +254,8 @@ fn scan_file_explains_verdicts_and_changes_nothing() {
     assert_eq!(missing.status.code(), Some(1));
 }
 
+// Unix only: Windows itself drops a trailing space, so both names are one file there.
+#[cfg(unix)]
 #[test]
 fn check_file_checks_the_file_whose_name_was_given_not_a_trimmed_one() {
     let sandbox = Sandbox::new("checkname");

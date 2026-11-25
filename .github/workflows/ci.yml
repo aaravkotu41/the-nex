@@ -61,6 +61,7 @@ jobs:
           python scripts/gen_test_zipbomb.py
           python scripts/fetch_hash_list.py --self-test
           python scripts/ember_eval.py --self-test
+          python scripts/ci_run.py --self-test
 
       # On-device hand/face models for AegisMesh's emergency signs: pinned, SHA-256 verified,
       # embedded into the apps at build time.
@@ -86,7 +87,7 @@ jobs:
           THENEX_MODEL_PATH: ${{ github.workspace }}\thenex_model.onnx
           RUST_TEST_THREADS: "1"
           RUST_BACKTRACE: "1"
-        run: cargo test --workspace --locked --no-fail-fast
+        run: python scripts/ci_run.py cargo test --workspace --locked --no-fail-fast
 
       # Real-malware regression floor: scores the committed EMBER2024 sample with the model
       # trained above. No download; the full evaluation only ever runs locally.
@@ -122,7 +123,7 @@ jobs:
 
       - name: Live end-to-end verification
         if: ${{ !cancelled() && steps.release.outcome == 'success' }}
-        run: python scripts/verify_thenex.py --skip-build
+        run: python scripts/ci_run.py python scripts/verify_thenex.py --skip-build
 
       - name: Build TheNexSetup.exe (one-click installer)
         id: installer
@@ -259,6 +260,7 @@ jobs:
           python scripts/gen_test_zipbomb.py
           python scripts/fetch_hash_list.py --self-test
           python scripts/ember_eval.py --self-test
+          python scripts/ci_run.py --self-test
 
       - name: Fetch the vision runtime and test the sign recogniser
         run: |
@@ -278,7 +280,7 @@ jobs:
         env:
           THENEX_MODEL_PATH: ${{ github.workspace }}/thenex_model.onnx
           RUST_BACKTRACE: "1"
-        run: cargo test --workspace --locked --no-fail-fast
+        run: python scripts/ci_run.py cargo test --workspace --locked --no-fail-fast
 
       # Real-malware regression floor: scores the committed EMBER2024 sample with the model
       # trained above. No download; the full evaluation only ever runs locally.
@@ -294,7 +296,7 @@ jobs:
 
       - name: Live end-to-end verification
         if: ${{ !cancelled() && steps.dmg.outcome == 'success' }}
-        run: python scripts/verify_thenex.py --skip-build
+        run: python scripts/ci_run.py python scripts/verify_thenex.py --skip-build
 
       - name: AegisMesh simulation verification
         if: ${{ !cancelled() && steps.check.outcome == 'success' }}

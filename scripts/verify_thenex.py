@@ -50,6 +50,18 @@ EXE = ROOT / "target" / "release" / ("the-nex.exe" if WINDOWS else "the-nex")
 MODEL = ROOT / "thenex_model.onnx"
 ICON = ROOT / "crates" / "the-nex-gui" / "icons" / "icon.ico"
 ENV = {**os.environ, "THENEX_DATA_DIR": str(DATA)}
+
+
+def state_dir():
+    """Where the engine keeps its state. An administrator's engine ignores THENEX_DATA_DIR (as on
+    GitHub's Windows machines) and uses the real folder there."""
+    if WINDOWS:
+        import ctypes
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return Path(os.environ["ProgramData"]) / "TheNex"
+    return DATA
+
+
 CANARIES = (".thenex_canary_01.docx", ".thenex_canary_02.xlsx")
 CANARY_MAGIC = b"THENEX\x00CANARY"
 ACTION_TIMEOUT = 3.0
@@ -416,7 +428,8 @@ def check_scheduled_scan(daemon):
     wait, which only --console honours) makes it due at once; the installed service waits ten
     minutes."""
     report_file = SANDBOX / "last_scheduled_scan.json"
-    state_file = DATA / "scheduled_scan.json"
+    state_file = state_dir() / "scheduled_scan.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
     bomb, decoy = WATCH / "scheduled_bomb.zip", WATCH / "scheduled_decoy.docm"
     bomb.write_bytes(ratio_bomb(50))
     decoy.write_bytes(DECOY)
@@ -437,6 +450,7 @@ def check_scheduled_scan(daemon):
                  and not quarantined("scheduled_bomb.zip") and not quarantined("scheduled_decoy.docm"))
     nex("--set", "scan_schedule=off")
     state_file.unlink(missing_ok=True)
+    state_file.with_name("scheduled_seen.json").unlink(missing_ok=True)
     ok = (chosen.returncode == 0 and bool(ran) and {"scheduled_bomb.zip", "scheduled_decoy.docm"} <= found
           and untouched and len(summaries) == 1 and "scheduled" in summaries[0].get("details", "")
           and state.get("last_run", "") > "2021" and state.get("last_attempt", "") > "2021")
