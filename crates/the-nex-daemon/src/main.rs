@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use the_nex_core::allowlist::{self, AllowedFile};
 use the_nex_core::bin_ai::BinaryAiScanner;
 use the_nex_core::config::{self, AppConfig, CliArgs, Engine, Mode, RuntimeToggles};
 use the_nex_core::engine;
-use the_nex_core::quarantine::{self, Severity, ThreatEvent};
+use the_nex_core::quarantine::{self, QuarantineMeta, Severity, ThreatEvent};
 use the_nex_core::{canary, logger, notifier, platform};
 
 fn main() -> ExitCode {
@@ -28,6 +29,10 @@ fn main() -> ExitCode {
         Mode::Uninstall => report(platform::uninstall_service()),
         Mode::Restore(id) => restore(id, &args),
         Mode::Delete(id) => delete(id, &args),
+        Mode::Allow(sha256) => allow(sha256, &args),
+        Mode::Disallow(sha256) => disallow(sha256, &args),
+        Mode::AllowQuarantined(id) => allow_quarantined(id, &args),
+        Mode::ListAllowed => list_allowed(&args),
         Mode::Set(engine, enabled) => set_toggle(*engine, *enabled, &args),
         Mode::QuickScan => scan(&args, engine::ScanKind::Quick),
         Mode::FullScan => scan(&args, engine::ScanKind::Full),
@@ -90,10 +95,14 @@ fn cli_config(args: &CliArgs) -> AppConfig {
 
 fn restore(id: &str, args: &CliArgs) -> ExitCode {
     let cfg = cli_config(args);
-    match quarantine::restore_file(id, &cfg) {
+    restored(id, quarantine::restore_file(id, &cfg), &cfg)
+}
+
+fn restored(id: &str, result: std::io::Result<QuarantineMeta>, cfg: &AppConfig) -> ExitCode {
+    match result {
         Ok(meta) => {
             quarantine::record_event(
-                &cfg,
+                cfg,
                 ThreatEvent::new(
                     "QUARANTINE_RESTORE",
                     Severity::Low,
@@ -107,6 +116,76 @@ fn restore(id: &str, args: &CliArgs) -> ExitCode {
         }
         Err(e) => {
             eprintln!("error: restoring {id} failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// A config that knows the known-malware list, so a listed hash can never be allowed. If the
+/// list is on this build but cannot be verified, nothing is changed.
+fn allow_config(args: &CliArgs) -> Result<AppConfig, String> {
+    let mut cfg = cli_config(args);
+    cfg.load_known_bad()?;
+    Ok(cfg)
+}
+
+fn allow(sha256: &str, args: &CliArgs) -> ExitCode {
+    let result = AllowedFile::new(
+        sha256,
+        args.allow_name.as_deref().unwrap_or("unnamed"),
+        args.allow_type.as_deref().unwrap_or("MANUAL"),
+    )
+    .and_then(|entry| {
+        let cfg = allow_config(args)?;
+        allowlist::add(&cfg, entry).map_err(|e| e.to_string())
+    });
+    match result {
+        Ok(added) => {
+            println!("{}", if added { "Added" } else { "Already listed" });
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: cannot allow {sha256}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn disallow(sha256: &str, args: &CliArgs) -> ExitCode {
+    match allowlist::remove(&cli_config(args), sha256) {
+        Ok(removed) => {
+            println!("{}", if removed { "Removed" } else { "Not listed" });
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: cannot remove {sha256}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn allow_quarantined(id: &str, args: &CliArgs) -> ExitCode {
+    match allow_config(args) {
+        Ok(cfg) => restored(id, allowlist::allow_and_restore(id, &cfg), &cfg),
+        Err(e) => {
+            eprintln!("error: cannot allow {id}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn list_allowed(args: &CliArgs) -> ExitCode {
+    let cfg = AppConfig::from_cli(args);
+    match allowlist::load(&cfg.allowed_file, config::running_privileged()) {
+        Ok(entries) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&entries).unwrap_or_default()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }

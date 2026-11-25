@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use the_nex_core::allowlist::{self, AllowedFile};
 use the_nex_core::bin_ai::BinaryAiScanner;
 use the_nex_core::canary;
 use the_nex_core::config::{AppConfig, Engine, RuntimeToggles, ZipLimits};
@@ -128,6 +129,11 @@ fn elevated(args: &[&str]) -> Result<(), String> {
             Some("--set") => format!("change an engine setting ({})", args[1..].join(" ")),
             Some("--quick-scan") => "run a quick scan".to_string(),
             Some("--restore") => "restore a file from quarantine".to_string(),
+            Some("--allow") => "stop flagging one exact file, for good".to_string(),
+            Some("--allow-quarantined") => {
+                "restore a quarantined file and stop flagging that exact file".to_string()
+            }
+            Some("--disallow") => "start checking one always-allowed file again".to_string(),
             Some("--delete") => "permanently delete a quarantined file".to_string(),
             Some("--rearm-canaries") => "re-create its ransomware decoy files".to_string(),
             _ => format!("run: the-nex {}", args.join(" ")),
@@ -583,6 +589,108 @@ async fn delete_quarantine(id: String) -> Result<String, String> {
     .await
 }
 
+/// The event with this ID, from the log. "Always allow" uses the hash the engine recorded in it,
+/// never a hash sent by the page.
+fn event_by_id(cfg: &AppConfig, id: &str) -> Result<ThreatEvent, String> {
+    quarantine::read_recent_events(&cfg.events_log, EVENT_TAIL_BYTES)
+        .map_err(|e| format!("{}: {e}", cfg.events_log.display()))?
+        .into_iter()
+        .find(|event| event.id == id)
+        .ok_or_else(|| "that event is no longer in the log".to_string())
+}
+
+/// Writes the entry directly where the data folder allows it, else through the administrator
+/// prompt, like `toggle_engine`. Never reachable from synced (remote) commands.
+fn allow_entry(entry: AllowedFile) -> Result<String, String> {
+    let mut cfg = config();
+    // A hash on the known-malware list is refused by the writer; when this process cannot read
+    // the list, the elevated run below checks it.
+    let direct = match cfg.load_known_bad() {
+        Ok(()) => allowlist::add(&cfg, entry.clone()),
+        Err(_) => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+    };
+    match direct {
+        Ok(_) => {}
+        Err(e) if is_permission_error(&e) => elevated(&[
+            "--allow",
+            entry.sha256.as_str(),
+            "--allow-name",
+            entry.name.as_str(),
+            "--allow-type",
+            entry.threat_type.as_str(),
+        ])?,
+        Err(e) => return Err(e.to_string()),
+    }
+    Ok(format!(
+        "{} will not be flagged again unless it changes",
+        entry.name
+    ))
+}
+
+#[tauri::command]
+async fn allow_event(id: String) -> Result<String, String> {
+    blocking(move || {
+        if !quarantine::is_valid_id(&id) {
+            return Err(format!("invalid event ID: {id}"));
+        }
+        allow_entry(AllowedFile::from_event(&event_by_id(&config(), &id)?)?)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn allow_quarantined(id: String) -> Result<String, String> {
+    blocking(move || {
+        if !quarantine::is_valid_id(&id) {
+            return Err(format!("invalid quarantine ID: {id}"));
+        }
+        let mut cfg = config();
+        let direct = match cfg.load_known_bad() {
+            Ok(()) => allowlist::allow_and_restore(&id, &cfg),
+            Err(_) => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        };
+        match direct {
+            Ok(meta) => {
+                audit(&cfg, "QUARANTINE_RESTORE", "RESTORED", &meta);
+                Ok(format!(
+                    "Restored to {}; this exact file will not be flagged again",
+                    meta.original_path.display()
+                ))
+            }
+            Err(e) if is_permission_error(&e) => {
+                elevated(&["--allow-quarantined", id.as_str()])?;
+                Ok(format!(
+                    "Restored {id}; this exact file will not be flagged again"
+                ))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+fn list_allowed() -> Result<Vec<AllowedFile>, String> {
+    allowlist::load(
+        &config().allowed_file,
+        the_nex_core::config::running_privileged(),
+    )
+}
+
+#[tauri::command]
+async fn remove_allowed(sha256: String) -> Result<String, String> {
+    blocking(move || {
+        let sha256 = allowlist::parse_sha256(&sha256)?;
+        match allowlist::remove(&config(), &sha256) {
+            Ok(_) => {}
+            Err(e) if is_permission_error(&e) => elevated(&["--disallow", sha256.as_str()])?,
+            Err(e) => return Err(e.to_string()),
+        }
+        Ok("That file will be checked again".to_string())
+    })
+    .await
+}
+
 #[tauri::command]
 async fn verify_canaries(remote: Option<bool>) -> Result<Vec<CanaryStatus>, String> {
     blocking(move || {
@@ -725,6 +833,10 @@ fn main() {
             list_quarantine,
             restore_quarantine,
             delete_quarantine,
+            allow_event,
+            allow_quarantined,
+            list_allowed,
+            remove_allowed,
             verify_canaries,
             install_service,
             uninstall_service,
@@ -803,6 +915,32 @@ mod tests {
         assert!(event_matches(&lotl, "8842", None));
         assert!(!event_matches(&lotl, "invoice", None));
         assert!(event_matches(&lotl, "", None));
+    }
+
+    #[test]
+    fn always_allow_uses_the_hash_recorded_in_the_log_for_that_event_id() {
+        let dir = std::env::temp_dir().join(format!("thenex-gui-allow-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let cfg = AppConfig::for_base_dir(&dir);
+        let recorded = "ab".repeat(32);
+        let mut flagged = event("ZIP_BOMB", Severity::High, "/Users/x/Downloads/pack.zip");
+        flagged.sha256 = Some(recorded.clone());
+        let lotl = event("LOTL_SCRIPT", Severity::High, "osascript (pid 4)");
+        let unhashed = event("MALWARE_AI", Severity::High, "/tmp/tool");
+        for e in [&flagged, &lotl, &unhashed] {
+            quarantine::append_event(&cfg, e).unwrap();
+        }
+        let found = event_by_id(&cfg, &flagged.id).unwrap();
+        let entry = AllowedFile::from_event(&found).unwrap();
+        assert_eq!(
+            (entry.sha256, entry.name),
+            (recorded, "pack.zip".to_string())
+        );
+        assert!(event_by_id(&cfg, "no-such-event").is_err());
+        // Events without a hash, or of a kind that has no file, can never be allowed.
+        assert!(AllowedFile::from_event(&event_by_id(&cfg, &lotl.id).unwrap()).is_err());
+        assert!(AllowedFile::from_event(&event_by_id(&cfg, &unhashed.id).unwrap()).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -4,10 +4,10 @@
 Runs the real release binary against harmless decoys confined to ./thenex_live_sandbox:
   1 startup & canaries        5 overlapping-header bomb    9 --restore CLI
   2 benign zip pass-through   6 known-malware list        10 --dry-run mode
-  3 ratio zip bomb            7 LotL process kill
+  3 ratio zip bomb            7 LotL process kill         12 always-allowed file
   4 nested zip bomb           8 canary trip & recovery
   11 --check-file (read-only report on a bomb outside the watched folder)
-Exit status is 0 only when all eleven checks pass.
+Exit status is 0 only when all twelve checks pass.
 
 Note: like the real product, the console engine watches every process on the machine while
 it runs; checks 7 and 8 rely on that and only target the decoy processes this script starts.
@@ -40,10 +40,12 @@ STAGING = SANDBOX / "staging"
 EVENTS = SANDBOX / "events.jsonl"
 HASH_LIST = SANDBOX / "known_bad_test.bin"
 DAEMON_LOG = SANDBOX / "daemon-output.log"
+DATA = SANDBOX / "data"  # THENEX_DATA_DIR: keeps settings and the allowed list out of the installed app
 WINDOWS = os.name == "nt"
 EXE = ROOT / "target" / "release" / ("the-nex.exe" if WINDOWS else "the-nex")
 MODEL = ROOT / "thenex_model.onnx"
 ICON = ROOT / "crates" / "the-nex-gui" / "icons" / "icon.ico"
+ENV = {**os.environ, "THENEX_DATA_DIR": str(DATA)}
 CANARIES = (".thenex_canary_01.docx", ".thenex_canary_02.xlsx")
 CANARY_MAGIC = b"THENEX\x00CANARY"
 ACTION_TIMEOUT = 3.0
@@ -164,7 +166,7 @@ class Daemon:
         ]
         if dry_run:
             command.append("--dry-run")
-        kwargs = {}
+        kwargs = {"env": ENV}
         if WINDOWS:
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         log = open(DAEMON_LOG, "ab")
@@ -345,6 +347,40 @@ def check_dry_run(daemon):
         f"known-malware logged={bool(doc_logged)} exists={doc.exists()} quarantined={quarantined(DRY_DECOY_NAME)}")
 
 
+def nex(*args):
+    return subprocess.run([str(EXE), *args], cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=60)
+
+
+def check_always_allow(daemon):
+    """An allowed decoy zip bomb is left alone (under any name), a one-byte-different one is
+    still quarantined, and after --disallow the original is quarantined again."""
+    bomb = ratio_bomb(50)
+    changed = bytearray(bomb)
+    changed[bomb.rindex(b"zeros.bin") + 4] ^= 1  # one byte of the central-directory name
+    sha = hashlib.sha256(bomb).hexdigest()
+    daemon.start()
+    time.sleep(1.5)
+    added = nex("--allow", sha, "--allow-name", "allowed_bomb.zip", "--allow-type", "ZIP_BOMB")
+    listed = nex("--list-allowed").stdout
+    kept = [drop("allowed_bomb.zip", bomb), drop("renamed_copy.zip", bomb)]
+    other = drop("changed_bomb.zip", bytes(changed))
+    flagged = wait_until(lambda: not other.exists() and find_event("ZIP_BOMB", "changed_bomb.zip", "QUARANTINED"), ACTION_TIMEOUT)
+    time.sleep(1.0)
+    left_alone = all(p.exists() for p in kept) and not any(
+        find_event("ZIP_BOMB", p.name) for p in kept)
+    removed = nex("--disallow", sha)
+    again = drop("allowed_again.zip", bomb)
+    requarantined = wait_until(lambda: not again.exists() and find_event("ZIP_BOMB", "allowed_again.zip", "QUARANTINED"), ACTION_TIMEOUT)
+    event = find_event("ZIP_BOMB", "allowed_again.zip")
+    recorded = bool(event) and event.get("sha256") == sha
+    daemon.stop()
+    ok = (added.returncode == 0 and sha in listed and removed.returncode == 0 and bool(flagged)
+          and left_alone and bool(requarantined) and recorded)
+    return ok, "allowed copies untouched, changed one quarantined, flagged again after --disallow" if ok else (
+        f"allow={added.returncode} listed={sha in listed} flagged_changed={bool(flagged)} left_alone={left_alone} "
+        f"disallow={removed.returncode} requarantined={bool(requarantined)} hash_in_event={recorded} {added.stderr.strip()[:120]}")
+
+
 def ensure_assets(skip_build):
     if not MODEL.exists():
         subprocess.run([sys.executable, str(ROOT / "scripts" / "train_onnx.py"), "--out", str(MODEL)], check=True)
@@ -432,8 +468,10 @@ def main():
 
     ensure_assets(args.skip_build)
     remove_sandbox()
-    for folder in (WATCH, QUARANTINE, STAGING):
+    for folder in (WATCH, QUARANTINE, STAGING, DATA):
         folder.mkdir(parents=True, exist_ok=True)
+    if MODEL.exists():
+        shutil.copy(MODEL, DATA / MODEL.name)
 
     fillers = [hashlist.prefix(hashlib.sha256(b"filler-%d" % i).digest()) for i in range(20)]
     hashlist.write_list(HASH_LIST, fillers + [hashlist.prefix(hashlib.sha256(DECOY).digest())], int(time.time()))
@@ -451,6 +489,7 @@ def main():
         ("Live restore CLI", lambda: check_restore(daemon, ratio_data)),
         ("Live dry-run mode", lambda: check_dry_run(daemon)),
         ("Live file check (read-only)", check_file_report),
+        ("Live always-allowed file", lambda: check_always_allow(daemon)),
     ]
     results = []
     try:

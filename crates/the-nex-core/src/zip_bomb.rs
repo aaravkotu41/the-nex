@@ -1,3 +1,4 @@
+use crate::allowlist;
 use crate::config::{AppConfig, ZipLimits};
 use crate::quarantine::{self, Severity, ThreatEvent};
 use std::fs::{self, File};
@@ -854,6 +855,10 @@ fn inspect_level<R: Read + Seek>(
 
 pub fn scan_and_respond(path: &Path, cfg: &AppConfig) -> Option<ZipThreat> {
     let threat = inspect_zip_file(path, cfg)?;
+    let (digest, allowed) = allowlist::check(cfg, path);
+    if allowed {
+        return None;
+    }
     let details = threat.summary();
     let action = if cfg.is_dry_run() {
         "DRY_RUN: would quarantine".to_string()
@@ -871,7 +876,8 @@ pub fn scan_and_respond(path: &Path, cfg: &AppConfig) -> Option<ZipThreat> {
             path.display().to_string(),
             action,
             details,
-        ),
+        )
+        .with_sha256(digest),
     );
     Some(threat)
 }

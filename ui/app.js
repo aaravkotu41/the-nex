@@ -44,6 +44,9 @@ const TOGGLE_FIELDS = {
 const RED_TYPES = new Set(["ZIP_BOMB", "RANSOMWARE_CANARY", "RANSOMWARE_SUSPECT", "MALWARE_AI", "MALWARE_AI_PROCESS", "KNOWN_MALWARE"]);
 const AMBER_TYPES = new Set(["LOTL_SCRIPT"]);
 const GREEN_TYPES = new Set(["QUARANTINE_RESTORE"]);
+// Detections that "Always allow" can cover: whole files judged by an estimating engine.
+const ALLOWABLE_TYPES = new Set(["MALWARE_AI", "MALWARE_AI_PROCESS", "ZIP_BOMB"]);
+const ALLOW_NOTE = "Always allow: this exact file (matched by its SHA-256) will never be flagged again until its contents change. It needs your administrator approval.";
 
 const state = {
   page: "overview",
@@ -203,7 +206,7 @@ function copyButton(text, label = "Copy") {
 
 /** Copies an item's details (file name only, account name removed) and opens the website's
  *  report form in the browser. The app itself sends nothing. */
-function reportButton(item) {
+function reportButton(item, ...more) {
   const button = el("button", {
     className: "btn btn-small", text: "Report as safe",
     title: "Copies these details, without the file's folder or your account name, and opens the report form in your browser",
@@ -221,7 +224,7 @@ function reportButton(item) {
     }
     call("open_report_page", { kind: "false_alarm" }).catch((error) => notice(errorText(error), true));
   });
-  return el("div", { className: "detail-actions" }, [button]);
+  return el("div", { className: "button-group detail-actions" }, [button, ...more]);
 }
 
 function detailGrid(entries, note) {
@@ -380,7 +383,9 @@ function activityRows(event) {
     ["Action taken", event.action_taken],
     ["Event ID", event.id, event.id],
   ], TYPE_NOTES[event.threat_type]);
-  detail.append(reportButton(event));
+  const allowable = event.sha256 && ALLOWABLE_TYPES.has(event.threat_type);
+  detail.append(reportButton(event, ...(allowable ? [quarantineButton("allow_event", "Always allow", event.id)] : [])));
+  if (allowable) detail.append(el("p", { className: "detail-note", text: ALLOW_NOTE }));
   return expandable(cells, detail, open, () => {
     state.openEvent = open ? null : event.id;
     loadEvents().catch(() => {});
@@ -720,6 +725,8 @@ function quarantineButton(action, label, id) {
   const button = el("button", {
     className: action === "delete" ? "btn btn-small btn-danger" : "btn btn-small",
     text: armed ? `Confirm ${label.toLowerCase()}` : label,
+    title: action.startsWith("allow") ? ALLOW_NOTE : "",
+    attrs: { type: "button" },
   });
   button.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -767,7 +774,10 @@ function quarantineRows(q) {
     ["Stored as", q.quarantined_path],
     ["Quarantine ID", q.id],
   ], `${TYPE_NOTES[q.threat_type] ? `${TYPE_NOTES[q.threat_type]} ` : ""}The file is locked away and cannot run. Restore puts it back where it was found; Delete removes it for good.`);
-  detail.append(reportButton({ ...q, target: q.original_path, timestamp: q.quarantined_at }));
+  const allowable = q.sha256 && ALLOWABLE_TYPES.has(q.threat_type);
+  detail.append(reportButton({ ...q, target: q.original_path, timestamp: q.quarantined_at },
+    ...(allowable ? [quarantineButton("allow_quarantined", "Restore and always allow", q.id)] : [])));
+  if (allowable) detail.append(el("p", { className: "detail-note", text: `${ALLOW_NOTE} The file is restored first.` }));
   return expandable(cells, detail, open, () => {
     state.openQuarantine = open ? null : q.id;
     renderQuarantine();
@@ -794,24 +804,27 @@ function renderQuarantineFacts(all) {
 
 function renderQuarantine() {
   const records = state.quarantine.filter((q) => matchesQuery(q.id, q.original_path, q.sha256, q.threat_type, q.details));
-  const signature = JSON.stringify([state.openQuarantine, records.map((q) => [q.id, confirming("restore", q.id), confirming("delete", q.id)])]);
+  const signature = JSON.stringify([state.openQuarantine, records.map((q) => [q.id, confirming("restore", q.id), confirming("delete", q.id), confirming("allow_quarantined", q.id)])]);
   replaceIfChanged($("quarantine-rows"), signature, () => records.flatMap(quarantineRows));
   renderQuarantineFacts(state.quarantine);
   $("quarantine-empty").hidden = records.length > 0;
   $("quarantine-count").textContent = `${state.quarantine.length} file${state.quarantine.length === 1 ? "" : "s"} · click a row for details`;
 }
 
+const ACTION_COMMANDS = { restore: "restore_quarantine", delete: "delete_quarantine", allow_quarantined: "allow_quarantined", allow_event: "allow_event" };
+
 async function quarantineAction(action, id, event) {
+  const redraw = () => { renderQuarantine(); loadEvents().catch(() => {}); };
   if (!confirming(action, id)) {
     state.confirm = { action, id, at: Date.now(), until: Date.now() + CONFIRM_MS };
-    renderQuarantine();
-    setTimeout(renderQuarantine, CONFIRM_MS + 50);
+    redraw();
+    setTimeout(redraw, CONFIRM_MS + 50);
     return;
   }
   if (event.detail > 1 || Date.now() - state.confirm.at < 400) return; // a double-click must not confirm
   state.confirm = null;
   try {
-    const message = await call(action === "restore" ? "restore_quarantine" : "delete_quarantine", { id });
+    const message = await call(ACTION_COMMANDS[action], { id });
     notice(message, false);
   } catch (error) {
     notice(errorText(error), true);
@@ -852,12 +865,44 @@ async function loadEvents() {
     $("activity-range").textContent = capped
       ? `Only the newest ${count(ACTIVITY_LIMIT)} events are listed; the Overview chart counts all of them. ${range}`
       : range;
-    replaceIfChanged($("activity-events"), `${eventsSignature(shown)}|${state.openEvent}`, () => shown.flatMap(activityRows));
+    replaceIfChanged($("activity-events"), `${eventsSignature(shown)}|${state.openEvent}|${confirming("allow_event", state.openEvent)}`, () => shown.flatMap(activityRows));
     $("activity-empty").hidden = shown.length > 0;
   }
 }
 
 let refreshSeq = 0; // each refresh bumps it; older responses see the change and don't render
+/** The "Always allowed files" panel in Settings. */
+async function loadAllowed() {
+  let list = [];
+  let problem = "";
+  try {
+    list = await call("list_allowed");
+  } catch (error) {
+    problem = errorText(error);
+  }
+  $("allowed-empty").textContent = problem || "No file is always allowed.";
+  $("allowed-empty").hidden = list.length > 0;
+  replaceIfChanged($("allowed-list"), JSON.stringify(list), () => list.map((entry) => {
+    const remove = el("button", { className: "btn btn-small", text: "Remove", attrs: { type: "button", "aria-label": `Check ${entry.name} again` } });
+    remove.addEventListener("click", async () => {
+      remove.disabled = true;
+      try {
+        notice(await call("remove_allowed", { sha256: entry.sha256 }), false);
+      } catch (error) {
+        notice(errorText(error), true);
+      }
+      await loadAllowed();
+    });
+    return el("li", { className: "allowed-item" }, [
+      el("span", {}, [
+        el("span", { className: "cell-main", text: entry.name, title: entry.name }),
+        el("code", { className: "cell-sub", text: entry.sha256, title: `${entry.threat_type}, added ${formatDateTime(entry.added_at)}` }),
+      ]),
+      remove,
+    ]);
+  }));
+}
+
 async function refresh(force) {
   if (state.refreshing && !force) return;
   state.refreshing = true;
@@ -879,6 +924,7 @@ async function refresh(force) {
     if (seq !== refreshSeq) return;
     state.quarantine = quarantine;
     renderQuarantine();
+    if (state.page === "settings") await loadAllowed();
   } catch (error) {
     renderOffline(invoke ? `Unavailable — ${errorText(error)}` : "Open The Nex from its desktop app to manage protection.");
   } finally {

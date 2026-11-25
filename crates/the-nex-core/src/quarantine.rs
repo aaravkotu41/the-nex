@@ -1,4 +1,5 @@
 use crate::config::AppConfig;
+use crate::known_bad::Digest32;
 use crate::logger::{self, lock_or_recover};
 use crate::platform;
 use chrono::{DateTime, Utc};
@@ -56,6 +57,9 @@ pub struct ThreatEvent {
     /// scan's own summary event is the alert).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quiet: bool,
+    /// SHA-256 of the file judged, recorded for detections that "Always allow" can cover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 impl ThreatEvent {
@@ -75,6 +79,14 @@ impl ThreatEvent {
             action_taken: action_taken.into(),
             details: details.into(),
             quiet: false,
+            sha256: None,
+        }
+    }
+
+    pub fn with_sha256(self, digest: Option<Digest32>) -> Self {
+        Self {
+            sha256: digest.map(|d| to_hex(&d)),
+            ..self
         }
     }
 

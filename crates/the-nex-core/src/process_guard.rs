@@ -1,4 +1,5 @@
 use crate::ai_policy::{self, Action, Request, Target};
+use crate::allowlist;
 use crate::bin_ai::{self, BinaryAiScanner};
 use crate::config::{AppConfig, Engine};
 use crate::known_bad::{self, Digest32};
@@ -429,6 +430,7 @@ impl ProcessGuard {
             exe,
             decision,
             details,
+            None,
         );
         true
     }
@@ -487,6 +489,10 @@ impl ProcessGuard {
         if score.is_nan() || score < threshold {
             return;
         }
+        let (digest, allowed) = allowlist::check(&self.cfg, exe);
+        if allowed {
+            return;
+        }
         let details = format!(
             "pid={} name={name} {}",
             pid.as_u32(),
@@ -502,7 +508,14 @@ impl ProcessGuard {
             explanation: &details,
             data_dir: &self.cfg.base_dir,
         });
-        self.respond("MALWARE_AI_PROCESS", Severity::High, exe, decision, details);
+        self.respond(
+            "MALWARE_AI_PROCESS",
+            Severity::High,
+            exe,
+            decision,
+            details,
+            digest,
+        );
     }
 
     /// Carries out a verdict on a running program and logs it. `alert_severity` is the
@@ -514,6 +527,7 @@ impl ProcessGuard {
         exe: &Path,
         decision: Action,
         details: String,
+        sha256: Option<Digest32>,
     ) {
         let (severity, action) = match decision {
             Action::Ignore => return,
@@ -544,7 +558,8 @@ impl ProcessGuard {
                 exe.display().to_string(),
                 action,
                 details,
-            ),
+            )
+            .with_sha256(sha256),
         );
     }
 
@@ -1044,6 +1059,62 @@ mod tests {
             let _ = child.kill();
             let _ = child.wait();
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_running_program_that_is_always_allowed_is_not_flagged() {
+        use std::process::{Command, Stdio};
+        let dir = std::env::temp_dir().join(format!("thenex-pg-allow-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
+        // A copy of this test program: not signed by Apple, so the AI judges it.
+        let exe = dir.join("napper");
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let cfg = AppConfig::for_base_dir(&dir.join("base"));
+        cfg.ensure_dirs().unwrap();
+        let mut toggles = cfg.toggles.snapshot();
+        toggles.set(Engine::DryRun, true);
+        cfg.toggles.apply(toggles);
+        let cfg = Arc::new(cfg);
+        let mut child = Command::new(&exe)
+            .args(["--ignored", "--exact", "process_guard::tests::napper"])
+            .env("THENEX_TEST_NAP", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_u32(child.id());
+        let mut g = ProcessGuard::new(
+            Arc::clone(&cfg),
+            Arc::new(BinaryAiScanner::with_fixed_score(0.99)),
+            Arc::new(Telemetry::default()),
+        );
+        g.sys
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
+        let events = || -> Vec<ThreatEvent> {
+            quarantine::read_recent_events(&cfg.events_log, 1 << 20)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| e.threat_type == "MALWARE_AI_PROCESS")
+                .collect()
+        };
+
+        g.inspect_binary(pid, false);
+        let seen = events();
+        assert_eq!(seen.len(), 1);
+        let sha = quarantine::sha256_file(&exe).unwrap();
+        assert_eq!(seen[0].sha256.as_deref(), Some(sha.as_str()));
+
+        let entry = allowlist::AllowedFile::new(&sha, "napper", "MALWARE_AI_PROCESS").unwrap();
+        allowlist::add(&cfg, entry).unwrap();
+        g.inspect_binary(pid, false);
+        assert_eq!(events().len(), 1, "an allowed program raises nothing");
+        assert!(child.try_wait().unwrap().is_none());
+        let _ = child.kill();
+        let _ = child.wait();
         let _ = fs::remove_dir_all(&dir);
     }
 

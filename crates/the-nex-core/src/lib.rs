@@ -1,4 +1,5 @@
 pub mod ai_policy;
+pub mod allowlist;
 pub mod bin_ai;
 pub mod canary;
 pub mod check_file;

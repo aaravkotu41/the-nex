@@ -742,6 +742,29 @@ where
     }
 }
 
+/// Logs a change in whether the always-allowed list is being used: refused (damaged, or not
+/// owned by root) or accepted again.
+fn report_allowed(cfg: &AppConfig, refusal: &Option<String>) {
+    let Some(why) = refusal else {
+        logger::info(format!(
+            "always-allowed files: {} listed",
+            cfg.allowed.len()
+        ));
+        return;
+    };
+    logger::error(format!("always-allowed list refused: {why}"));
+    quarantine::record_event(
+        cfg,
+        ThreatEvent::new(
+            "INTEGRITY",
+            Severity::High,
+            crate::allowlist::FILE_NAME,
+            "LIST_REFUSED: no file is always allowed until it is replaced",
+            format!("the always-allowed list was refused: {why}"),
+        ),
+    );
+}
+
 /// Runs every detector until `shutdown` is set. Used by both the service and `--console`.
 pub fn run(mut cfg: AppConfig, shutdown: Arc<AtomicBool>) {
     logger::init(&cfg.log_dir, cfg.interactive);
@@ -812,6 +835,7 @@ pub fn run(mut cfg: AppConfig, shutdown: Arc<AtomicBool>) {
     let mut last_requests = Instant::now();
     let mut last_discovery = Instant::now();
     let mut last_settings = Instant::now();
+    let mut allowed_refusal: Option<String> = None;
     let mut last_status: Option<Instant> = None;
     let mut status_error_logged = false;
     let mut own_process = System::new();
@@ -829,6 +853,12 @@ pub fn run(mut cfg: AppConfig, shutdown: Arc<AtomicBool>) {
             last_settings = Instant::now();
             if let Some(toggles) = cfg.toggles.reload_if_changed(&cfg.settings_file) {
                 logger::info(format!("settings reloaded: {toggles:?}"));
+            }
+            cfg.allowed.refresh();
+            let refusal = cfg.allowed.error();
+            if refusal != allowed_refusal {
+                report_allowed(&cfg, &refusal);
+                allowed_refusal = refusal;
             }
         }
         if last_status.is_none_or(|t| t.elapsed() >= STATUS_INTERVAL) {
@@ -1190,6 +1220,111 @@ mod tests {
         set_engine(&cfg, Engine::KnownBad, false);
         let off = scan(&QUICK_LIMITS);
         assert_eq!((off.files_scanned, off.findings.len()), (0, 0));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A zip with one entry of 20 MiB of zeros: a harmless decoy that trips the ratio rule.
+    fn decoy_bomb() -> Vec<u8> {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("zeros.bin", options).unwrap();
+        writer.write_all(&vec![0u8; 20 * 1024 * 1024]).unwrap();
+        writer.finish().unwrap();
+        cursor.into_inner()
+    }
+
+    /// A thin Mach-O executable header: parsed as a program, which the fixed-score scanner
+    /// then rates as malicious.
+    fn decoy_program() -> Vec<u8> {
+        [0xFEED_FACF, 0x0100_000C, 0, 2, 0, 0, 0, 0]
+            .iter()
+            .flat_map(|field: &u32| field.to_le_bytes())
+            .collect()
+    }
+
+    fn always_allow(cfg: &AppConfig, path: &Path, kind: &str) {
+        let sha = quarantine::sha256_file(path).unwrap();
+        let entry = crate::allowlist::AllowedFile::new(&sha, "decoy", kind).unwrap();
+        assert!(crate::allowlist::add(cfg, entry).unwrap());
+    }
+
+    #[test]
+    fn an_always_allowed_file_is_left_alone_until_one_byte_changes() {
+        let root = temp_root("allowed");
+        let watch = root.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        let cfg = AppConfig::for_base_dir(&root.join("base"));
+        cfg.ensure_dirs().unwrap();
+        set_engine(&cfg, Engine::DryRun, true);
+        let scanner = BinaryAiScanner::with_fixed_score(0.99);
+        let telemetry = Telemetry::default();
+        let (bomb, program) = (watch.join("decoy.zip"), watch.join("decoy.exe"));
+        fs::write(&bomb, decoy_bomb()).unwrap();
+        fs::write(&program, decoy_program()).unwrap();
+        let events = |kind: &str| events_of(&cfg, kind);
+
+        // Flagged (dry run), and the event carries the hash of the file that was judged.
+        scan_path(&cfg, &scanner, &bomb, &telemetry);
+        scan_path(&cfg, &scanner, &program, &telemetry);
+        for (kind, path) in [("ZIP_BOMB", &bomb), ("MALWARE_AI", &program)] {
+            let seen = events(kind);
+            assert_eq!(seen.len(), 1, "{kind}");
+            assert_eq!(seen[0].action_taken, "DRY_RUN: would quarantine");
+            assert_eq!(
+                seen[0].sha256.as_deref(),
+                Some(quarantine::sha256_file(path).unwrap().as_str())
+            );
+            always_allow(&cfg, path, kind);
+        }
+
+        // Allowed: no event even in dry run, and nothing moves for real.
+        scan_path(&cfg, &scanner, &bomb, &telemetry);
+        scan_path(&cfg, &scanner, &program, &telemetry);
+        assert_eq!(
+            (events("ZIP_BOMB").len(), events("MALWARE_AI").len()),
+            (1, 1)
+        );
+        set_engine(&cfg, Engine::DryRun, false);
+        let quick = quick_scan(&cfg, &scanner, std::slice::from_ref(&watch), &telemetry);
+        assert!(quick.findings.is_empty(), "{:?}", quick.findings);
+        assert!(bomb.exists() && program.exists());
+        assert_eq!(
+            (events("ZIP_BOMB").len(), events("MALWARE_AI").len()),
+            (1, 1)
+        );
+
+        // One byte different is a different file: flagged and quarantined again.
+        for path in [&bomb, &program] {
+            let mut bytes = fs::read(path).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+            let changed = path.with_file_name(format!(
+                "changed-{}",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            fs::write(&changed, bytes).unwrap();
+            scan_path(&cfg, &scanner, &changed, &telemetry);
+            assert!(!changed.exists(), "{} was quarantined", changed.display());
+            assert!(path.exists(), "the allowed original is untouched");
+        }
+        assert_eq!(
+            (events("ZIP_BOMB").len(), events("MALWARE_AI").len()),
+            (2, 2)
+        );
+        assert!(events("ZIP_BOMB")[1]
+            .action_taken
+            .starts_with("QUARANTINED id="));
+
+        // Removed from the list, the original is flagged again.
+        for path in [&bomb, &program] {
+            let sha = quarantine::sha256_file(path).unwrap();
+            assert!(crate::allowlist::remove(&cfg, &sha).unwrap());
+        }
+        scan_path(&cfg, &scanner, &bomb, &telemetry);
+        assert!(!bomb.exists());
         let _ = fs::remove_dir_all(&root);
     }
 

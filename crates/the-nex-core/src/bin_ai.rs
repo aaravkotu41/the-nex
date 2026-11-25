@@ -7,6 +7,7 @@
 //! training silently stops working, so change both sides together.
 
 use crate::ai_policy;
+use crate::allowlist;
 use crate::config::{AppConfig, MAX_AI_SCAN_BYTES};
 use crate::logger::{self, lock_or_recover};
 use crate::platform;
@@ -293,6 +294,12 @@ impl BinaryAiScanner {
 
     pub fn heuristic_only() -> Self {
         Self::build(None)
+    }
+
+    /// Test scanner that scores every parseable executable the same.
+    #[cfg(test)]
+    pub fn with_fixed_score(score: f32) -> Self {
+        Self::build(Some(Box::new(move |_| Some(score))))
     }
 
     fn build(model: Option<InferenceFn>) -> Self {
@@ -805,6 +812,13 @@ pub fn scan_and_respond(
             detection: None,
         });
     }
+    let (digest, allowed) = allowlist::check(cfg, path);
+    if allowed {
+        return Some(AiOutcome {
+            score,
+            detection: None,
+        });
+    }
     // Explain before quarantining: the file is moved away below.
     let details = match profile {
         Some(p) => scanner.explain_with(Some(&p), score, threshold),
@@ -841,7 +855,8 @@ pub fn scan_and_respond(
             path.display().to_string(),
             action,
             details.clone(),
-        ),
+        )
+        .with_sha256(digest),
     );
     Some(AiOutcome {
         score,

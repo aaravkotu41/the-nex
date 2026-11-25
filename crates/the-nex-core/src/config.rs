@@ -1,4 +1,5 @@
-use crate::known_bad::{self, KnownBad};
+use crate::allowlist::{self, LiveAllowed};
+use crate::known_bad::{self, Digest32, KnownBad};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -47,6 +48,11 @@ Modes:
   --delete <ID>             permanently delete a quarantined file by its quarantine ID
   --set <ENGINE>=<on|off>   toggle known_bad, zip_bomb, bin_ai, process_guard, canary or
                             dry_run
+  --allow <SHA256>          never flag the one file with this SHA-256 again (needs
+                            administrator rights); with --allow-name NAME and --allow-type TYPE
+  --disallow <SHA256>       remove a file from the always-allowed list
+  --allow-quarantined <ID>  restore a quarantined file and always allow that exact file
+  --list-allowed            print the always-allowed list as JSON
   --help                    show this help
 
 Options:
@@ -129,6 +135,10 @@ pub enum Mode {
     Restore(String),
     Delete(String),
     Set(Engine, bool),
+    Allow(String),
+    Disallow(String),
+    AllowQuarantined(String),
+    ListAllowed,
     Help,
 }
 
@@ -141,6 +151,9 @@ pub struct CliArgs {
     pub log_file: Option<PathBuf>,
     /// Console and one-shot scans only: a known-malware list to use instead of the shipped one.
     pub hash_list: Option<PathBuf>,
+    /// `--allow` only: the name and detection type recorded with the entry.
+    pub allow_name: Option<String>,
+    pub allow_type: Option<String>,
 }
 
 fn take_value<I: Iterator<Item = OsString>>(iter: &mut I, flag: &str) -> Result<String, String> {
@@ -164,6 +177,8 @@ where
     let mut quarantine_dir: Option<PathBuf> = None;
     let mut log_file: Option<PathBuf> = None;
     let mut hash_list: Option<PathBuf> = None;
+    let mut allow_name: Option<String> = None;
+    let mut allow_type: Option<String> = None;
     let mut iter = args.into_iter();
 
     while let Some(raw) = iter.next() {
@@ -188,6 +203,30 @@ where
                 &mut iter,
                 "--check-file",
             )?))),
+            "--allow" => Some(Mode::Allow(allowlist::parse_sha256(&take_value(
+                &mut iter, "--allow",
+            )?)?)),
+            "--disallow" => Some(Mode::Disallow(allowlist::parse_sha256(&take_value(
+                &mut iter,
+                "--disallow",
+            )?)?)),
+            "--allow-quarantined" => Some(Mode::AllowQuarantined(take_value(
+                &mut iter,
+                "--allow-quarantined",
+            )?)),
+            "--list-allowed" => Some(Mode::ListAllowed),
+            "--allow-name" => {
+                let name = take_value(&mut iter, "--allow-name")?;
+                allowlist::check_name(&name)?;
+                allow_name = Some(name);
+                None
+            }
+            "--allow-type" => {
+                let kind = take_value(&mut iter, "--allow-type")?;
+                allowlist::check_type(&kind)?;
+                allow_type = Some(kind);
+                None
+            }
             "--set" => {
                 let value = take_value(&mut iter, "--set")?;
                 let (name, state) = value.split_once('=').ok_or("--set expects ENGINE=on|off")?;
@@ -254,6 +293,9 @@ where
                 .into(),
         );
     }
+    if (allow_name.is_some() || allow_type.is_some()) && !matches!(mode, Mode::Allow(_)) {
+        return Err("--allow-name and --allow-type are only valid with --allow".into());
+    }
     if path_overrides && matches!(mode, Mode::Install | Mode::Uninstall | Mode::Help) {
         return Err("--quarantine-dir and --log-file cannot be combined with that mode".into());
     }
@@ -264,6 +306,8 @@ where
         quarantine_dir,
         log_file,
         hash_list,
+        allow_name,
+        allow_type,
     })
 }
 
@@ -326,14 +370,25 @@ impl RuntimeToggles {
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let staging = path.with_extension("json.tmp");
         let body = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
-        fs::write(&staging, body)?;
-        fs::rename(&staging, path)
+        write_atomic(path, &body)
     }
+}
+
+/// Writes `body` to a staging file and renames it over `path`, so a reader never sees half of it.
+pub fn write_atomic(path: &Path, body: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let staging = path.with_extension("json.tmp");
+    fs::write(&staging, body)?;
+    // Whatever the umask: the allowed-files list is refused when others can write it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o644))?;
+    }
+    fs::rename(&staging, path)
 }
 
 fn modified_nanos(path: &Path) -> u64 {
@@ -445,6 +500,9 @@ pub struct AppConfig {
     pub log_dir: PathBuf,
     pub events_log: PathBuf,
     pub settings_file: PathBuf,
+    /// Files the AI and zip-bomb engines must leave alone (see `allowlist`).
+    pub allowed_file: PathBuf,
+    pub allowed: Arc<LiveAllowed>,
     pub status_file: PathBuf,
     pub model_path: PathBuf,
     /// Forced dry run from the command line (settings.json can also enable it).
@@ -468,6 +526,7 @@ impl AppConfig {
     pub fn for_base_dir(base_dir: &Path) -> Self {
         let log_dir = base_dir.join(LOG_DIR_NAME);
         let settings_file = base_dir.join(SETTINGS_FILE_NAME);
+        let allowed_file = base_dir.join(allowlist::FILE_NAME);
         Self {
             base_dir: base_dir.to_path_buf(),
             quarantine_dir: base_dir.join(QUARANTINE_DIR_NAME),
@@ -476,6 +535,8 @@ impl AppConfig {
             log_dir,
             toggles: Arc::new(LiveToggles::load(&settings_file)),
             settings_file,
+            allowed: Arc::new(LiveAllowed::new(allowed_file.clone())),
+            allowed_file,
             model_path: resolve_model_path(base_dir),
             dry_run: false,
             watch_dir: None,
@@ -556,6 +617,14 @@ impl AppConfig {
 
     pub fn engine_enabled(&self, engine: Engine) -> bool {
         self.toggles.snapshot().get(engine)
+    }
+
+    /// True when this exact content is always allowed. A known-malware hash never is, whatever
+    /// the list says. Checks the list file's stamp first, so a change counts at once.
+    pub fn is_allowed(&self, digest: &Digest32) -> bool {
+        self.allowed.refresh();
+        self.allowed.contains(&crate::quarantine::to_hex(digest))
+            && !self.known_bad.contains(digest)
     }
 
     /// True when files should be looked up in the known-malware list.
@@ -725,6 +794,54 @@ fn user_fallback_base_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
+    fn parse(args: &[&str]) -> Result<super::CliArgs, String> {
+        super::parse_args(args.iter().map(std::ffi::OsString::from))
+    }
+
+    #[test]
+    fn always_allow_options_are_parsed_strictly() {
+        use super::Mode;
+        let sha = "ab".repeat(32);
+        let parsed = parse(&[
+            "--allow",
+            &sha.to_uppercase(),
+            "--allow-name",
+            "a b.exe",
+            "--allow-type",
+            "ZIP_BOMB",
+        ])
+        .unwrap();
+        assert_eq!(parsed.mode, Mode::Allow(sha.clone()));
+        assert_eq!(parsed.allow_name.as_deref(), Some("a b.exe"));
+        assert_eq!(parsed.allow_type.as_deref(), Some("ZIP_BOMB"));
+        assert_eq!(
+            parse(&["--disallow", &sha]).unwrap().mode,
+            Mode::Disallow(sha.clone())
+        );
+        assert_eq!(
+            parse(&["--allow-quarantined", "20260101-1-0001"])
+                .unwrap()
+                .mode,
+            Mode::AllowQuarantined("20260101-1-0001".to_string())
+        );
+        assert_eq!(parse(&["--list-allowed"]).unwrap().mode, Mode::ListAllowed);
+        for bad in [
+            vec!["--allow", "abc"],
+            vec!["--allow", &sha[1..]],
+            vec!["--allow"],
+            vec!["--disallow", "zz"],
+            vec!["--allow", &sha, "--allow-type", "KNOWN_MALWARE"],
+            vec!["--allow", &sha, "--allow-type", "LOTL_SCRIPT"],
+            vec!["--allow", &sha, "--allow-name", "bad\u{7}name"],
+            vec!["--allow", &sha, "--allow-name", &"n".repeat(121)],
+            vec!["--allow-name", "x"],
+            vec!["--list-allowed", "--allow-type", "ZIP_BOMB"],
+            vec!["--allow", &sha, "--disallow", &sha],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
+    }
     #[test]
     fn privileged_runs_ignore_the_data_dir_env() {
         // Not mutating the environment (shared across tests): just check the rule's input.
