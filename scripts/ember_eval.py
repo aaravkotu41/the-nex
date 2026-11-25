@@ -11,6 +11,8 @@ and reports malware caught and clean programs flagged.
     python scripts/ember_eval.py report [--cache DIR]    # print the numbers; --json FILE to save them
     python scripts/ember_eval.py sample                  # write data/ember2024_sample.csv
     python scripts/ember_eval.py check                   # score that committed sample (no download)
+    python scripts/ember_eval.py train-sample            # write data/ember2024_train.csv (after
+                                                         # fetch --only Win32_train Win64_train Dot_Net_train)
     python scripts/ember_eval.py --self-test
 
 fetch, score and report run locally only: the data is far too large for CI. `check` and
@@ -27,12 +29,14 @@ The test files list every program twice; each is counted once.
 """
 
 import argparse
+import array
 import csv
 import hashlib
 import io
 import json
 import subprocess
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -50,12 +54,24 @@ FILES = {
     "Dot_Net_test": (220481493, "b74c4181dbd77565fce16ba47c8ab0f7c7044ae6d880d859ec2c27365dea6299"),
     "challenge": (32144161, "dd215997b10596e4397d2b305d54afe9678e91e3051918262f0172b36e40baf1"),
 }
+# Training split (the 52 weeks before the test split), 19 GB: only for `fetch --only ...`.
+TRAIN_FILES = {
+    "Dot_Net_train": (937108923, "b9f6e90ab75293a7ceb9339700586dd033a03d19766282755ee31dfa0836e625"),
+    "Win64_train": (5853142901, "7b050100ce7bd87149bbfca442de3e02d4bf97d51251566caec2581eebe799fd"),
+    "Win32_train": (12321281336, "6cf9dea847960115f65d405d38b6b09d38c87225c8288dafedf00fed2512b1d4"),
+}
 PE_TYPES = ("Win32", "Win64", "Dot_Net")
+TRAIN_SAMPLE = ROOT / "data" / "ember2024_train.csv"
+# Rows per label in the training sample. 64-bit and .NET get more than their share of EMBER: they
+# are what people run today and what the model is worst at.
+TRAIN_MIX = {"Win32": 10_000, "Win64": 6_000, "Dot_Net": 4_000}
+FAMILY_CAP = 300  # per file type; otherwise one family would fill a third of the malware
 ALERT, KILL = 0.65, 0.9  # config.rs AI_MALWARE_THRESHOLD, ai_policy.rs KILL_CONFIDENCE
 SAMPLE = ROOT / "data" / "ember2024_sample.csv"
-# Floors for `check`, set loosely under what the 0.4.1 model scores on the sample (29.4% / 3.7%):
-# they catch a model that got clearly worse on real malware data, not small retraining noise.
-MIN_SAMPLE_CAUGHT, MAX_SAMPLE_FLAGGED = 0.20, 0.08
+# Floors for `check`, set loosely under what the model trained with EMBER rows scores on the sample
+# (59.2% / 3.0%; 0.4.1 scored 29.4% / 3.7%): they catch a model that got clearly worse on real
+# malware data, not small retraining noise.
+MIN_SAMPLE_CAUGHT, MAX_SAMPLE_FLAGGED = 0.50, 0.06
 
 
 # ------------------------------------------------------------------ one row -> our features
@@ -149,7 +165,8 @@ def sha256_of(path):
 
 
 def convert(zip_path, out_path):
-    rows = {"x": [], "label": [], "week": [], "kind": [], "certificate": [], "family": [], "confidence": [], "how": [], "sha": []}
+    # x is one flat float32 buffer: 1.5 million rows as Python lists would not fit in 8 GB.
+    rows = {"x": array.array("f"), "label": [], "week": [], "kind": [], "certificate": [], "family": [], "confidence": [], "how": [], "sha": []}
     skipped, seen = 0, set()
     with zipfile.ZipFile(zip_path) as archive:
         for member in sorted(archive.namelist()):
@@ -158,24 +175,24 @@ def convert(zip_path, out_path):
             with archive.open(member) as handle:
                 for line in io.TextIOWrapper(handle, encoding="utf-8"):
                     row = json.loads(line)
-                    if row["sha256"] in seen:
+                    if bytes.fromhex(row["sha256"]) in seen:
                         continue  # the test files list every program twice (the copies differ only in "caps")
-                    seen.add(row["sha256"])
+                    seen.add(bytes.fromhex(row["sha256"]))
                     if row.get("file_type") not in PE_TYPES or not row["general"].get("is_pe") or not row["section"]["sections"]:
                         skipped += 1  # not a Windows program, or one pefile could not read
                         continue
                     p = profile(row)
-                    rows["x"].append(tf.features(p))
+                    rows["x"].extend(tf.features(p))
                     rows["label"].append(int(row["label"]))
                     rows["week"].append(int(row.get("week_id") or 0))
                     rows["kind"].append(PE_TYPES.index(row["file_type"]))
                     rows["certificate"].append(p["_has_certificate"])
-                    rows["family"].append((row.get("family") or "")[:40])
+                    rows["family"].append(sys.intern((row.get("family") or "")[:40]))
                     rows["confidence"].append(float(row.get("family_confidence") or 0.0))
                     rows["how"].append(("agree", "ember", "rebuilt").index(p["_entry_how"]))
                     rows["sha"].append(row["sha256"][:16])
     np.savez_compressed(
-        out_path, x=np.array(rows["x"], dtype=np.float32), label=np.array(rows["label"], dtype=np.int8),
+        out_path, x=np.frombuffer(rows["x"], dtype=np.float32).reshape(-1, tf.N_FEATURES), label=np.array(rows["label"], dtype=np.int8),
         week=np.array(rows["week"], dtype=np.int16), kind=np.array(rows["kind"], dtype=np.int8),
         certificate=np.array(rows["certificate"], dtype=bool), family=np.array(rows["family"]),
         confidence=np.array(rows["confidence"], dtype=np.float32), how=np.array(rows["how"], dtype=np.int8),
@@ -186,7 +203,7 @@ def convert(zip_path, out_path):
 def fetch(cache, names):
     cache.mkdir(parents=True, exist_ok=True)
     for name in names:
-        size, digest = FILES[name]
+        size, digest = {**FILES, **TRAIN_FILES}[name]
         out = cache / f"{name}.npz"
         if out.exists():
             print(f"{name}: already converted")
@@ -194,9 +211,16 @@ def fetch(cache, names):
         archive = cache / f"{name}.zip"
         if not archive.exists() or archive.stat().st_size != size:
             print(f"{name}: downloading {size / 1e9:.2f} GB")
-            subprocess.run(["curl", "-sS", "-L", "-C", "-", "--retry", "5", "-A", "Mozilla/5.0", "-o", str(archive), URL.format(name=name)], check=True)
+            for _ in range(30):  # a fresh curl resumes where the last one stopped; curl's own --retry does not
+                done = subprocess.run(["curl", "-sS", "-f", "-L", "-C", "-", "--speed-limit", "1000", "--speed-time", "60",
+                                       "-A", "Mozilla/5.0", "-o", str(archive), URL.format(name=name)]).returncode == 0
+                if done:
+                    break
+                time.sleep(10)
+            else:
+                sys.exit(f"{name}: download did not finish; run the same command again to resume")
         if sha256_of(archive) != digest:
-            sys.exit(f"{name}: checksum mismatch, refusing to use {archive}")
+            sys.exit(f"{name}: checksum mismatch, refusing to use {archive}; delete it and fetch again")
         kept, skipped = convert(archive, out)
         archive.unlink()
         print(f"{name}: {kept:,} rows converted, {skipped:,} skipped")
@@ -334,6 +358,41 @@ def write_sample(cache, per_cell=170):
     print(f"wrote {SAMPLE}")
 
 
+def pick_training(label, family, certificate, target, pool, n, rng):
+    """Up to n random rows of `pool` with this label: clean ones without a certificate (the ones
+    the model certainly meets on Windows), malware with no family above FAMILY_CAP."""
+    keep = (label == target) & ~(certificate & (target == 0))
+    chosen, seen = [], {}
+    for i in rng.permutation(pool[keep[pool]]).tolist():
+        name = family[i]
+        if target == 1 and name:
+            seen[name] = seen.get(name, 0) + 1
+            if seen[name] > FAMILY_CAP:
+                continue
+        chosen.append(i)
+        if len(chosen) == n:
+            break
+    return sorted(chosen)
+
+
+def write_train_sample(cache):
+    rng = np.random.default_rng(2024)
+    total = 0
+    with open(TRAIN_SAMPLE, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["file_type", "label", "week"] + tf.FEATURE_NAMES)
+        for name, n in TRAIN_MIX.items():
+            data, _ = load(cache, f"{name}_train")
+            x, label, week = data["x"], data["label"], data["week"]
+            assert week.max() <= 51, "the test split starts at week 52 and must never be trained on"
+            _, first = np.unique(x.round(5), axis=0, return_index=True)  # one row per distinct measurement
+            for target in (0, 1):
+                for i in pick_training(label, data["family"], data["certificate"], target, first, n, rng):
+                    writer.writerow([name, target, int(week[i])] + [f"{v:.5g}" for v in x[i]])
+                    total += 1
+    print(f"wrote {TRAIN_SAMPLE}: {total:,} rows")
+
+
 def check():
     """Scores the committed sample with the current model: a regression check that needs no download."""
     with open(SAMPLE, newline="") as handle:
@@ -393,6 +452,16 @@ def self_test():
     row["section"]["entry"] = ".data"
     assert profile(row)["_entry_how"] == "ember"
 
+    # Training rows: no certified clean program, no family above the cap, nothing outside the pool.
+    many = FAMILY_CAP + 50
+    label = np.array([0, 0, 1] + [1] * many)
+    family = np.array(["", "", ""] + ["big"] * many)
+    certificate = np.array([True, False, True] + [False] * many)
+    rng = np.random.default_rng(0)
+    assert pick_training(label, family, certificate, 0, np.arange(len(label)), 9, rng) == [1]
+    picked = pick_training(label, family, certificate, 1, np.arange(1, len(label)), 10_000, rng)
+    assert len(picked) == FAMILY_CAP + 1 and 2 in picked, len(picked)
+
     labels = np.array([0, 0, 1, 1, 1])
     assert abs(auc(np.array([0.1, 0.4, 0.35, 0.8, 0.9]), labels) - 5 / 6) < 1e-9
     assert abs(auc(np.array([0.5] * 5), labels) - 0.5) < 1e-9
@@ -401,9 +470,9 @@ def self_test():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", nargs="?", choices=["fetch", "score", "report", "sample", "check"])
+    parser.add_argument("command", nargs="?", choices=["fetch", "score", "report", "sample", "check", "train-sample"])
     parser.add_argument("--cache", type=Path, default=ROOT / "ember_cache", help="where converted rows are kept (git-ignored)")
-    parser.add_argument("--only", nargs="+", choices=list(FILES), default=list(FILES))
+    parser.add_argument("--only", nargs="+", choices=list(FILES) + list(TRAIN_FILES), default=list(FILES))
     parser.add_argument("--json", help="report: also write the numbers to this file")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -419,6 +488,8 @@ def main():
         write_sample(args.cache)
     elif args.command == "check":
         check()
+    elif args.command == "train-sample":
+        write_train_sample(args.cache)
     else:
         parser.error("give a command or --self-test")
 

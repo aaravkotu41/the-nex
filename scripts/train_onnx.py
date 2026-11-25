@@ -9,7 +9,11 @@ Data
             protector-wrapped commercial software and macOS Mach-O programs.
   malicious synthetic profiles of well-documented malware traits: packed, crypted, process
             injectors / stealers / keyloggers, droppers, obfuscated .NET and Mach-O stealers.
-            No malware is downloaded or stored.
+  both      data/ember2024_train.csv: measurements of 20k real malware programs and 20k real clean
+            programs without a certificate, from weeks 0-51 of EMBER2024 (weeks 52-63 are its
+            test split and are never trained on). Made by scripts/ember_eval.py train-sample.
+            The clean rows matter as much as the malware: without them the model would learn to
+            tell EMBER's files from ours. No malware file is downloaded or stored.
 
 Features come from scripts/thenex_features.py, which mirrors crates/the-nex-core/src/bin_ai.rs.
 
@@ -63,11 +67,13 @@ import thenex_features as tf  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = ROOT / "thenex_model.onnx"
 DEFAULT_DATA = ROOT / "data" / "benign_pe_features.csv"
+DEFAULT_EMBER = ROOT / "data" / "ember2024_train.csv"
+EMBER_ROWS = 40_000
 N_FEATURES = tf.N_FEATURES
 OPSET = 13
 IR_VERSION = 7
 ALLOWED_OPS = {"Gemm", "Relu", "Sigmoid"}
-HIDDEN = (32, 16)
+HIDDEN = (64, 32)
 THRESHOLD = 0.65  # config::AI_MALWARE_THRESHOLD
 KILL_CONFIDENCE = 0.9  # process_guard::PROCESS_KILL_CONFIDENCE
 SIGNED = tf.FEATURE_NAMES.index("has_signature")
@@ -358,6 +364,24 @@ def load_benign(path):
     return categories, groups, x
 
 
+def load_ember(path):
+    """(feature rows, labels) of the EMBER2024 training sample (scripts/ember_eval.py train-sample)."""
+    if not path.is_file():
+        raise SystemExit(f"{path} is missing")
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.reader(fh)
+        header = next(reader)
+        rows = list(reader)
+    if header != ["file_type", "label", "week"] + tf.FEATURE_NAMES:
+        raise SystemExit(f"{path} has columns {header}; rebuild it")
+    if len(rows) != EMBER_ROWS or sum(r[1] == "1" for r in rows) * 2 != EMBER_ROWS:
+        raise SystemExit(f"{path} has {len(rows)} rows, expected {EMBER_ROWS}, half of them malware")
+    if max(int(r[2]) for r in rows) > 51:
+        raise SystemExit(f"{path} holds rows of the test weeks (52 and later), which must never be trained on")
+    return (np.array([[float(v) for v in r[3:]] for r in rows], dtype=np.float32),
+            np.array([int(r[1]) for r in rows], dtype=np.float32))
+
+
 def hold_out_groups(groups, rng, share):
     """Mask of rows whose whole application is held out (about `share` of the rows)."""
     ids, counts = np.unique(groups, return_counts=True)
@@ -416,6 +440,12 @@ def build_sets(args, rng):
     # fold[i] = the member that must not train on row i (-1: every member may).
     fold = np.full(len(x), -1)
     fold[:len(real_train)] = real_fold
+    # EMBER rows are training rows only (fold -1): calibration stays on our own clean programs,
+    # whose applications are known. Added after the label noise, so their labels stay as given.
+    ember_x, ember_y = load_ember(args.ember)
+    x, y = np.concatenate([x, ember_x]), np.concatenate([y, ember_y])
+    w = np.concatenate([w, np.ones(len(ember_y), dtype=np.float32)])
+    fold = np.concatenate([fold, np.full(len(ember_y), -1)])
     return x, y, w, fold, benign_test, malicious_test
 
 
@@ -669,6 +699,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    parser.add_argument("--ember", type=Path, default=DEFAULT_EMBER)
     parser.add_argument("--members", type=int, default=5, help="networks in the ensemble")
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch-size", type=int, default=512)
