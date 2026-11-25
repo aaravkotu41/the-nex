@@ -74,6 +74,57 @@ address and 500 in total. The cap keeps a keyed code of the sender's address, ap
 reports, and an hourly job deletes codes older than 24 hours. Not included yet: the 14 feature numbers behind an AI verdict,
 which events do not record.
 
+## Everyday features (not released yet)
+
+- **Always allow** (Activity, Quarantine): never flags one exact file again, matched by SHA-256,
+  never by name or folder; one changed byte flags it again. Needs an administrator, because
+  malware must not be able to allow itself: the list lives in the service's protected folder, the
+  elevated engine looks the detection up in its own log, and the prompt names the file and the
+  start of its hash. Files on the known-malware list, scripts and decoy alerts can never be
+  allowed. Settings lists what is allowed, with Remove. Limits: an updated program has to be
+  allowed again; files over 256 MB cannot be; an archive's hash is taken by reading it again.
+- **Check a file** by dropping it on the window (`the-nex --check-file`): AI score, archive check
+  and known-malware list, read-only, in a separate process with limits. Nothing is moved, logged
+  or sent. It says what it could not check (files inside archives, signed programs are trusted
+  and not scored) and never calls a file safe. Mouse only for now.
+- **Startup programs** (`the-nex --list-startup`): what starts with the computer and what The Nex
+  makes of each program, without changing anything. It checks the program file, not what that
+  program loads or is told to do, so the best result is "No warning signs", and anything with
+  instructions, unusual settings or a binary definition is "Not checked" (on the developer's Mac
+  5 of 13 items). It cannot read macOS's newer Login Items list, other users' items, Windows
+  services or scheduled tasks, and says so.
+- **Scheduled scan** (off by default; daily or weekly): the quick-scan folders, at low priority,
+  report only: it never moves anything even when Dry Run is off. It waits ten minutes after start
+  or wake. It does not look at the battery. Findings already reported and unchanged are not
+  reported again.
+- **Summary report**: one readable HTML page in Downloads for 7 or 30 days. Folder names are left
+  out unless ticked, and the account name is removed.
+- **Setup checklist** (Settings): service, Full Disk Access (reported by the service itself), Dry
+  Run, decoys. It does not say "All set" while an engine is off or the service is silent.
+
+**Scripts and AppleScript.** The osascript rules stop the osascript process itself, as before. A
+shell or Python command line that only mentions such a call is now reported instead of stopped,
+unless it feeds text into osascript; the osascript it starts is still judged on its own. This
+came from a false alarm on an installer command.
+
+**Ransomware response.** When a decoy file changes, the busiest writer is stopped. That is weak
+evidence: the live check once stopped the desktop app it was run from. A validly signed app is
+now only reported; unsigned programs and signed interpreters are still stopped, so an innocent
+unsigned program that is busy saving can still be picked.
+
+**Security fixes over 0.4.1.** In 0.4.1 a program running as the user could set THENEX_DATA_DIR so
+that the app's next administrator prompt ran a file of its choosing; the app now always uses the
+installed engine and passes a clean environment. A program started through a link was inspected
+under the link's name and skipped.
+
+**Known gap (0.4.1 and this build):** on macOS a program started by a relative path (`./x`) is
+looked up from the service's own folder, so the process guard does not check its image. Files in
+watched folders are still checked when they arrive.
+
+Checked on macOS only: 347 Rust tests, the Node tests and 14 live checks. Windows code is
+type-checked, never run. The administrator prompts, the real window and dropping a real file were
+not exercised.
+
 ## Known-malware list
 
 The first check on any file: is it, byte for byte, a file already identified as malware? The
