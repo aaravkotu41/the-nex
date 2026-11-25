@@ -454,7 +454,10 @@ impl CanaryManager {
             ));
             return;
         };
-        let action = if self.cfg.is_dry_run() {
+        let action = if !may_terminate(suspect.exe.as_deref(), platform::is_trusted_binary) {
+            "ALERT_ONLY: the busiest writer is a properly signed app, so it was not stopped"
+                .to_string()
+        } else if self.cfg.is_dry_run() {
             "DRY_RUN: would terminate process".to_string()
         } else if sys.process(suspect.pid).is_some_and(|p| p.kill()) {
             "TERMINATED".to_string()
@@ -510,6 +513,20 @@ fn is_exempt(
         return false;
     }
     exe.is_some_and(|exe| crate::ai_policy::is_os_critical_path(exe) || trusted(exe))
+}
+
+/// Being the busiest writer is weak evidence: whatever app was saving at that moment gets picked
+/// (the live check once stopped the desktop app it was run from). A signed app is only reported;
+/// signed interpreters stay stoppable, since a ransomware script runs inside one.
+fn may_terminate(exe: Option<&Path>, trusted: impl FnOnce(&Path) -> bool) -> bool {
+    let Some(exe) = exe else {
+        return true;
+    };
+    let stem = exe
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    crate::startup::is_interpreter(&stem) || !trusted(exe)
 }
 
 /// Highest active writer in the sampling window, excluding verified protected/safe processes.
@@ -666,6 +683,15 @@ mod tests {
         assert!(is_safe_writer("MsMpEng.exe"));
         assert!(is_safe_writer("mds_stores"));
         assert!(!is_safe_writer("evil.exe"));
+    }
+
+    #[test]
+    fn a_signed_app_is_reported_but_never_stopped() {
+        let app = Path::new("/Applications/Editor.app/Contents/MacOS/Editor");
+        assert!(!may_terminate(Some(app), |_| true));
+        assert!(may_terminate(Some(app), |_| false)); // unsigned: still stopped
+        assert!(may_terminate(Some(Path::new("/usr/bin/python3")), |_| true)); // runs any script
+        assert!(may_terminate(None, |_| true)); // a self-deleted program has no image
     }
 
     #[test]

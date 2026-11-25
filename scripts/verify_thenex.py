@@ -11,8 +11,10 @@ Runs the real release binary against harmless decoys confined to ./thenex_live_s
   14 --list-startup (read-only listing of a sandbox folder of startup definitions)
 Exit status is 0 only when all fourteen checks pass.
 
-Note: like the real product, the console engine watches every process on the machine while
-it runs; checks 7 and 8 rely on that and only target the decoy processes this script starts.
+Safety: the engine under test sees every process on the machine, so anything that could stop a
+real program is switched off except where a check needs it: the process guard is on only during
+check 7 (script rules only, the AI is off), and check 8 runs in dry run, because the ransomware
+response picks the busiest writer, which may be one of the user's own apps.
 """
 
 import argparse
@@ -259,7 +261,24 @@ def lotl_decoy_command():
     return ["/bin/sh", "-c", "sleep 15; exit 0 # base64 -D"]
 
 
+def switch(**settings):
+    """Sets engine switches (or dry_run) in the sandbox's settings; the engine follows in a second."""
+    for name, on in settings.items():
+        done = nex("--set", f"{name}={'on' if on else 'off'}")
+        if done.returncode != 0:
+            raise RuntimeError(f"cannot set {name}: {done.stderr or done.stdout}")
+    time.sleep(1.5)
+
+
 def check_lotl(daemon):
+    switch(bin_ai=False, process_guard=True)
+    try:
+        return lotl_kill()
+    finally:
+        switch(process_guard=False, bin_ai=True)
+
+
+def lotl_kill():
     decoy = subprocess.Popen(lotl_decoy_command(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         killed = wait_until(lambda: decoy.poll() is not None, KILL_TIMEOUT)
@@ -291,6 +310,14 @@ with open(scratch, "wb") as out:
 
 def check_canary(daemon):
     daemon.wait_for_cooldown()
+    switch(dry_run=True)
+    try:
+        return canary_trip()
+    finally:
+        switch(dry_run=False)
+
+
+def canary_trip():
     canary = WATCH / CANARIES[0]
     scratch = SANDBOX / "decoy-writer.bin"
     worker = subprocess.Popen([sys.executable, "-c", CANARY_WORKER, str(canary), str(scratch)], stdin=subprocess.DEVNULL)
@@ -582,6 +609,7 @@ def main():
         ("Live startup listing (read-only)", startup_listing),
     ]
     results = []
+    switch(process_guard=False)
     try:
         for name, check in checks:
             started = time.monotonic()
@@ -592,6 +620,7 @@ def main():
             results.append((name, ok, time.monotonic() - started, detail))
     finally:
         daemon.stop()
+        switch(process_guard=True)
 
     width = max(len(name) for name, *_ in results)
     print()
