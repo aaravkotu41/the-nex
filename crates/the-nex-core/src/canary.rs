@@ -536,20 +536,22 @@ pub fn select_suspect(sys: &System) -> Option<WriterSuspect> {
         .filter_map(|(pid, process)| {
             let name = OsStr::new(process.name()).to_string_lossy().into_owned();
             let written = process.disk_usage().written_bytes;
-            if written <= ACTIVE_WRITE_BYTES
-                || is_exempt(
-                    pid.as_u32(),
-                    &name,
-                    process.exe(),
-                    platform::is_trusted_binary,
-                )
-            {
+            if written <= ACTIVE_WRITE_BYTES {
+                return None;
+            }
+            let exe = platform::program_file(process);
+            if is_exempt(
+                pid.as_u32(),
+                &name,
+                exe.as_deref(),
+                platform::is_trusted_binary,
+            ) {
                 return None;
             }
             Some(WriterSuspect {
                 pid: *pid,
                 name,
-                exe: process.exe().map(Path::to_path_buf),
+                exe,
                 written_bytes: written,
             })
         })

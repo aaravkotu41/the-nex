@@ -419,6 +419,10 @@ pub fn is_trusted_binary(path: &Path) -> bool {
 /// spared by a known-malware match (the Windows folders themselves are alert-only by path,
 /// see ai_policy). Upgrade by checking the signer's chain for the Microsoft root once a
 /// Windows machine is available to test it on.
+pub fn program_file(process: &sysinfo::Process) -> Option<PathBuf> {
+    process.exe().map(Path::to_path_buf)
+}
+
 pub fn is_os_vendor_signed(_path: &Path) -> bool {
     false
 }

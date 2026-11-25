@@ -242,6 +242,28 @@ pub fn send_desktop_notification(title: &str, body: &str) {
     }
 }
 
+/// The file the kernel runs for `pid`. sysinfo's path comes from the process's own memory: it is
+/// whatever the program was started by (`./x`, a link), and the program can rewrite it.
+fn kernel_path(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is writable for the length passed; the call returns the length written.
+    let len = unsafe {
+        libc::proc_pidpath(
+            i32::try_from(pid).ok()?,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    buffer.truncate(usize::try_from(len).ok().filter(|&len| len > 0)?);
+    Some(std::ffi::OsString::from_vec(buffer).into())
+}
+
+/// The file a process runs; what it was started by when the kernel no longer knows (deleted).
+pub fn program_file(process: &sysinfo::Process) -> Option<PathBuf> {
+    kernel_path(process.pid().as_u32()).or_else(|| process.exe().map(Path::to_path_buf))
+}
+
 fn satisfies_requirement(path: &Path, requirement: &str) -> bool {
     Command::new("/usr/bin/codesign")
         .args(["--verify", "--strict", requirement])

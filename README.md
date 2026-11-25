@@ -117,11 +117,16 @@ that the app's next administrator prompt ran a file of its choosing; the app now
 installed engine and passes a clean environment. A program started through a link was inspected
 under the link's name and skipped.
 
-**Known gap (0.4.1 and this build):** on macOS a program started by a relative path (`./x`) is
-looked up from the service's own folder, so the process guard does not check its image. Files in
-watched folders are still checked when they arrive.
+On macOS a running program was looked up by the path in its own memory: one started by a relative
+path (`./x`) was not found and so not checked, one that became another program (`exec`) kept its
+first verdict, and a program could rewrite that path. The process guard and the ransomware
+response now ask the kernel, and look again when a process becomes another program. Limits: a
+program that starts and ends between two looks (0.4 s) is still missed, and one already running
+when protection starts is only reported, also if it later becomes another program. None of the
+397 programs running on the developer's Mac lost protection by this
+(`no_running_program_loses_its_protection`, run by hand).
 
-Checked on macOS only: 347 Rust tests, the Node tests and 14 live checks. Windows code is
+Checked on macOS only: 349 Rust tests, the Node tests and 14 live checks. Windows code is
 type-checked, never run. The administrator prompts, the real window and dropping a real file were
 not exercised.
 

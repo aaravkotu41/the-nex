@@ -251,8 +251,9 @@ pub struct ProcessGuard {
     scanner: Arc<BinaryAiScanner>,
     telemetry: Arc<Telemetry>,
     sys: System,
-    /// pid -> start time, so a recycled PID is treated as a new process.
-    seen: HashMap<Pid, u64>,
+    /// pid -> start time and program file. A recycled PID is a new process, and so is one that
+    /// became another program (`exec` keeps the PID and the start time).
+    seen: HashMap<Pid, (u64, Option<PathBuf>)>,
     trust_cache: HashMap<PathBuf, (bin_ai::FileStamp, bool)>,
     /// Program file -> its SHA-256 when it is on the known-malware list, so each version of a
     /// program is hashed once however often it starts.
@@ -299,6 +300,33 @@ impl ProcessGuard {
         out
     }
 
+    /// Processes not seen before, or that became another program since.
+    fn fresh_processes(&mut self) -> Vec<Pid> {
+        let (mut fresh, mut became) = (Vec::new(), Vec::new());
+        for (pid, process) in self.sys.processes() {
+            let started = process.start_time();
+            let file = platform::program_file(process);
+            match self.seen.get(pid) {
+                Some((s, f)) if *s == started && (*f == file || file.is_none()) => continue,
+                Some((s, _)) if *s == started => became.push(*pid),
+                _ => {}
+            }
+            self.seen.insert(*pid, (started, file));
+            fresh.push(*pid);
+        }
+        if !became.is_empty() {
+            // What was read about the program it used to be no longer holds.
+            self.sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&became),
+                true,
+                refresh_kind()
+                    .with_cmd(UpdateKind::Always)
+                    .with_exe(UpdateKind::Always),
+            );
+        }
+        fresh
+    }
+
     pub fn poll(&mut self) {
         if !self.cfg.engine_enabled(Engine::ProcessGuard) {
             // Forget everything so re-enabling inspects what is running at that moment.
@@ -312,14 +340,7 @@ impl ProcessGuard {
         let first_poll = !self.primed;
         self.sys
             .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
-        let mut fresh = Vec::new();
-        for (pid, process) in self.sys.processes() {
-            let started = process.start_time();
-            if self.seen.get(pid) != Some(&started) {
-                self.seen.insert(*pid, started);
-                fresh.push(*pid);
-            }
-        }
+        let fresh = self.fresh_processes();
         let live = self.sys.processes();
         self.seen.retain(|pid, _| live.contains_key(pid));
         self.telemetry
@@ -355,7 +376,12 @@ impl ProcessGuard {
             if first_poll {
                 self.pending_ai.push_back((pid, true));
             } else {
-                self.pending_ai.insert(next_new, (pid, false));
+                // One that was running when protection started keeps that status.
+                let preexisting = self
+                    .sys
+                    .process(pid)
+                    .is_some_and(|p| self.baseline.contains(&(pid, p.start_time())));
+                self.pending_ai.insert(next_new, (pid, preexisting));
                 next_new += 1;
             }
         }
@@ -378,7 +404,7 @@ impl ProcessGuard {
             return true;
         };
         let name = process_name(process);
-        let exe = process.exe().map(Path::to_path_buf);
+        let exe = platform::program_file(process);
         if is_protected(pid.as_u32(), &name, exe.as_deref(), |e| self.is_trusted(e)) {
             return true;
         }
@@ -386,7 +412,14 @@ impl ProcessGuard {
             return true;
         };
         let cmdline = command_line(process);
-        if let Some(pattern) = check_lotl_command(&name, &cmdline) {
+        // By the name it was started by (kept after an exec) and by its program's own name.
+        let own = exe
+            .as_deref()
+            .and_then(Path::file_name)
+            .map(OsStr::to_string_lossy);
+        let pattern = check_lotl_command(&name, &cmdline)
+            .or_else(|| check_lotl_command(own.as_deref()?, &cmdline));
+        if let Some(pattern) = pattern {
             self.respond_lotl(pid, &name, &cmdline, pattern);
             // An alert-only match proves nothing: the program must still reach the list and AI checks.
             return !is_alert_only(pattern);
@@ -404,7 +437,7 @@ impl ProcessGuard {
             return;
         };
         let name = process_name(process);
-        let Some(reported) = process.exe().map(Path::to_path_buf) else {
+        let Some(reported) = platform::program_file(process) else {
             return;
         };
         let exe = real_path(&reported, &self.cfg.base_dir);
@@ -600,13 +633,13 @@ impl ProcessGuard {
             .processes()
             .iter()
             .filter(|(pid, process)| {
-                process.exe().is_some_and(|reported| {
-                    platform::path_key(&real_path(reported, &self.cfg.base_dir)) == target
+                platform::program_file(process).is_some_and(|file| {
+                    platform::path_key(&real_path(&file, &self.cfg.base_dir)) == target
+                        && !is_protected(pid.as_u32(), &process_name(process), Some(&file), |_| {
+                            false
+                        })
                 }) && !self.ancestors.contains(pid)
                     && !self.baseline.contains(&(**pid, process.start_time()))
-                    && !is_protected(pid.as_u32(), &process_name(process), process.exe(), |_| {
-                        false
-                    })
             })
             .map(|(pid, process)| (*pid, process.start_time()))
             .collect();
@@ -1441,6 +1474,136 @@ mod tests {
             let _ = bystander.wait();
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_program_started_by_a_relative_path_is_judged_as_the_file_it_is() {
+        let dir = std::env::temp_dir().join(format!("thenex-pg-rel-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
+        let exe = dir.join("napper");
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let mut g = guard_with_list(&dir, &[&exe], BinaryAiScanner::heuristic_only());
+        // `cd dir && ./napper`, as a person or a dropper would start it.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "exec ./napper --ignored --exact process_guard::tests::napper",
+            ])
+            .current_dir(&dir)
+            .env("THENEX_TEST_NAP", "1")
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_u32(child.id());
+        let started = Instant::now();
+        loop {
+            g.sys
+                .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
+            let process = g.sys.process(pid);
+            if process.and_then(platform::program_file).as_deref() == Some(exe.as_path()) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "never seen as {}",
+                exe.display()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        g.inspect_binary(pid, false);
+        let seen = actions(&g);
+        assert!(
+            seen.len() == 1
+                && seen[0].starts_with("KNOWN_MALWARE: TERMINATED 1 process(es); QUARANTINED id="),
+            "{seen:?}"
+        );
+        assert!(child.wait().is_ok() && !exe.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_that_becomes_another_program_is_inspected_again() {
+        let dir = std::env::temp_dir().join(format!("thenex-pg-exec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
+        let exe = dir.join("napper");
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let mut g = guard_with_list(&dir, &[&exe], BinaryAiScanner::heuristic_only());
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "read go; exec ./napper --ignored --exact process_guard::tests::napper",
+            ])
+            .current_dir(&dir)
+            .env("THENEX_TEST_NAP", "1")
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_u32(child.id());
+        thread::sleep(Duration::from_millis(300)); // macOS's sh becomes another shell first
+        refresh_until_seen(&mut g, &[pid]);
+        // Never `poll` here: it would judge every process on this computer.
+        assert!(g.fresh_processes().contains(&pid), "the shell, at first");
+        assert!(!g.fresh_processes().contains(&pid), "seen already");
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), b"go\n").unwrap();
+        let begun = Instant::now();
+        loop {
+            g.sys
+                .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
+            if g.fresh_processes().contains(&pid) {
+                break;
+            }
+            assert!(begun.elapsed() < Duration::from_secs(5), "never seen again");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(command_line(g.sys.process(pid).unwrap()).starts_with("./napper"));
+        g.inspect_binary(pid, false);
+        assert!(
+            actions(&g)
+                .iter()
+                .any(|a| a.starts_with("KNOWN_MALWARE: TERMINATED 1 process(es); QUARANTINED id=")),
+            "{:?}",
+            actions(&g)
+        );
+        assert!(child.wait().is_ok() && !exe.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Run by hand: no running system program may lose the protection it had.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn no_running_program_loses_its_protection() {
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
+        let (mut total, mut differ, mut lost) = (0, 0, Vec::new());
+        for process in sys.processes().values() {
+            let (Some(reported), Some(file)) = (process.exe(), platform::program_file(process))
+            else {
+                continue;
+            };
+            total += 1;
+            if reported == file {
+                continue;
+            }
+            differ += 1;
+            println!("{} -> {}", reported.display(), file.display());
+            let spared =
+                |p: &Path| ai_policy::is_os_critical_path(p) || platform::is_trusted_binary(p);
+            if spared(reported) && !spared(&file) {
+                lost.push((reported.to_path_buf(), file));
+            }
+        }
+        println!("{total} programs, {differ} reported differently");
+        assert!(total > 50 && lost.is_empty(), "{lost:?}");
     }
 
     #[cfg(target_os = "macos")]

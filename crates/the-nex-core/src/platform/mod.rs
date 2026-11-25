@@ -1,5 +1,6 @@
 //! OS abstraction used by every core module. Each target provides the same function set:
 //! discover_watched_dirs, discover_canary_dirs, discover_quick_scan_dirs, set_hidden_file,
+//! program_file,
 //! lock_quarantined_file, unlock_restored_file, send_desktop_notification, is_trusted_binary,
 //! path_key, path_is_within, install_service, uninstall_service, service_installed,
 //! run_service, run_tray, tray_is_running, run_elevated, install_ctrlc_handler, detach_console.
