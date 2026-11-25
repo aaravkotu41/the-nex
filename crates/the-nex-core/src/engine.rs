@@ -1349,6 +1349,33 @@ mod tests {
     }
 
     #[test]
+    fn a_file_on_the_known_malware_list_is_quarantined_even_when_it_is_also_allowed() {
+        let root = temp_root("known-and-allowed");
+        let watch = root.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        let program = watch.join("both.exe");
+        fs::write(&program, decoy_program()).unwrap();
+        let cfg = cfg_with_list(&root, std::slice::from_ref(&program));
+        // `allowlist::add` refuses a listed hash, so the list is written by hand: even then
+        // the hash is in effect as "allowed" in the file but never honoured.
+        let sha = quarantine::sha256_file(&program).unwrap();
+        let entry = crate::allowlist::AllowedFile::new(&sha, "both", "MALWARE_AI").unwrap();
+        assert!(crate::allowlist::add(&cfg, entry.clone()).is_err());
+        fs::write(&cfg.allowed_file, serde_json::to_vec(&[entry]).unwrap()).unwrap();
+        cfg.allowed.refresh();
+        assert!(cfg.allowed.contains(&sha));
+
+        let scanner = BinaryAiScanner::with_fixed_score(0.99);
+        scan_path(&cfg, &scanner, &program, &Telemetry::default());
+        assert!(!program.exists(), "quarantined");
+        let events = events_of(&cfg, known_bad::THREAT_TYPE);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].action_taken.starts_with("QUARANTINED id="));
+        assert!(events_of(&cfg, "MALWARE_AI").is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_refused_list_is_logged_and_leaves_the_engine_idle() {
         let root = temp_root("known-refused");
         let mut cfg = AppConfig::for_base_dir(&root.join("base"));

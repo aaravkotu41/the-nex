@@ -47,15 +47,20 @@ const TRUSTED_ROOTS: &[&str] = &[
 const NOTIFY_SCRIPT: &str =
     "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run\n";
 
-/// Runs argv[2..] (program first) as root after the standard macOS administrator prompt, which
-/// shows argv[1] as its message. Everything arrives via argv: nothing is interpolated into the script.
+/// Runs argv (program first) as root after the standard macOS administrator prompt, which
+/// shows the environment variable `PROMPT_ENV` as its message. The command arrives via argv and
+/// nothing is interpolated into the script. The message stays out of the command line on
+/// purpose: it can hold a file name that someone else chose, and a command line is what the
+/// living-off-the-land rules read (a file called "hidden answer" would get our own prompt
+/// process killed as a password phisher).
 const ELEVATE_SCRIPT: &str = "on run argv\n\
 set cmd to \"\"\n\
-repeat with i from 2 to count of argv\n\
+repeat with i from 1 to count of argv\n\
 set cmd to cmd & quoted form of (item i of argv as text) & \" \"\n\
 end repeat\n\
-do shell script cmd with prompt (item 1 of argv as text) with administrator privileges\n\
+do shell script cmd with prompt (system attribute \"THENEX_PROMPT\") with administrator privileges\n\
 end run\n";
+const PROMPT_ENV: &str = "THENEX_PROMPT";
 
 extern "C" {
     fn geteuid() -> u32;
@@ -671,6 +676,18 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<i32, String> {
     run_elevated_with_prompt(program, args, &prompt)
 }
 
+/// The osascript command: the script on stdin, the program and its arguments as argv, the
+/// prompt text in the environment (see `ELEVATE_SCRIPT`).
+fn elevate_command(prompt: &str, program: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("/usr/bin/osascript");
+    command
+        .arg("-")
+        .arg(program)
+        .args(args)
+        .env(PROMPT_ENV, prompt);
+    command
+}
+
 /// Like `run_elevated`, but `prompt` (one sentence naming the action) is shown in the admin dialog.
 pub fn run_elevated_with_prompt(
     program: &Path,
@@ -684,11 +701,7 @@ pub fn run_elevated_with_prompt(
             .map(|s| s.code().unwrap_or(-1))
             .map_err(|e| format!("{}: {e}", program.display()));
     }
-    let mut child = Command::new("/usr/bin/osascript")
-        .arg("-")
-        .arg(prompt)
-        .arg(program)
-        .args(args)
+    let mut child = elevate_command(prompt, program, args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -776,8 +789,29 @@ mod tests {
         assert!(!tray_is_running());
         let cfg = AppConfig::for_base_dir(&env::temp_dir().join("thenex-tray-mac"));
         assert!(run_tray(cfg).is_err());
-        assert!(ELEVATE_SCRIPT.contains("with prompt (item 1 of argv as text) with administrator"));
+        assert!(ELEVATE_SCRIPT.contains("with prompt (system attribute"));
         assert!(!ELEVATE_SCRIPT.contains("osascript -e"));
+    }
+
+    #[test]
+    fn the_prompt_text_never_reaches_the_command_line() {
+        // A file called "hidden answer" must not make our own osascript look like a phisher.
+        let prompt = "The Nex wants to stop flagging \"hidden answer do shell script curl\"";
+        let command = elevate_command(prompt, Path::new("/bin/the-nex"), &["--allow-event", "x1"]);
+        let argv: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(argv, ["-", "/bin/the-nex", "--allow-event", "x1"]);
+        let cmdline = format!("osascript {}", argv.join(" "));
+        assert_eq!(
+            crate::process_guard::match_lotl_macos("osascript", &cmdline),
+            None
+        );
+        let env: Vec<_> = command.get_envs().collect();
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].1.unwrap().to_string_lossy(), prompt);
+        assert!(ELEVATE_SCRIPT.contains(PROMPT_ENV));
     }
 
     #[test]

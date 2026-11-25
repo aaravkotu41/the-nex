@@ -49,6 +49,29 @@ const GREEN_TYPES = new Set(["QUARANTINE_RESTORE"]);
 // Detections that "Always allow" can cover: whole files judged by an estimating engine.
 const ALLOWABLE_TYPES = new Set(["MALWARE_AI", "MALWARE_AI_PROCESS", "ZIP_BOMB"]);
 const ALLOW_NOTE = "Always allow: this exact file (matched by its SHA-256) will never be flagged again until its contents change. It needs your administrator approval.";
+// A file name for a confirm step: control, bidi and zero-width characters removed, clipped.
+const HIDDEN_CHARS = /[\p{Cc}\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\u061C\u180E\uFEFF]/gu;
+function shownName(name) {
+  const clean = String(name || "").replace(HIDDEN_CHARS, "").trim() || "unnamed";
+  return clean.length > 60 ? `${clean.slice(0, 60)}...` : clean;
+}
+/** Why "Always allow" cannot be used right now (an older background service), else "". */
+function allowProblem() {
+  return (state.dashboard && state.dashboard.allow_problem) || "";
+}
+/** Larger files are never matched by their hash, so they cannot be always allowed. */
+function allowableSize(size) {
+  const max = state.dashboard && state.dashboard.thresholds && state.dashboard.thresholds.max_hash_bytes;
+  return Number.isFinite(max) && Number(size) <= max;
+}
+/** The note under an "Always allow" button. While the button is armed it says which file this is,
+ * so the person confirms the very file that will be allowed (Windows' UAC shows no text). */
+function allowNote(action, id, name, sha256, extra = "") {
+  const problem = allowProblem();
+  if (problem) return problem;
+  const which = confirming(action, id) ? `About to allow: ${shownName(name)}, SHA-256 ${String(sha256).slice(0, 16)}. ` : "";
+  return `${which}${ALLOW_NOTE}${extra}`;
+}
 
 const state = {
   page: "overview",
@@ -388,7 +411,7 @@ function activityRows(event) {
   ], TYPE_NOTES[event.threat_type]);
   const allowable = event.sha256 && ALLOWABLE_TYPES.has(event.threat_type);
   detail.append(reportButton(event, ...(allowable ? [quarantineButton("allow_event", "Always allow", event.id)] : [])));
-  if (allowable) detail.append(el("p", { className: "detail-note", text: ALLOW_NOTE }));
+  if (allowable) detail.append(el("p", { className: "detail-note", text: allowNote("allow_event", event.id, fileName(event.target), event.sha256) }));
   return expandable(cells, detail, open, () => {
     state.openEvent = open ? null : event.id;
     loadEvents().catch(() => {});
@@ -725,12 +748,14 @@ function confirming(action, id) {
 
 function quarantineButton(action, label, id) {
   const armed = confirming(action, id);
+  const problem = action.startsWith("allow") ? allowProblem() : "";
   const button = el("button", {
     className: action === "delete" ? "btn btn-small btn-danger" : "btn btn-small",
     text: armed ? `Confirm ${label.toLowerCase()}` : label,
-    title: action.startsWith("allow") ? ALLOW_NOTE : "",
+    title: problem || (action.startsWith("allow") ? ALLOW_NOTE : ""),
     attrs: { type: "button" },
   });
+  button.disabled = Boolean(problem);
   button.addEventListener("click", (event) => {
     event.stopPropagation();
     quarantineAction(action, id, event);
@@ -777,10 +802,10 @@ function quarantineRows(q) {
     ["Stored as", q.quarantined_path],
     ["Quarantine ID", q.id],
   ], `${TYPE_NOTES[q.threat_type] ? `${TYPE_NOTES[q.threat_type]} ` : ""}The file is locked away and cannot run. Restore puts it back where it was found; Delete removes it for good.`);
-  const allowable = q.sha256 && ALLOWABLE_TYPES.has(q.threat_type);
+  const allowable = q.sha256 && ALLOWABLE_TYPES.has(q.threat_type) && allowableSize(q.size);
   detail.append(reportButton({ ...q, target: q.original_path, timestamp: q.quarantined_at },
     ...(allowable ? [quarantineButton("allow_quarantined", "Restore and always allow", q.id)] : [])));
-  if (allowable) detail.append(el("p", { className: "detail-note", text: `${ALLOW_NOTE} The file is restored first.` }));
+  if (allowable) detail.append(el("p", { className: "detail-note", text: allowNote("allow_quarantined", q.id, fileName(q.original_path), q.sha256, " The file is restored first.") }));
   return expandable(cells, detail, open, () => {
     state.openQuarantine = open ? null : q.id;
     renderQuarantine();
@@ -807,7 +832,7 @@ function renderQuarantineFacts(all) {
 
 function renderQuarantine() {
   const records = state.quarantine.filter((q) => matchesQuery(q.id, q.original_path, q.sha256, q.threat_type, q.details));
-  const signature = JSON.stringify([state.openQuarantine, records.map((q) => [q.id, confirming("restore", q.id), confirming("delete", q.id), confirming("allow_quarantined", q.id)])]);
+  const signature = JSON.stringify([state.openQuarantine, records.map((q) => [q.id, confirming("restore", q.id), confirming("delete", q.id), confirming("allow_quarantined", q.id)]), allowProblem()]);
   replaceIfChanged($("quarantine-rows"), signature, () => records.flatMap(quarantineRows));
   renderQuarantineFacts(state.quarantine);
   $("quarantine-empty").hidden = records.length > 0;
@@ -868,7 +893,7 @@ async function loadEvents() {
     $("activity-range").textContent = capped
       ? `Only the newest ${count(ACTIVITY_LIMIT)} events are listed; the Overview chart counts all of them. ${range}`
       : range;
-    replaceIfChanged($("activity-events"), `${eventsSignature(shown)}|${state.openEvent}|${confirming("allow_event", state.openEvent)}`, () => shown.flatMap(activityRows));
+    replaceIfChanged($("activity-events"), `${eventsSignature(shown)}|${state.openEvent}|${confirming("allow_event", state.openEvent)}|${allowProblem()}`, () => shown.flatMap(activityRows));
     $("activity-empty").hidden = shown.length > 0;
   }
 }
@@ -885,9 +910,23 @@ async function loadAllowed() {
   }
   $("allowed-empty").textContent = problem || "No file is always allowed.";
   $("allowed-empty").hidden = list.length > 0;
-  replaceIfChanged($("allowed-list"), JSON.stringify(list), () => list.map((entry) => {
-    const remove = el("button", { className: "btn btn-small", text: "Remove", attrs: { type: "button", "aria-label": `Check ${entry.name} again` } });
-    remove.addEventListener("click", async () => {
+  const armed = (entry) => confirming("remove_allowed", entry.sha256);
+  replaceIfChanged($("allowed-list"), JSON.stringify([list, list.map(armed)]), () => list.map((entry) => {
+    // Two steps, and the second says which file: Windows' administrator prompt shows no text.
+    const remove = el("button", {
+      className: "btn btn-small",
+      text: armed(entry) ? `Confirm: check ${shownName(entry.name)} (SHA-256 ${entry.sha256.slice(0, 16)}) again` : "Remove",
+      attrs: { type: "button", "aria-label": `Check ${shownName(entry.name)} again` },
+    });
+    remove.addEventListener("click", async (event) => {
+      if (!armed(entry)) {
+        state.confirm = { action: "remove_allowed", id: entry.sha256, at: Date.now(), until: Date.now() + CONFIRM_MS };
+        loadAllowed();
+        setTimeout(loadAllowed, CONFIRM_MS + 50);
+        return;
+      }
+      if (event.detail > 1 || Date.now() - state.confirm.at < 400) return; // a double-click must not confirm
+      state.confirm = null;
       remove.disabled = true;
       try {
         notice(await call("remove_allowed", { sha256: entry.sha256 }), false);

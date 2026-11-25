@@ -804,6 +804,7 @@ pub fn scan_and_respond(
     if scanner.is_trusted(path) {
         return None;
     }
+    let judged = allowlist::stamp_of(path);
     let (score, profile) = scanner.scan_with_profile(path)?;
     let threshold = ai_policy::effective_threshold(cfg.ai_threshold);
     if score.is_nan() || score < threshold {
@@ -812,7 +813,7 @@ pub fn scan_and_respond(
             detection: None,
         });
     }
-    let (digest, allowed) = allowlist::check(cfg, path);
+    let (digest, allowed) = allowlist::check(cfg, path, judged);
     if allowed {
         return Some(AiOutcome {
             score,

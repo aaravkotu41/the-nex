@@ -30,6 +30,7 @@ fn main() -> ExitCode {
         Mode::Restore(id) => restore(id, &args),
         Mode::Delete(id) => delete(id, &args),
         Mode::Allow(sha256) => allow(sha256, &args),
+        Mode::AllowEvent(id) => allow_event(id, &args),
         Mode::Disallow(sha256) => disallow(sha256, &args),
         Mode::AllowQuarantined(id) => allow_quarantined(id, &args),
         Mode::ListAllowed => list_allowed(&args),
@@ -148,6 +149,34 @@ fn allow(sha256: &str, args: &CliArgs) -> ExitCode {
         }
         Err(e) => {
             eprintln!("error: cannot allow {sha256}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The hash comes from this engine's own event log, never from the caller: when the desktop
+/// app asks for this through the administrator prompt, a user-level program cannot choose it.
+fn allow_event(id: &str, args: &CliArgs) -> ExitCode {
+    let result = allow_config(args).and_then(|cfg| {
+        let event = allowlist::event_by_id(&cfg, id).map_err(|e| e.to_string())?;
+        let entry = AllowedFile::from_event(&event)?;
+        let added = allowlist::add(&cfg, entry).map_err(|e| e.to_string())?;
+        let note = event
+            .quarantine_id()
+            .filter(|q| quarantine::load_meta(q, &cfg).is_ok())
+            .map(allowlist::still_quarantined_note);
+        Ok((added, note))
+    });
+    match result {
+        Ok((added, note)) => {
+            println!("{}", if added { "Added" } else { "Already listed" });
+            if let Some(note) = note {
+                println!("{note}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: cannot allow event {id}: {e}");
             ExitCode::FAILURE
         }
     }

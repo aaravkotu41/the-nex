@@ -877,8 +877,9 @@ fn inspect_level<R: Read + Seek>(
 }
 
 pub fn scan_and_respond(path: &Path, cfg: &AppConfig) -> Option<ZipThreat> {
+    let judged = allowlist::stamp_of(path);
     let threat = inspect_zip_file(path, cfg)?;
-    let (digest, allowed) = allowlist::check(cfg, path);
+    let (digest, allowed) = allowlist::check(cfg, path, judged);
     if allowed {
         return None;
     }

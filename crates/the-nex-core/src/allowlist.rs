@@ -9,23 +9,31 @@
 //! (LotL) and canaries have no file hash and so cannot be listed at all.
 
 use crate::config::{self, AppConfig};
-use crate::known_bad::Digest32;
+use crate::known_bad::{self, Digest32, Stamp};
 use crate::logger::{self, lock_or_recover};
 use crate::quarantine::{self, QuarantineMeta, Severity, ThreatEvent};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 pub const FILE_NAME: &str = "allowed.json";
 pub const MAX_ENTRIES: usize = 1000;
 const MAX_NAME_CHARS: usize = 120;
 /// 1,000 entries are well under 1 MB; a bigger file is not ours.
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// An event log is read at most this far, a line at most this long.
+const MAX_LOG_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_LOG_LINE: u64 = 1024 * 1024;
+const PROMPT_NAME_CHARS: usize = 60;
+/// A change to the list waits this long for another one to finish; a lock older than
+/// `STALE_LOCK` was left by a crash.
+const LOCK_WAIT: Duration = Duration::from_secs(3);
+const STALE_LOCK: Duration = Duration::from_secs(30);
 /// Detections an entry can cover: whole files judged by an estimating engine. `MANUAL` is for
 /// an entry added by hand from the command line.
 pub const ALLOWABLE_TYPES: &[&str] = &["MALWARE_AI", "MALWARE_AI_PROCESS", "ZIP_BOMB", "MANUAL"];
@@ -79,6 +87,33 @@ pub fn check_name(name: &str) -> Result<(), String> {
         return Err("the name must not contain control characters".to_string());
     }
     Ok(())
+}
+
+/// A file name for an administrator prompt or a confirm step: control, bidirectional and
+/// zero-width characters (which can reorder or hide text) are removed and the length is bounded.
+pub fn prompt_name(name: &str) -> String {
+    let hidden = |c: char| {
+        c.is_control()
+            || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}' | '\u{061C}' | '\u{180E}' | '\u{FEFF}')
+    };
+    let cleaned: String = name.chars().filter(|c| !hidden(*c)).collect();
+    let cleaned = cleaned.trim();
+    match cleaned.char_indices().nth(PROMPT_NAME_CHARS) {
+        _ if cleaned.is_empty() => "unnamed".to_string(),
+        Some((cut, _)) => format!("{}...", &cleaned[..cut]),
+        None => cleaned.to_string(),
+    }
+}
+
+/// What a prompt says about one file: the start of its SHA-256, then its name. The name comes
+/// last because someone else chose it: it cannot be made to look like text that follows.
+pub fn describe(name: &str, sha256: &str) -> String {
+    format!(
+        "SHA-256 {}, file name: {}",
+        &sha256[..sha256.len().min(16)],
+        prompt_name(name)
+    )
 }
 
 pub fn check_type(threat_type: &str) -> Result<(), String> {
@@ -138,35 +173,74 @@ fn untrusted_reason(uid: u32, mode: u32, privileged: bool) -> Option<&'static st
     }
 }
 
+/// Why the list could not be used. Only `Damaged` may be replaced by a writer.
+#[derive(Debug)]
+pub enum LoadError {
+    /// Could not be read right now (I/O error, too many open files): worth trying again.
+    Io(io::Error),
+    /// Not ours: wrong owner or mode, or too large. Never read, never overwritten.
+    Refused(String),
+    /// Read, but not a valid list.
+    Damaged(String),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => e.fmt(f),
+            Self::Refused(why) | Self::Damaged(why) => f.write_str(why),
+        }
+    }
+}
+
+impl From<LoadError> for String {
+    fn from(e: LoadError) -> String {
+        e.to_string()
+    }
+}
+
 /// Loads the list. A missing file is an empty list; a damaged or untrusted one is an error and
 /// is never partly used. shortcut: Windows relies on the ACL of ProgramData\TheNex; upgrade by
 /// checking the file's owner SID there as well.
-pub fn load(path: &Path, privileged: bool) -> Result<Vec<AllowedFile>, String> {
+pub fn load(path: &Path, privileged: bool) -> Result<Vec<AllowedFile>, LoadError> {
+    let io_error =
+        |e: io::Error| LoadError::Io(io::Error::new(e.kind(), format!("{}: {e}", path.display())));
     let file = match quarantine::open_nofollow(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+            return Err(LoadError::Refused(format!(
+                "{} is ignored: {e}",
+                path.display()
+            )))
+        }
+        Err(e) => return Err(io_error(e)),
     };
-    let meta = file.metadata().map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(io_error)?;
     #[cfg(unix)]
     {
         // Checked on the open handle, so a swap after the open changes nothing.
         use std::os::unix::fs::MetadataExt;
         if let Some(why) = untrusted_reason(meta.uid(), meta.mode(), privileged) {
-            return Err(format!("{} is ignored: {why}", path.display()));
+            return Err(LoadError::Refused(format!(
+                "{} is ignored: {why}",
+                path.display()
+            )));
         }
     }
     #[cfg(not(unix))]
     let _ = privileged;
     if meta.len() > MAX_FILE_BYTES {
-        return Err("the list is too large to be ours".to_string());
+        return Err(LoadError::Refused(
+            "the list is too large to be ours".to_string(),
+        ));
     }
     let mut bytes = Vec::new();
     file.take(MAX_FILE_BYTES)
         .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
+        .map_err(io_error)?;
     let entries: Vec<AllowedFile> =
-        serde_json::from_slice(&bytes).map_err(|e| format!("damaged: {e}"))?;
+        serde_json::from_slice(&bytes).map_err(|e| LoadError::Damaged(format!("damaged: {e}")))?;
     let mut seen = HashSet::new();
     let well_formed = entries.len() <= MAX_ENTRIES
         && entries
@@ -175,7 +249,9 @@ pub fn load(path: &Path, privileged: bool) -> Result<Vec<AllowedFile>, String> {
     if well_formed {
         Ok(entries)
     } else {
-        Err("damaged: an entry is malformed or the list is over its limit".to_string())
+        Err(LoadError::Damaged(
+            "damaged: an entry is malformed or the list is over its limit".to_string(),
+        ))
     }
 }
 
@@ -206,6 +282,10 @@ impl LiveAllowed {
 
     /// One stat; reads the file only when it changed.
     pub fn refresh(&self) {
+        self.refresh_with(|path| load(path, config::running_privileged()));
+    }
+
+    fn refresh_with(&self, load: impl FnOnce(&Path) -> Result<Vec<AllowedFile>, LoadError>) {
         let stamp = fs::metadata(&self.path).map_or((0, 0, 0), |m| {
             let modified = m
                 .modified()
@@ -225,15 +305,17 @@ impl LiveAllowed {
         if state.stamp == Some(stamp) {
             return;
         }
-        state.stamp = Some(stamp);
-        match load(&self.path, config::running_privileged()) {
+        let result = load(&self.path);
+        // A failed read is retried next time; a verdict about the content is kept until it changes.
+        state.stamp = (!matches!(result, Err(LoadError::Io(_)))).then_some(stamp);
+        match result {
             Ok(entries) => {
                 state.hashes = entries.into_iter().map(|e| e.sha256).collect();
                 state.error = None;
             }
             Err(e) => {
                 state.hashes.clear();
-                state.error = Some(e);
+                state.error = Some(e.to_string());
             }
         }
     }
@@ -256,14 +338,36 @@ impl LiveAllowed {
     }
 }
 
+/// The stamp of the file as it is now (never following a link), for `check`.
+pub fn stamp_of(path: &Path) -> Option<Stamp> {
+    fs::symlink_metadata(path)
+        .ok()
+        .and_then(|m| known_bad::stamp(&m))
+}
+
 /// Hashes `path` (the file about to be flagged) and says whether that exact content is always
-/// allowed. The hash is returned for the event either way; `None` when the file cannot be
-/// hashed (too large, not a regular file), which can never be allowed.
-// shortcut: this re-reads the file after the engine judged it, so a swap in between is
-// possible; the hash goes into the event and the same bytes are then quarantined or left alone.
-// Closing it means hashing the very bytes the engine scored; do that if engines ever keep them.
-pub fn check(cfg: &AppConfig, path: &Path) -> (Option<Digest32>, bool) {
-    let digest = crate::known_bad::hash_file(path, crate::known_bad::MAX_HASH_BYTES);
+/// allowed. `judged` is the stamp taken before the engine read the file to score it: the hash
+/// counts only if the file still has that stamp after it was hashed, so an event never records
+/// (and the list never matches) bytes that were not the ones judged. `None` when the file
+/// cannot be hashed (too large, not a regular file) or changed in between, which can never be
+/// allowed.
+// shortcut: Windows has only size and modified time as a stamp (see `known_bad::Stamp::Weak`),
+// which a swap can keep; there it narrows the window rather than closing it. Closing it means
+// hashing the very bytes the engine scored (volume serial + file index + change time would do).
+pub fn check(cfg: &AppConfig, path: &Path, judged: Option<Stamp>) -> (Option<Digest32>, bool) {
+    check_with(cfg, path, judged, known_bad::hash_file)
+}
+
+fn check_with(
+    cfg: &AppConfig,
+    path: &Path,
+    judged: Option<Stamp>,
+    hash: impl FnOnce(&Path, u64) -> Option<Digest32>,
+) -> (Option<Digest32>, bool) {
+    let digest = judged.and_then(|before| {
+        let digest = hash(path, known_bad::MAX_HASH_BYTES)?;
+        (stamp_of(path) == Some(before)).then_some(digest)
+    });
     let allowed = digest.is_some_and(|d| cfg.is_allowed(&d));
     if allowed {
         logger::info(format!(
@@ -272,6 +376,70 @@ pub fn check(cfg: &AppConfig, path: &Path) -> (Option<Digest32>, bool) {
         ));
     }
     (digest, allowed)
+}
+
+/// Holds the list's lock file; dropping it lets the next change go ahead.
+struct UpdateLock(PathBuf);
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// One change to the list at a time (an exclusive create of a lock file beside it). A lock a
+/// crash left behind goes stale after `STALE_LOCK`.
+fn lock(cfg: &AppConfig, wait: Duration) -> io::Result<UpdateLock> {
+    if let Some(parent) = cfg.allowed_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let path = cfg.allowed_file.with_extension("json.lock");
+    let started = Instant::now();
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(UpdateLock(path)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let age = fs::symlink_metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok());
+                if age.is_some_and(|age| age > STALE_LOCK) {
+                    let _ = fs::remove_file(&path);
+                } else if started.elapsed() >= wait {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "another change to the always-allowed list is in progress; try again",
+                    ));
+                } else {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// The list to change. A list that could not be read or was refused is an error, so a change
+/// never rewrites it and loses entries; only a damaged one is replaced, and a copy is kept.
+fn load_for_update(cfg: &AppConfig) -> io::Result<Vec<AllowedFile>> {
+    match load(&cfg.allowed_file, config::running_privileged()) {
+        Ok(entries) => Ok(entries),
+        Err(LoadError::Io(e)) => Err(e),
+        Err(LoadError::Refused(why)) => Err(io::Error::new(io::ErrorKind::InvalidData, why)),
+        Err(LoadError::Damaged(why)) => {
+            let kept = cfg.allowed_file.with_extension("json.damaged");
+            fs::rename(&cfg.allowed_file, &kept)?;
+            logger::warn(format!(
+                "always-allowed list replaced ({why}); the old file is kept as {}",
+                kept.display()
+            ));
+            Ok(Vec::new())
+        }
+    }
 }
 
 /// Adds one entry (a no-op returning false when already listed). The caller loads the
@@ -285,8 +453,8 @@ pub fn add(cfg: &AppConfig, entry: AllowedFile) -> io::Result<bool> {
             "it is on the known-malware list and can never be allowed",
         ));
     }
-    // A damaged list is ignored by every reader anyway, so writing replaces it.
-    let mut entries = load(&cfg.allowed_file, config::running_privileged()).unwrap_or_default();
+    let _lock = lock(cfg, LOCK_WAIT)?;
+    let mut entries = load_for_update(cfg)?;
     if entries.iter().any(|e| e.sha256 == hash) {
         return Ok(false);
     }
@@ -312,10 +480,14 @@ fn digest_of(hex: &str) -> Digest32 {
     digest
 }
 
-/// Removes one entry; false when it was not listed.
+/// Removes one entry; false when it was not listed (a damaged list lists nothing).
 pub fn remove(cfg: &AppConfig, sha256: &str) -> io::Result<bool> {
     let hash = parse_sha256(sha256).map_err(invalid)?;
-    let mut entries = load(&cfg.allowed_file, config::running_privileged()).unwrap_or_default();
+    let _lock = lock(cfg, LOCK_WAIT)?;
+    let mut entries = match load(&cfg.allowed_file, config::running_privileged()) {
+        Err(LoadError::Damaged(_)) => return Ok(false),
+        _ => load_for_update(cfg)?,
+    };
     let before = entries.len();
     entries.retain(|e| e.sha256 != hash);
     if entries.len() == before {
@@ -346,10 +518,94 @@ fn audit(cfg: &AppConfig, action: &str, target: &str, sha256: &str) {
     );
 }
 
+/// Searches one log for `id`, reading at most `MAX_LOG_BYTES` and never
+/// holding more than one line (`MAX_LOG_LINE`) in memory.
+fn find_in_log(log: impl Read, id: &str) -> io::Result<Option<ThreatEvent>> {
+    let mut reader = io::BufReader::new(log.take(MAX_LOG_BYTES));
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = (&mut reader)
+            .take(MAX_LOG_LINE)
+            .read_until(b'\n', &mut line)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if line.last() != Some(&b'\n') && read as u64 == MAX_LOG_LINE {
+            // Too long to be an event: skip to the end of the line.
+            let mut rest = Vec::new();
+            while (&mut reader)
+                .take(MAX_LOG_LINE)
+                .read_until(b'\n', &mut rest)?
+                > 0
+                && rest.last() != Some(&b'\n')
+            {
+                rest.clear();
+            }
+            continue;
+        }
+        if line.windows(id.len()).any(|w| w == id.as_bytes()) {
+            if let Ok(event) = serde_json::from_slice::<ThreatEvent>(&line) {
+                if event.id == id {
+                    return Ok(Some(event));
+                }
+            }
+        }
+    }
+}
+
+/// The logged event with this ID, from this process's own data folder (the current log, then
+/// the rotated one). "Always allow" uses the hash the engine recorded in that event, never one
+/// supplied by whoever asks. A privileged engine reads the root-owned log here, so the
+/// desktop app (user-level) cannot choose what is allowed.
+pub fn event_by_id(cfg: &AppConfig, id: &str) -> io::Result<ThreatEvent> {
+    if !quarantine::is_valid_id(id) {
+        return Err(invalid(format!("invalid event ID: {id}")));
+    }
+    for path in [
+        cfg.events_log.clone(),
+        quarantine::rotated_events_path(&cfg.events_log),
+    ] {
+        let log = match quarantine::open_nofollow(&path) {
+            Ok(log) => log,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+        };
+        if let Some(event) = find_in_log(log, id)? {
+            return Ok(event);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "that event is no longer in the log",
+    ))
+}
+
+/// The engines hash only files up to `MAX_HASH_BYTES`, so an entry for a bigger one could
+/// never match.
+pub fn check_size(size: u64) -> Result<(), String> {
+    if size > known_bad::MAX_HASH_BYTES {
+        return Err(format!(
+            "this file is larger than {} MB, which is too large to always allow (it would still be flagged); nothing was restored",
+            known_bad::MAX_HASH_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
+/// What to tell someone who allowed an event whose file is still in quarantine: allowing does
+/// not restore it.
+pub fn still_quarantined_note(id: &str) -> String {
+    format!(
+        "The file is still in quarantine (ID {id}). Restore it from the Quarantine page, or run: the-nex --restore {id}"
+    )
+}
+
 /// Lists the hash from a quarantine record (the bytes that were moved) and restores the file.
 /// If the restore fails the hash does not stay allowed.
 pub fn allow_and_restore(id: &str, cfg: &AppConfig) -> io::Result<QuarantineMeta> {
     let meta = quarantine::load_meta(id, cfg)?;
+    check_size(meta.size).map_err(invalid)?;
     let added = add(cfg, AllowedFile::from_quarantined(&meta).map_err(invalid)?)?;
     match quarantine::restore_file(id, cfg) {
         Ok(meta) => Ok(meta),
@@ -607,6 +863,250 @@ mod tests {
         let (path, meta) = place("bad.bin", "KNOWN_MALWARE");
         assert!(allow_and_restore(&meta.id, &cfg).is_err());
         assert!(!path.exists() && quarantine::load_meta(&meta.id, &cfg).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_names_lose_hidden_characters_and_are_short() {
+        assert_eq!(prompt_name("a\u{202E}b\u{200B}c\nd\u{7}\u{2066}e"), "abcde");
+        assert_eq!(prompt_name("\u{202E}\u{200B}  "), "unnamed");
+        assert_eq!(prompt_name(&"é".repeat(100)).chars().count(), 63);
+        assert_eq!(
+            describe("x\u{202E}.exe", HASH),
+            "SHA-256 0123456789abcdef, file name: x.exe"
+        );
+    }
+
+    #[test]
+    fn a_file_swapped_after_it_was_judged_has_no_digest_and_is_never_allowed() {
+        let dir = temp("swap");
+        let cfg = AppConfig::for_base_dir(&dir);
+        cfg.ensure_dirs().unwrap();
+        let file = dir.join("tool.bin");
+        fs::write(&file, b"judged bytes").unwrap();
+        add(&cfg, entry(&quarantine::sha256_hex(b"other bytes"))).unwrap();
+        let judged = stamp_of(&file);
+
+        // Unchanged: the digest is the judged file's, and it is not on the list.
+        let (digest, allowed) = check(&cfg, &file, judged);
+        assert_eq!(
+            digest,
+            Some(digest_of(&quarantine::sha256_hex(b"judged bytes")))
+        );
+        assert!(!allowed);
+        // No stamp from before the judging: nothing can be vouched for.
+        assert_eq!(check(&cfg, &file, None), (None, false));
+        // Swapped for an allowed file between the judging and the hashing: no digest at all.
+        let swap = |path: &Path, max: u64| {
+            fs::remove_file(path).unwrap();
+            fs::write(path, b"other bytes").unwrap();
+            known_bad::hash_file(path, max)
+        };
+        assert_eq!(check_with(&cfg, &file, judged, swap), (None, false));
+        // Swapped after the hash was taken: also caught by the second stamp.
+        let late = |path: &Path, max: u64| {
+            let digest = known_bad::hash_file(path, max);
+            fs::remove_file(path).unwrap();
+            fs::write(path, b"another one").unwrap();
+            digest
+        };
+        let judged = stamp_of(&file);
+        assert_eq!(check_with(&cfg, &file, judged, late), (None, false));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_privileged_reader_refuses_a_list_owned_by_a_user() {
+        if config::running_privileged() {
+            return; // the file would be root's own
+        }
+        let dir = temp("owner");
+        let file = dir.join(FILE_NAME);
+        fs::write(&file, serde_json::to_vec(&[entry(HASH)]).unwrap()).unwrap();
+        assert!(load(&file, false).is_ok());
+        match load(&file, true) {
+            Err(LoadError::Refused(why)) => assert!(why.contains("not owned by root"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_list_that_was_refused_or_cannot_be_read_is_never_rewritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp("norewrite");
+        let cfg = AppConfig::for_base_dir(&dir);
+        cfg.ensure_dirs().unwrap();
+        add(&cfg, entry(HASH)).unwrap();
+        let original = fs::read(&cfg.allowed_file).unwrap();
+
+        fs::set_permissions(&cfg.allowed_file, fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(
+            add(&cfg, entry(&hash_n(1))).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(remove(&cfg, HASH).is_err());
+        assert_eq!(fs::read(&cfg.allowed_file).unwrap(), original);
+
+        if !config::running_privileged() {
+            fs::set_permissions(&cfg.allowed_file, fs::Permissions::from_mode(0o000)).unwrap();
+            assert_eq!(
+                add(&cfg, entry(&hash_n(1))).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert!(remove(&cfg, HASH).is_err());
+        }
+        fs::set_permissions(&cfg.allowed_file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(fs::read(&cfg.allowed_file).unwrap(), original);
+        assert!(!cfg.allowed_file.with_extension("json.damaged").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_damaged_list_is_replaced_and_a_copy_is_kept() {
+        let dir = temp("damaged");
+        let cfg = AppConfig::for_base_dir(&dir);
+        cfg.ensure_dirs().unwrap();
+        let kept = cfg.allowed_file.with_extension("json.damaged");
+        fs::write(&cfg.allowed_file, b"not json").unwrap();
+        assert!(!remove(&cfg, HASH).unwrap(), "nothing to remove from it");
+        assert_eq!(fs::read(&cfg.allowed_file).unwrap(), b"not json");
+        assert!(add(&cfg, entry(HASH)).unwrap());
+        assert_eq!(fs::read(&kept).unwrap(), b"not json");
+        assert_eq!(load(&cfg.allowed_file, false).unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_read_is_retried_but_a_verdict_on_the_content_is_kept() {
+        let dir = temp("retry");
+        let file = dir.join(FILE_NAME);
+        let live = LiveAllowed::new(file.clone());
+        fs::write(&file, serde_json::to_vec(&[entry(HASH)]).unwrap()).unwrap();
+        live.refresh_with(|_| Err(LoadError::Io(io::Error::other("too many open files"))));
+        assert!(live.error().is_some() && !live.contains(HASH));
+        // Same file, same stamp: it is read again because the last read failed.
+        live.refresh_with(|path| load(path, false));
+        assert!(live.contains(HASH) && live.error().is_none());
+        // A damaged file is a verdict: it is not parsed again until it changes.
+        fs::write(&file, b"not json").unwrap();
+        live.refresh_with(|path| load(path, false));
+        assert!(live.error().is_some());
+        live.refresh_with(|_| panic!("read again"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changes_to_the_list_are_serialised() {
+        let dir = temp("lock");
+        let cfg = AppConfig::for_base_dir(&dir);
+        cfg.ensure_dirs().unwrap();
+        std::thread::scope(|scope| {
+            for n in 0..12 {
+                let cfg = &cfg;
+                scope.spawn(move || add(cfg, entry(&hash_n(n))).unwrap());
+            }
+        });
+        assert_eq!(load(&cfg.allowed_file, false).unwrap().len(), 12);
+        assert!(!cfg.allowed_file.with_extension("json.lock").exists());
+
+        // A lock someone holds makes the change wait and then give up; a stale one is cleared.
+        let held = cfg.allowed_file.with_extension("json.lock");
+        fs::write(&held, b"").unwrap();
+        let started = Instant::now();
+        let timeout = lock(&cfg, Duration::from_millis(80)).err().unwrap();
+        assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        fs::File::options()
+            .write(true)
+            .open(&held)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - STALE_LOCK - Duration::from_secs(5))
+            .unwrap();
+        drop(lock(&cfg, Duration::from_millis(80)).unwrap());
+        assert!(!held.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_event_is_found_by_its_id_in_the_current_and_the_rotated_log() {
+        let dir = temp("events");
+        let cfg = AppConfig::for_base_dir(&dir);
+        cfg.ensure_dirs().unwrap();
+        let mut zip = ThreatEvent::new("ZIP_BOMB", Severity::High, "/x/pack.zip", "Q", "d");
+        zip.sha256 = Some(HASH.to_string());
+        let mut old = ThreatEvent::new("MALWARE_AI", Severity::High, "/x/old.bin", "Q", "d");
+        old.sha256 = Some(hash_n(9));
+        let lotl = ThreatEvent::new("LOTL_SCRIPT", Severity::High, "osascript (pid 4)", "K", "d");
+        let mut known = ThreatEvent::new("KNOWN_MALWARE", Severity::High, "/x/bad", "Q", "d");
+        known.sha256 = Some(hash_n(8));
+        for e in [&zip, &lotl, &known] {
+            quarantine::append_event(&cfg, e).unwrap();
+        }
+        let line = serde_json::to_string(&old).unwrap() + "\n";
+        fs::write(quarantine::rotated_events_path(&cfg.events_log), line).unwrap();
+
+        assert_eq!(event_by_id(&cfg, &zip.id).unwrap(), zip);
+        assert_eq!(event_by_id(&cfg, &old.id).unwrap(), old);
+        assert_eq!(
+            event_by_id(&cfg, "20200101000000000-1-0000")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            event_by_id(&cfg, "../x").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // Same type rules as ever: scripts have no file, and known malware is never allowed.
+        for forged in [&lotl, &known] {
+            let found = event_by_id(&cfg, &forged.id).unwrap();
+            assert!(
+                AllowedFile::from_event(&found).is_err(),
+                "{}",
+                found.threat_type
+            );
+        }
+        assert!(add(&cfg, AllowedFile::from_event(&zip).unwrap()).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_log_search_is_bounded_and_skips_lines_that_are_too_long() {
+        let mut event = ThreatEvent::new("ZIP_BOMB", Severity::High, "/x/a.zip", "Q", "d");
+        event.sha256 = Some(HASH.to_string());
+        let mut log = vec![b'x'; MAX_LOG_LINE as usize * 2 + 5];
+        log.push(b'\n');
+        log.extend_from_slice(b"not json with the id inside\n");
+        log.extend_from_slice(serde_json::to_string(&event).unwrap().as_bytes());
+        assert_eq!(find_in_log(&log[..], &event.id).unwrap(), Some(event));
+        assert_eq!(find_in_log(&log[..], "nope").unwrap(), None);
+    }
+
+    #[test]
+    fn a_file_too_large_to_ever_match_is_refused_before_anything_is_restored() {
+        let dir = temp("toolarge");
+        let mut cfg = AppConfig::for_base_dir(&dir);
+        cfg.ensure_dirs().unwrap();
+        cfg.load_known_bad().unwrap();
+        let path = dir.join("huge.bin");
+        fs::write(&path, b"stands in for a huge file").unwrap();
+        let meta = quarantine::quarantine_file(&path, &cfg, "MALWARE_AI", "t").unwrap();
+        let record = quarantine::meta_path(&cfg, &meta.id);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        json["size"] = (known_bad::MAX_HASH_BYTES + 1).into();
+        fs::write(&record, serde_json::to_vec(&json).unwrap()).unwrap();
+
+        let refused = allow_and_restore(&meta.id, &cfg).unwrap_err();
+        assert!(refused.to_string().contains("too large"), "{refused}");
+        assert!(!path.exists() && !cfg.allowed_file.exists());
+        assert!(
+            quarantine::load_meta(&meta.id, &cfg).is_ok(),
+            "still quarantined"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

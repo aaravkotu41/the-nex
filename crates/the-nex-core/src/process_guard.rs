@@ -517,6 +517,7 @@ impl ProcessGuard {
         if self.is_trusted(exe) {
             return;
         }
+        let judged = allowlist::stamp_of(exe);
         let Some(score) = self.scanner.scan_file(exe) else {
             return;
         };
@@ -524,7 +525,7 @@ impl ProcessGuard {
         if score.is_nan() || score < threshold {
             return;
         }
-        let (digest, allowed) = allowlist::check(&self.cfg, exe);
+        let (digest, allowed) = allowlist::check(&self.cfg, exe, judged);
         if allowed {
             return;
         }

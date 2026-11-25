@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use the_nex_core::allowlist::{self, AllowedFile};
 use the_nex_core::bin_ai::BinaryAiScanner;
 use the_nex_core::canary;
-use the_nex_core::config::{AppConfig, Engine, RuntimeToggles, ZipLimits};
+use the_nex_core::config::{self, AppConfig, Engine, RuntimeToggles, ZipLimits};
 use the_nex_core::engine::{self, QuickScanReport, ScanKind};
 use the_nex_core::platform;
 use the_nex_core::quarantine::{self, QuarantineMeta, Severity, ThreatEvent};
@@ -49,6 +49,8 @@ struct Thresholds {
     nested_read_mb: f64,
     min_ratio_check_mb: f64,
     ai_threshold: f32,
+    /// Files above this size are never matched by their hash, so they cannot be always allowed.
+    max_hash_bytes: u64,
 }
 
 /// The known-malware list as the running service loaded it.
@@ -87,14 +89,27 @@ struct DashboardState {
     full_disk_access: Option<bool>,
     /// The copy macOS lists under Full Disk Access: the service runs from here, not from the app.
     engine_path: String,
+    /// Why "Always allow" cannot be used now (the engine that would run it is too old).
+    allow_problem: Option<String>,
 }
 
-fn engine_copy_path(cfg: &AppConfig) -> PathBuf {
-    cfg.base_dir.join("engine").join(platform::DAEMON_EXE_STEM)
+/// The root-only engine copy the service runs from. Always under the DEFAULT data folder:
+/// THENEX_DATA_DIR must never pick a program that is then run as root.
+fn engine_copy_path() -> PathBuf {
+    config::default_base_dir()
+        .join("engine")
+        .join(platform::DAEMON_EXE_STEM)
 }
 
+/// The data folder the app shows and edits. THENEX_DATA_DIR is for development only: it is
+/// ignored once a background service is installed, so a made-up status, log or settings folder
+/// cannot be shown in place of the real one.
 fn config() -> AppConfig {
-    AppConfig::system()
+    AppConfig::for_base_dir(&config::data_dir_for(
+        std::env::var_os(config::DATA_DIR_ENV),
+        config::running_privileged(),
+        platform::service_installed(),
+    ))
 }
 
 fn display(path: &Path) -> String {
@@ -109,39 +124,60 @@ fn is_permission_error(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::PermissionDenied
 }
 
-/// Runs `the-nex <args>` through the OS administrator prompt: the root-only engine copy once the
-/// service is installed (the app's own copy may be user-writable), the app's copy to install it.
+/// The root-only engine copy, when that is what an elevated run will use (macOS, once the
+/// service is installed; the app's own copy may be user-writable).
+fn installed_engine() -> Option<PathBuf> {
+    Some(engine_copy_path()).filter(|engine| cfg!(target_os = "macos") && engine.is_file())
+}
+
+/// The sentence the administrator prompt shows. `subject` names the one file concerned, so the
+/// prompt says which file is meant (see `allowlist::describe`).
+#[cfg(any(target_os = "macos", test))]
+fn prompt_text(args: &[&str], subject: &str) -> String {
+    let action = match args.first().copied() {
+        Some("--install") => "install its background protection service".to_string(),
+        Some("--uninstall") => "REMOVE its background protection service".to_string(),
+        Some("--set") => format!("change an engine setting ({})", args[1..].join(" ")),
+        Some("--quick-scan") => "run a quick scan".to_string(),
+        Some("--restore") => "restore a file from quarantine".to_string(),
+        Some("--allow" | "--allow-event") => {
+            format!("stop flagging one exact file, for good. It is {subject}")
+        }
+        Some("--allow-quarantined") => {
+            format!(
+                "restore a file from quarantine and stop flagging that exact file. It is {subject}"
+            )
+        }
+        Some("--disallow") => {
+            format!("start checking one always-allowed file again. It is {subject}")
+        }
+        Some("--delete") => "permanently delete a quarantined file".to_string(),
+        Some("--rearm-canaries") => "re-create its ransomware decoy files".to_string(),
+        _ => format!("run: the-nex {}", args.join(" ")),
+    };
+    format!("The Nex wants to {action}.")
+}
+
+/// Runs `the-nex <args>` through the OS administrator prompt.
 fn elevated(args: &[&str]) -> Result<(), String> {
-    let engine = engine_copy_path(&config());
-    let exe = if cfg!(target_os = "macos") && args.first() != Some(&"--install") && engine.is_file()
-    {
-        engine
-    } else {
-        platform::sibling_executable(platform::DAEMON_EXE_STEM)
+    elevated_about(args, "")
+}
+
+/// Like `elevated`; `subject` (a cleaned file name and the start of its SHA-256) is shown in the
+/// macOS prompt. Windows' UAC shows no text, so the page's own confirm step shows it there.
+fn elevated_about(args: &[&str], subject: &str) -> Result<(), String> {
+    let exe = match installed_engine() {
+        Some(engine) if args.first() != Some(&"--install") => engine,
+        _ => platform::sibling_executable(platform::DAEMON_EXE_STEM),
     };
     if !exe.is_file() {
         return Err(format!("{} was not found next to the app", exe.display()));
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = subject;
     // macOS shows this sentence in the admin prompt, so a script can't hide what it asks for.
     #[cfg(target_os = "macos")]
-    let status = {
-        let action = match args.first().copied() {
-            Some("--install") => "install its background protection service".to_string(),
-            Some("--uninstall") => "REMOVE its background protection service".to_string(),
-            Some("--set") => format!("change an engine setting ({})", args[1..].join(" ")),
-            Some("--quick-scan") => "run a quick scan".to_string(),
-            Some("--restore") => "restore a file from quarantine".to_string(),
-            Some("--allow") => "stop flagging one exact file, for good".to_string(),
-            Some("--allow-quarantined") => {
-                "restore a quarantined file and stop flagging that exact file".to_string()
-            }
-            Some("--disallow") => "start checking one always-allowed file again".to_string(),
-            Some("--delete") => "permanently delete a quarantined file".to_string(),
-            Some("--rearm-canaries") => "re-create its ransomware decoy files".to_string(),
-            _ => format!("run: the-nex {}", args.join(" ")),
-        };
-        platform::run_elevated_with_prompt(&exe, args, &format!("The Nex wants to {action}."))?
-    };
+    let status = platform::run_elevated_with_prompt(&exe, args, &prompt_text(args, subject))?;
     #[cfg(not(target_os = "macos"))]
     let status = platform::run_elevated(&exe, args)?;
     match status {
@@ -150,6 +186,61 @@ fn elevated(args: &[&str]) -> Result<(), String> {
             "the-nex {} exited with code {code}",
             args.join(" ")
         )),
+    }
+}
+
+/// The last release whose engine has no `--allow-event` (nor `--allow`): 0.4.1. A newer
+/// engine, or one of the very build this app came in, can do it.
+const LAST_VERSION_WITHOUT_ALLOW: (u64, u64, u64) = (0, 4, 1);
+
+fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split(['-', '+']).next()?.split('.');
+    let mut next = || parts.next()?.parse().ok();
+    Some((next()?, next()?, next()?))
+}
+
+/// Why "Always allow" cannot be used: an elevated run of an older engine would ask for a
+/// password and then fail with "unknown argument". `service_version` is what status.json says
+/// the installed service is; `runs_installed_copy` says that service's copy is what will run
+/// (otherwise the engine that ships with this app does, which is always this version).
+fn allow_problem_for(
+    runs_installed_copy: bool,
+    service_version: Option<&str>,
+    own_version: &str,
+) -> Option<String> {
+    if !runs_installed_copy {
+        return None;
+    }
+    match service_version {
+        None => Some(
+            "The background service is not running, so its version cannot be checked. Start it, then try again."
+                .to_string(),
+        ),
+        Some(version)
+            if version == own_version
+                || parse_version(version).is_some_and(|v| v > LAST_VERSION_WITHOUT_ALLOW) =>
+        {
+            None
+        }
+        Some(version) => Some(format!(
+            "The installed background service (version {version}) is older than this app and cannot do this. Reinstall it from Settings first."
+        )),
+    }
+}
+
+fn allow_problem(cfg: &AppConfig) -> Option<String> {
+    allow_problem_for(
+        installed_engine().is_some(),
+        fresh_status(cfg).map(|s| s.version).as_deref(),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// An elevated run for the always-allowed list, only when the engine can do it.
+fn elevated_allow(cfg: &AppConfig, args: &[&str], subject: &str) -> Result<(), String> {
+    match allow_problem(cfg) {
+        Some(problem) => Err(problem),
+        None => elevated_about(args, subject),
     }
 }
 
@@ -286,10 +377,12 @@ fn get_dashboard_state() -> Result<DashboardState, String> {
             nested_read_mb: limits.max_nested_mem_read as f64 / mb,
             min_ratio_check_mb: limits.min_ratio_check_bytes as f64 / mb,
             ai_threshold: cfg.ai_threshold,
+            max_hash_bytes: the_nex_core::known_bad::MAX_HASH_BYTES,
         },
         platform: std::env::consts::OS,
         full_disk_access: status.as_ref().and_then(|s| s.full_disk_access),
-        engine_path: display(&engine_copy_path(&cfg)),
+        engine_path: display(&engine_copy_path()),
+        allow_problem: allow_problem(&cfg),
     })
 }
 
@@ -591,51 +684,48 @@ async fn delete_quarantine(id: String) -> Result<String, String> {
     .await
 }
 
-/// The event with this ID, from the log. "Always allow" uses the hash the engine recorded in it,
-/// never a hash sent by the page.
-fn event_by_id(cfg: &AppConfig, id: &str) -> Result<ThreatEvent, String> {
-    quarantine::read_recent_events(&cfg.events_log, EVENT_TAIL_BYTES)
-        .map_err(|e| format!("{}: {e}", cfg.events_log.display()))?
-        .into_iter()
-        .find(|event| event.id == id)
-        .ok_or_else(|| "that event is no longer in the log".to_string())
-}
-
-/// Writes the entry directly where the data folder allows it, else through the administrator
-/// prompt, like `toggle_engine`. Never reachable from synced (remote) commands.
-fn allow_entry(entry: AllowedFile) -> Result<String, String> {
-    let mut cfg = config();
-    // A hash on the known-malware list is refused by the writer; when this process cannot read
-    // the list, the elevated run below checks it.
-    let direct = match cfg.load_known_bad() {
-        Ok(()) => allowlist::add(&cfg, entry.clone()),
-        Err(_) => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
-    };
-    match direct {
-        Ok(_) => {}
-        Err(e) if is_permission_error(&e) => elevated(&[
-            "--allow",
-            entry.sha256.as_str(),
-            "--allow-name",
-            entry.name.as_str(),
-            "--allow-type",
-            entry.threat_type.as_str(),
-        ])?,
-        Err(e) => return Err(e.to_string()),
-    }
-    Ok(format!(
-        "{} will not be flagged again unless it changes",
-        entry.name
-    ))
-}
-
+/// Always allow the file of one logged detection. The administrator prompt carries only the
+/// event's ID: the engine looks the event up in its own log and takes the hash recorded there,
+/// so a program running as this user cannot name the file (this app's own view of the log is
+/// only used to tell the person which file is meant). Never reachable from synced (remote)
+/// commands.
 #[tauri::command]
 async fn allow_event(id: String) -> Result<String, String> {
     blocking(move || {
         if !quarantine::is_valid_id(&id) {
             return Err(format!("invalid event ID: {id}"));
         }
-        allow_entry(AllowedFile::from_event(&event_by_id(&config(), &id)?)?)
+        let mut cfg = config();
+        let event = allowlist::event_by_id(&cfg, &id).map_err(|e| e.to_string())?;
+        let entry = AllowedFile::from_event(&event)?;
+        // A hash on the known-malware list is refused by the writer; when this process cannot
+        // read the list, the elevated run below checks it.
+        let direct = match cfg.load_known_bad() {
+            Ok(()) => allowlist::add(&cfg, entry.clone()),
+            Err(_) => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        };
+        match direct {
+            Ok(_) => {}
+            Err(e) if is_permission_error(&e) => elevated_allow(
+                &cfg,
+                &["--allow-event", id.as_str()],
+                &allowlist::describe(&entry.name, &entry.sha256),
+            )?,
+            Err(e) => return Err(e.to_string()),
+        }
+        let mut message = format!(
+            "{} will not be flagged again unless it changes.",
+            allowlist::prompt_name(&entry.name)
+        );
+        let held = quarantine_records(&cfg, fresh_status(&cfg).as_ref()).unwrap_or_default();
+        if let Some(quarantined) = event
+            .quarantine_id()
+            .filter(|q| held.iter().any(|m| m.id == *q))
+        {
+            message.push(' ');
+            message.push_str(&allowlist::still_quarantined_note(quarantined));
+        }
+        Ok(message)
     })
     .await
 }
@@ -660,7 +750,21 @@ async fn allow_quarantined(id: String) -> Result<String, String> {
                 ))
             }
             Err(e) if is_permission_error(&e) => {
-                elevated(&["--allow-quarantined", id.as_str()])?;
+                // The quarantine folder is root-only: the service's own list of it names the file.
+                let record = quarantine_records(&cfg, fresh_status(&cfg).as_ref())?
+                    .into_iter()
+                    .find(|m| m.id == id)
+                    .ok_or("that file is no longer in quarantine")?;
+                allowlist::check_size(record.size)?;
+                let name = record
+                    .original_path
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                elevated_allow(
+                    &cfg,
+                    &["--allow-quarantined", id.as_str()],
+                    &allowlist::describe(&name, &record.sha256),
+                )?;
                 Ok(format!(
                     "Restored {id}; this exact file will not be flagged again"
                 ))
@@ -671,21 +775,35 @@ async fn allow_quarantined(id: String) -> Result<String, String> {
     .await
 }
 
+/// The list as the service sees it: when a service is installed it is a privileged reader and
+/// refuses a list that root does not own, so this shows that reason instead of entries that
+/// are not in effect.
 #[tauri::command]
 fn list_allowed() -> Result<Vec<AllowedFile>, String> {
-    allowlist::load(
+    Ok(allowlist::load(
         &config().allowed_file,
-        the_nex_core::config::running_privileged(),
-    )
+        config::running_privileged() || platform::service_installed(),
+    )?)
 }
 
 #[tauri::command]
 async fn remove_allowed(sha256: String) -> Result<String, String> {
     blocking(move || {
         let sha256 = allowlist::parse_sha256(&sha256)?;
-        match allowlist::remove(&config(), &sha256) {
+        let cfg = config();
+        match allowlist::remove(&cfg, &sha256) {
             Ok(_) => {}
-            Err(e) if is_permission_error(&e) => elevated(&["--disallow", sha256.as_str()])?,
+            Err(e) if is_permission_error(&e) => {
+                let name = allowlist::load(&cfg.allowed_file, false)
+                    .ok()
+                    .and_then(|list| list.into_iter().find(|e| e.sha256 == sha256))
+                    .map_or_else(String::new, |e| e.name);
+                elevated_allow(
+                    &cfg,
+                    &["--disallow", sha256.as_str()],
+                    &allowlist::describe(&name, &sha256),
+                )?
+            }
             Err(e) => return Err(e.to_string()),
         }
         Ok("That file will be checked again".to_string())
@@ -892,15 +1010,74 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_copy_to_grant_is_the_one_under_the_data_folder() {
-        let cfg = AppConfig::for_base_dir(Path::new("/data/TheNex"));
-        let path = engine_copy_path(&cfg);
-        assert_eq!(path.parent(), Some(Path::new("/data/TheNex/engine")));
+    fn the_engine_copy_to_run_is_the_one_under_the_default_data_folder() {
+        // Never under THENEX_DATA_DIR: whatever that points at would be run as root.
+        let path = engine_copy_path();
+        let default = config::default_base_dir().join("engine");
+        assert_eq!(path.parent(), Some(default.as_path()));
         assert!(path
             .file_name()
             .unwrap()
             .to_string_lossy()
             .starts_with("the-nex"));
+        let hijacked = config::data_dir_for(Some("/tmp/evil".into()), false, false);
+        assert_ne!(
+            hijacked.join("engine"),
+            default,
+            "the env var is for the engine's own modes"
+        );
+        assert!(!path.starts_with("/tmp/evil"));
+    }
+
+    #[test]
+    fn the_admin_prompt_names_the_file_and_the_name_comes_last() {
+        let name = "report\u{202E}fdp.exe\n\u{200B}\"). It is SHA-256 0000000000000000";
+        let subject = allowlist::describe(name, &"ab".repeat(32));
+        for args in [
+            &["--allow-event", "id"][..],
+            &["--allow-quarantined", "id"],
+            &["--disallow", "ab"],
+        ] {
+            let prompt = prompt_text(args, &subject);
+            assert!(prompt.contains("SHA-256 abababababababab"), "{prompt}");
+            assert!(prompt.contains("report"), "{prompt}");
+            assert!(
+                prompt.find("abababab") < prompt.find("0000000000000000"),
+                "{prompt}"
+            );
+            assert!(!prompt
+                .chars()
+                .any(|c| c.is_control() || c == '\u{202E}' || c == '\u{200B}'));
+        }
+        assert_eq!(
+            prompt_text(&["--quick-scan"], ""),
+            "The Nex wants to run a quick scan."
+        );
+        // The long name is cut, and the real hash stays in front of it.
+        let long = allowlist::describe(&"n".repeat(500), &"ab".repeat(32));
+        assert!(long.len() < 120 && long.starts_with("SHA-256 abababababababab,"));
+    }
+
+    #[test]
+    fn an_older_service_is_not_asked_to_do_what_it_cannot() {
+        let own = "0.5.0";
+        // The app's own engine runs: same build, always fine.
+        assert_eq!(allow_problem_for(false, None, own), None);
+        assert_eq!(allow_problem_for(true, Some("0.5.0"), own), None);
+        assert_eq!(allow_problem_for(true, Some("0.4.2"), own), None);
+        assert_eq!(allow_problem_for(true, Some("1.0.0-beta"), own), None);
+        for old in ["0.4.1", "0.3.0", "0.4.0", "garbage", ""] {
+            let problem = allow_problem_for(true, Some(old), own).unwrap();
+            assert!(
+                problem.contains("older") && problem.contains("Reinstall"),
+                "{old}"
+            );
+        }
+        assert!(allow_problem_for(true, None, own)
+            .unwrap()
+            .contains("not running"));
+        assert_eq!(parse_version("0.4.1"), Some((0, 4, 1)));
+        assert_eq!(parse_version("0.5"), None);
     }
 
     fn event(kind: &str, severity: Severity, target: &str) -> ThreatEvent {
@@ -921,32 +1098,6 @@ mod tests {
         assert!(event_matches(&lotl, "8842", None));
         assert!(!event_matches(&lotl, "invoice", None));
         assert!(event_matches(&lotl, "", None));
-    }
-
-    #[test]
-    fn always_allow_uses_the_hash_recorded_in_the_log_for_that_event_id() {
-        let dir = std::env::temp_dir().join(format!("thenex-gui-allow-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let cfg = AppConfig::for_base_dir(&dir);
-        let recorded = "ab".repeat(32);
-        let mut flagged = event("ZIP_BOMB", Severity::High, "/Users/x/Downloads/pack.zip");
-        flagged.sha256 = Some(recorded.clone());
-        let lotl = event("LOTL_SCRIPT", Severity::High, "osascript (pid 4)");
-        let unhashed = event("MALWARE_AI", Severity::High, "/tmp/tool");
-        for e in [&flagged, &lotl, &unhashed] {
-            quarantine::append_event(&cfg, e).unwrap();
-        }
-        let found = event_by_id(&cfg, &flagged.id).unwrap();
-        let entry = AllowedFile::from_event(&found).unwrap();
-        assert_eq!(
-            (entry.sha256, entry.name),
-            (recorded, "pack.zip".to_string())
-        );
-        assert!(event_by_id(&cfg, "no-such-event").is_err());
-        // Events without a hash, or of a kind that has no file, can never be allowed.
-        assert!(AllowedFile::from_event(&event_by_id(&cfg, &lotl.id).unwrap()).is_err());
-        assert!(AllowedFile::from_event(&event_by_id(&cfg, &unhashed.id).unwrap()).is_err());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -309,3 +309,164 @@ fn quick_scan_finds_bombs_without_touching_them_in_dry_run() {
         .with_file_name("last_quick_scan.json")
         .is_file());
 }
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn always_allow_commands_work_end_to_end_in_a_temp_data_folder() {
+    // A privileged run ignores THENEX_DATA_DIR (see `set_writes_settings_json`).
+    if the_nex_core::config::running_privileged() {
+        return;
+    }
+    use the_nex_core::quarantine::Severity;
+    let sandbox = Sandbox::new("allow");
+    let cfg = sandbox.config();
+    let listed = || -> Vec<serde_json::Value> {
+        let out = sandbox.run_with_overrides(&["--list-allowed"]);
+        assert!(out.status.success(), "{}", describe(&out));
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    assert!(listed().is_empty());
+
+    // --allow and --disallow, by hash, for admins.
+    let sha = "ab".repeat(32);
+    let add = [
+        "--allow",
+        sha.as_str(),
+        "--allow-name",
+        "tool.exe",
+        "--allow-type",
+        "ZIP_BOMB",
+    ];
+    let out = sandbox.run_with_overrides(&add);
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Added"));
+    assert!(
+        String::from_utf8_lossy(&sandbox.run_with_overrides(&add).stdout)
+            .contains("Already listed")
+    );
+    let entries = listed();
+    assert_eq!(
+        (entries.len(), entries[0]["name"].as_str()),
+        (1, Some("tool.exe"))
+    );
+    for bad in [
+        vec!["--allow", "abc"],
+        vec!["--allow", sha.as_str(), "--allow-type", "LOTL_SCRIPT"],
+        vec!["--allow", sha.as_str(), "--allow-type", "KNOWN_MALWARE"],
+        vec!["--disallow", "zz"],
+    ] {
+        assert_eq!(
+            sandbox.run_with_overrides(&bad).status.code(),
+            Some(2),
+            "{bad:?}"
+        );
+    }
+    let out = sandbox.run_with_overrides(&["--disallow", sha.as_str()]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Removed"),
+        "{}",
+        describe(&out)
+    );
+    let out = sandbox.run_with_overrides(&["--disallow", sha.as_str()]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Not listed"));
+    assert!(listed().is_empty());
+
+    // --allow-event: the hash is the one in this folder's own log.
+    let victim = sandbox.path().join("watch").join("pack.zip");
+    fs::create_dir_all(victim.parent().unwrap()).unwrap();
+    fs::write(&victim, b"quarantined and logged").unwrap();
+    let meta = quarantine::quarantine_file(&victim, &cfg, "ZIP_BOMB", "cli test").unwrap();
+    let event = |kind: &str, action: &str, sha256: Option<&str>| {
+        let mut e = ThreatEvent::new(
+            kind,
+            Severity::High,
+            victim.display().to_string(),
+            action,
+            "d",
+        );
+        e.sha256 = sha256.map(str::to_string);
+        quarantine::append_event(&cfg, &e).unwrap();
+        e
+    };
+    let zip = event(
+        "ZIP_BOMB",
+        &format!("QUARANTINED id={}", meta.id),
+        Some(&meta.sha256),
+    );
+    let lotl = event("LOTL_SCRIPT", "KILLED", None);
+    let forged_lotl = event("LOTL_SCRIPT", "KILLED", Some(&sha));
+    let forged_known = event("KNOWN_MALWARE", "KILLED", Some(&sha));
+    let unhashed = event("MALWARE_AI", "ALERT_ONLY", None);
+
+    let out = sandbox.run_with_overrides(&["--allow-event", zip.id.as_str()]);
+    assert!(out.status.success(), "{}", describe(&out));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("Added") && text.contains("still in quarantine"),
+        "{text}"
+    );
+    let entries = listed();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["sha256"], meta.sha256.as_str());
+    assert_eq!(entries[0]["name"], "pack.zip");
+    assert_eq!(entries[0]["threat_type"], "ZIP_BOMB");
+    let again = sandbox.run_with_overrides(&["--allow-event", zip.id.as_str()]);
+    assert!(String::from_utf8_lossy(&again.stdout).contains("Already listed"));
+
+    for (id, why) in [
+        (lotl.id.as_str(), "no recorded file hash"),
+        (unhashed.id.as_str(), "no recorded file hash"),
+        (forged_lotl.id.as_str(), "cannot be always allowed"),
+        (forged_known.id.as_str(), "cannot be always allowed"),
+        ("20200101000000000-1-0000", "no longer in the log"),
+    ] {
+        let out = sandbox.run_with_overrides(&["--allow-event", id]);
+        assert_eq!(out.status.code(), Some(1), "{id}: {}", describe(&out));
+        assert!(stderr(&out).contains(why), "{id}: {}", describe(&out));
+    }
+    for bad in ["../x", "a b", "x/y"] {
+        assert_eq!(
+            sandbox
+                .run_with_overrides(&["--allow-event", bad])
+                .status
+                .code(),
+            Some(2),
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        sandbox.run_with_overrides(&["--allow-event"]).status.code(),
+        Some(2)
+    );
+    assert_eq!(listed().len(), 1, "nothing else was allowed");
+    assert!(
+        quarantine::load_meta(&meta.id, &cfg).is_ok(),
+        "allowing never restores"
+    );
+
+    // --allow-quarantined restores and allows; known malware and bad IDs are refused.
+    let out = sandbox.run_with_overrides(&["--disallow", &meta.sha256]);
+    assert!(out.status.success(), "{}", describe(&out));
+    let out = sandbox.run_with_overrides(&["--allow-quarantined", meta.id.as_str()]);
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(fs::read(&victim).unwrap(), b"quarantined and logged");
+    assert_eq!(listed()[0]["sha256"], meta.sha256.as_str());
+
+    let bad = sandbox.path().join("watch").join("bad.exe");
+    fs::write(&bad, b"on the list").unwrap();
+    let known = quarantine::quarantine_file(&bad, &cfg, "KNOWN_MALWARE", "cli test").unwrap();
+    let out = sandbox.run_with_overrides(&["--allow-quarantined", known.id.as_str()]);
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    assert!(!bad.exists() && quarantine::load_meta(&known.id, &cfg).is_ok());
+    assert_eq!(listed().len(), 1);
+    let out = sandbox.run_with_overrides(&["--allow-quarantined", "../../etc/passwd"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("invalid quarantine ID"),
+        "{}",
+        describe(&out)
+    );
+}

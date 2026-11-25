@@ -633,8 +633,15 @@ fn restart_action(delay_secs: u64) -> ServiceAction {
 // ProgramData; if the data folder exists and is not owned by Administrators/SYSTEM, rename it
 // aside (never reset in place) and recreate it. The installer (installer.nsi) is deliberately
 // unchanged until that can be tested on Windows.
-fn harden_data_dirs(cfg: &AppConfig) -> Vec<String> {
+//
+// Planted settings: a folder that already existed before the FIRST install was not made by us, so
+// its allowed.json (files that are never flagged) and settings.json (engines switched off) are
+// deleted; deleting means defaults (everything on, nothing allowed), which is the safe state.
+// Not done when the service already existed: that folder was hardened by an earlier install, and
+// an update must keep the person's own list. Unverified on Windows (type-checked only).
+fn harden_data_dirs(cfg: &AppConfig, first_install: bool) -> Vec<String> {
     let mut notes = Vec::new();
+    let pre_existing = cfg.base_dir.exists();
     if let Err(e) = cfg.ensure_dirs() {
         notes.push(e);
     }
@@ -642,6 +649,18 @@ fn harden_data_dirs(cfg: &AppConfig) -> Vec<String> {
     for dir in [&cfg.base_dir, &cfg.quarantine_dir] {
         icacls(dir, &["/setowner", SID_ADMINISTRATORS, "/T", "/C"]);
         icacls(dir, &["/reset", "/T", "/C"]);
+    }
+    if first_install && pre_existing {
+        for planted in [&cfg.allowed_file, &cfg.settings_file] {
+            match fs::remove_file(planted) {
+                Ok(()) => notes.push(format!(
+                    "removed {}: it was in a data folder that existed before the first install",
+                    planted.display()
+                )),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => notes.push(format!("could not remove {}: {e}", planted.display())),
+            }
+        }
     }
     let system = format!("{SID_SYSTEM}:(OI)(CI)F");
     let admins = format!("{SID_ADMINISTRATORS}:(OI)(CI)F");
@@ -737,12 +756,14 @@ pub fn install_service() -> Result<String, String> {
     let info = service_info(exe.clone());
     let access = ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
     let mut notes = Vec::new();
+    let mut first_install = true;
     let service = match manager.create_service(&info, access) {
         Ok(service) => {
             notes.push(format!("service '{}' registered", config::SERVICE_NAME));
             service
         }
         Err(e) if win32_code(&e) == Some(ERROR_SERVICE_EXISTS) => {
+            first_install = false;
             let service = manager
                 .open_service(config::SERVICE_NAME, access)
                 .map_err(|e| service_error("cannot open existing service", e))?;
@@ -774,9 +795,10 @@ pub fn install_service() -> Result<String, String> {
         .set_failure_actions_on_non_crash_failures(true)
         .map_err(|e| service_error("cannot enable failure actions", e))?;
 
-    notes.extend(harden_data_dirs(&AppConfig::for_base_dir(
-        &config::default_base_dir(),
-    )));
+    notes.extend(harden_data_dirs(
+        &AppConfig::for_base_dir(&config::default_base_dir()),
+        first_install,
+    ));
     register_autostart(RUN_KEY, RUN_VALUE, &exe, NOTIFIER_ARG)
         .map_err(|e| format!("service installed but notifier autostart failed: {e}"))?;
     notes.push(format!(

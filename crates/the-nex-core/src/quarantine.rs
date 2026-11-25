@@ -221,12 +221,17 @@ pub fn record_event(cfg: &AppConfig, event: ThreatEvent) {
     }
 }
 
+/// Where the full log is moved to (`events.jsonl` becomes `events.jsonl.1`).
+pub fn rotated_events_path(path: &Path) -> PathBuf {
+    path.with_extension("jsonl.1")
+}
+
 fn rotate_events_if_needed(path: &Path) {
     if fs::metadata(path)
         .map(|m| m.len() >= MAX_EVENTS_BYTES)
         .unwrap_or(false)
     {
-        let rotated = path.with_extension("jsonl.1");
+        let rotated = rotated_events_path(path);
         let _ = fs::remove_file(&rotated);
         let _ = fs::rename(path, &rotated);
     }

@@ -55,6 +55,8 @@ Modes:
                             run a report-only scan of Downloads and Desktop on a schedule
   --allow <SHA256>          never flag the one file with this SHA-256 again (needs
                             administrator rights); with --allow-name NAME and --allow-type TYPE
+  --allow-event <ID>        the same for the file of one logged detection: the SHA-256 is the one
+                            this engine recorded in its own event log (what the app uses)
   --disallow <SHA256>       remove a file from the always-allowed list
   --allow-quarantined <ID>  restore a quarantined file and always allow that exact file
   --list-allowed            print the always-allowed list as JSON
@@ -143,6 +145,7 @@ pub enum Mode {
     Set(Engine, bool),
     SetSchedule(ScanSchedule),
     Allow(String),
+    AllowEvent(String),
     Disallow(String),
     AllowQuarantined(String),
     ListAllowed,
@@ -225,6 +228,13 @@ where
             "--allow" => Some(Mode::Allow(allowlist::parse_sha256(&take_value(
                 &mut iter, "--allow",
             )?)?)),
+            "--allow-event" => {
+                let id = take_value(&mut iter, "--allow-event")?;
+                if !crate::quarantine::is_valid_id(&id) {
+                    return Err(format!("invalid event ID: {id}"));
+                }
+                Some(Mode::AllowEvent(id))
+            }
             "--disallow" => Some(Mode::Disallow(allowlist::parse_sha256(&take_value(
                 &mut iter,
                 "--disallow",
@@ -417,15 +427,31 @@ pub fn write_atomic(path: &Path, body: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let staging = path.with_extension("json.tmp");
-    fs::write(&staging, body)?;
-    // Whatever the umask: the allowed-files list is refused when others can write it.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&staging, fs::Permissions::from_mode(0o644))?;
+    // A name of its own, created exclusively: a leftover or planted file is never written through.
+    static STAGING: AtomicU64 = AtomicU64::new(0);
+    let staging = path.with_extension(format!(
+        "json.{}-{}.tmp",
+        std::process::id(),
+        STAGING.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        io::Write::write_all(&mut file, body)?;
+        // Whatever the umask: the allowed-files list is refused when others can write it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o644))?;
+        }
+        fs::rename(&staging, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&staging);
     }
-    fs::rename(&staging, path)
+    written
 }
 
 fn modified_nanos(path: &Path) -> u64 {
@@ -801,13 +827,23 @@ fn windows_token_elevated() -> bool {
     }
 }
 
-/// Default data directory. THENEX_DATA_DIR is honoured only for unprivileged runs: a privileged
-/// daemon must not be redirected to attacker-chosen storage through its environment.
-pub fn data_dir() -> PathBuf {
-    std::env::var_os(DATA_DIR_ENV)
-        .filter(|v| !v.is_empty() && !running_privileged())
+/// The data folder for these inputs. THENEX_DATA_DIR is honoured only for unprivileged runs: a
+/// privileged daemon must not be redirected to attacker-chosen storage through its environment.
+/// The desktop app also ignores it once a background service is installed, so a fake status,
+/// log or settings folder cannot be shown in place of the real one.
+pub fn data_dir_for(
+    env: Option<std::ffi::OsString>,
+    privileged: bool,
+    service_installed: bool,
+) -> PathBuf {
+    env.filter(|v| !v.is_empty() && !privileged && !service_installed)
         .map(PathBuf::from)
         .unwrap_or_else(default_base_dir)
+}
+
+/// The engine's data folder: the environment override applies to unprivileged runs only.
+pub fn data_dir() -> PathBuf {
+    data_dir_for(std::env::var_os(DATA_DIR_ENV), running_privileged(), false)
 }
 
 #[cfg(windows)]
@@ -872,7 +908,16 @@ mod tests {
             Mode::AllowQuarantined("20260101-1-0001".to_string())
         );
         assert_eq!(parse(&["--list-allowed"]).unwrap().mode, Mode::ListAllowed);
+        assert_eq!(
+            parse(&["--allow-event", "20260101-1-0001"]).unwrap().mode,
+            Mode::AllowEvent("20260101-1-0001".to_string())
+        );
         for bad in [
+            vec!["--allow-event"],
+            vec!["--allow-event", "../etc"],
+            vec!["--allow-event", "a b"],
+            vec!["--allow-event", "x", "--allow-name", "y"],
+            vec!["--allow-event", "x", "--allow", &sha],
             vec!["--allow", "abc"],
             vec!["--allow", &sha[1..]],
             vec!["--allow"],
@@ -888,6 +933,30 @@ mod tests {
             assert!(parse(&bad).is_err(), "{bad:?}");
         }
     }
+    #[test]
+    fn the_data_dir_env_is_ignored_when_privileged_or_when_a_service_is_installed() {
+        let env = || Some(std::ffi::OsString::from("/fake/data"));
+        assert_eq!(
+            super::data_dir_for(env(), false, false),
+            PathBuf::from("/fake/data")
+        );
+        for (privileged, service) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                super::data_dir_for(env(), privileged, service),
+                super::default_base_dir()
+            );
+        }
+        let empty = Some(std::ffi::OsString::new());
+        assert_eq!(
+            super::data_dir_for(empty, false, false),
+            super::default_base_dir()
+        );
+        assert_eq!(
+            super::data_dir_for(None, false, false),
+            super::default_base_dir()
+        );
+    }
+
     #[test]
     fn privileged_runs_ignore_the_data_dir_env() {
         // Not mutating the environment (shared across tests): just check the rule's input.
