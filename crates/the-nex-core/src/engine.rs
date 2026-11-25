@@ -554,7 +554,13 @@ pub fn run_scan(
     // A clean scheduled scan is recorded without a notification; with findings it is the one.
     summary.quiet = scheduled && report.findings.is_empty();
     quarantine::record_event(cfg, summary);
-    if let Ok(json) = serde_json::to_vec_pretty(&report) {
+    // A stopped scheduled scan leaves the last complete report in place: it looked at part of
+    // the files, and "nothing found" about that would be false.
+    let write_report = !(scheduled && report.cancelled);
+    if let Some(json) = serde_json::to_vec_pretty(&report)
+        .ok()
+        .filter(|_| write_report)
+    {
         // Staged and renamed so a client polling for the report never reads half of it.
         let path = cfg.log_dir.join(kind.report_file());
         let staging = path.with_extension("json.tmp");

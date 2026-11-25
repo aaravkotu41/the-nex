@@ -5,7 +5,8 @@
 //! A request is an empty file with a fixed name in `<data dir>/requests`, which any local user
 //! may create. Only the name is ever looked at, never the content. Any local user can therefore
 //! start a scan, or cancel one a user started. None of them can cancel the scheduled scan; a
-//! scan a user asks for stops it instead (it is retried later). A full scan only reports; a quick scan acts on what it finds in
+//! scan a user asks for stops it once per due period (it is retried later), and after that waits
+//! behind it, where a cancel request removes it. A full scan only reports; a quick scan acts on what it finds in
 //! Downloads and Desktop exactly as live protection already does for new files there.
 //! shortcut: no per-user authorisation of requests, add it before a scan can do more than that.
 
@@ -143,8 +144,12 @@ pub struct ScanJobs {
     cancel: AtomicBool,
     /// The running scan is the scheduled one.
     scheduled: AtomicBool,
-    /// A user's scan that arrived during the scheduled one, started once that one has stopped.
-    waiting: Mutex<Option<ScanKind>>,
+    /// User scans that arrived during the scheduled one (a quick and a full one can both wait),
+    /// started one after the other once that one has stopped.
+    waiting: Mutex<Vec<ScanKind>>,
+    /// The scheduled scan was already stopped for a user's scan since one last ran to the end:
+    /// the retry is not stopped again, or a local user could keep it from ever finishing.
+    preempted: AtomicBool,
     /// How the last scheduled scan ended (true = ran to the end), until the schedule reads it.
     outcome: Mutex<Option<bool>>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -156,8 +161,9 @@ fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl ScanJobs {
     /// Called about once a second by the service: starts a requested scan (one at a time) and
-    /// passes on a cancel request. The scheduled scan ignores cancel requests, and a requested
-    /// scan stops it and runs in its place.
+    /// passes on a cancel request. The scheduled scan ignores cancel requests (they remove a
+    /// scan waiting behind it instead). A requested scan stops it once and runs in its place;
+    /// after that it waits for the scheduled scan to end.
     pub fn poll(
         self: &Arc<Self>,
         cfg: &Arc<AppConfig>,
@@ -165,23 +171,37 @@ impl ScanJobs {
         telemetry: &Arc<Telemetry>,
     ) {
         let dir = request_dir(cfg);
-        if take_request(&dir, CANCEL_REQUEST) && !self.scheduled.load(Ordering::SeqCst) {
-            self.cancel.store(true, Ordering::SeqCst);
+        if take_request(&dir, CANCEL_REQUEST) {
+            if !self.scheduled.load(Ordering::SeqCst) {
+                self.cancel.store(true, Ordering::SeqCst);
+            } else {
+                // Cancels the user's scans queued behind the scheduled one, not the schedule.
+                locked(&self.waiting).clear();
+            }
         }
         for kind in [ScanKind::Full, ScanKind::Quick] {
             if take_request(&dir, request_name(kind)) {
                 if !self.is_running() {
                     self.start(kind, cfg, scanner, telemetry);
                 } else if self.scheduled.load(Ordering::SeqCst) {
-                    *locked(&self.waiting) = Some(kind);
-                    self.cancel.store(true, Ordering::SeqCst);
+                    let mut waiting = locked(&self.waiting);
+                    if !waiting.contains(&kind) {
+                        waiting.push(kind);
+                    }
+                    drop(waiting);
+                    if !self.preempted.swap(true, Ordering::SeqCst) {
+                        self.cancel.store(true, Ordering::SeqCst);
+                    }
                 }
                 // else: a request that arrives during a user's scan is dropped, not queued.
             }
         }
         if !self.is_running() {
-            let waiting = locked(&self.waiting).take();
-            if let Some(kind) = waiting {
+            let next = {
+                let mut waiting = locked(&self.waiting);
+                (!waiting.is_empty()).then(|| waiting.remove(0))
+            };
+            if let Some(kind) = next {
                 self.start(kind, cfg, scanner, telemetry);
             }
         }
@@ -300,6 +320,9 @@ impl ScanJobs {
         });
         write_progress(cfg, &snapshot(&report, Path::new(""), false));
         if kind == ScanKind::Scheduled {
+            if !report.cancelled {
+                self.preempted.store(false, Ordering::SeqCst);
+            }
             *locked(&self.outcome) = Some(!report.cancelled);
         }
     }
@@ -511,7 +534,7 @@ mod tests {
                 scheduled: false,
             },
         );
-        assert!(request(&cfg, ScanKind::Quick).is_err());
+        assert_eq!(request(&cfg, ScanKind::Quick), Err(BUSY.to_string()));
         // The same progress, but stale: the service died, so a new request is accepted.
         let mut stale = read_progress(&cfg).unwrap();
         stale.updated_at = Utc::now() - chrono::Duration::seconds(PROGRESS_STALE_SECS + 5);
@@ -555,7 +578,7 @@ mod tests {
         request(&cfg, ScanKind::Full).unwrap();
         jobs.poll(&shared, &scanner, &telemetry);
         assert!(jobs.cancel.load(Ordering::SeqCst));
-        assert_eq!(*locked(&jobs.waiting), Some(ScanKind::Full));
+        assert_eq!(*locked(&jobs.waiting), [ScanKind::Full]);
         // Once the scheduled scan has stopped, the user's scan runs.
         jobs.running.store(false, Ordering::SeqCst);
         jobs.scheduled.store(false, Ordering::SeqCst);
@@ -568,6 +591,114 @@ mod tests {
         request_cancel(&cfg).unwrap();
         jobs.poll(&shared, &scanner, &telemetry);
         assert!(jobs.cancel.load(Ordering::SeqCst));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_scheduled_scan_is_stopped_for_a_user_once_then_user_scans_wait_behind_it() {
+        let (root, cfg) = sandbox("once");
+        let (jobs, shared, scanner, telemetry) = service(&cfg);
+        let scheduled_runs = |jobs: &ScanJobs| {
+            jobs.running.store(true, Ordering::SeqCst);
+            jobs.scheduled.store(true, Ordering::SeqCst);
+            jobs.cancel.store(false, Ordering::SeqCst);
+        };
+        // First time in this due period: the user's scan stops it and takes its place.
+        scheduled_runs(&jobs);
+        request(&cfg, ScanKind::Full).unwrap();
+        jobs.poll(&shared, &scanner, &telemetry);
+        assert!(jobs.cancel.load(Ordering::SeqCst));
+        // The retry cannot be stopped again, however often a user asks: the scans wait.
+        scheduled_runs(&jobs);
+        for _ in 0..3 {
+            request(&cfg, ScanKind::Full).unwrap();
+            request(&cfg, ScanKind::Quick).unwrap();
+            jobs.poll(&shared, &scanner, &telemetry);
+            assert!(!jobs.cancel.load(Ordering::SeqCst), "the retry runs on");
+        }
+        // Both kinds wait, not only the last one asked for.
+        assert_eq!(*locked(&jobs.waiting), [ScanKind::Full, ScanKind::Quick]);
+        // A cancel request is not swallowed: it removes what waits, and the schedule goes on.
+        request_cancel(&cfg).unwrap();
+        jobs.poll(&shared, &scanner, &telemetry);
+        assert!(locked(&jobs.waiting).is_empty() && !jobs.cancel.load(Ordering::SeqCst));
+        jobs.running.store(false, Ordering::SeqCst);
+        jobs.scheduled.store(false, Ordering::SeqCst);
+        jobs.poll(&shared, &scanner, &telemetry);
+        assert!(!jobs.is_running(), "nothing was left waiting");
+
+        // Without a cancel, the waiting scans run one after the other once the schedule is done.
+        scheduled_runs(&jobs);
+        request(&cfg, ScanKind::Full).unwrap();
+        request(&cfg, ScanKind::Quick).unwrap();
+        jobs.poll(&shared, &scanner, &telemetry);
+        jobs.running.store(false, Ordering::SeqCst);
+        jobs.scheduled.store(false, Ordering::SeqCst);
+        jobs.poll(&shared, &scanner, &telemetry);
+        wait_idle(&jobs);
+        assert!(engine::read_scan_report(&cfg, ScanKind::Full).is_some());
+        assert!(engine::read_scan_report(&cfg, ScanKind::Quick).is_none());
+        jobs.poll(&shared, &scanner, &telemetry);
+        wait_idle(&jobs);
+        assert!(engine::read_scan_report(&cfg, ScanKind::Quick).is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stopped_scheduled_run_is_not_a_finished_one_and_leaves_the_last_report() {
+        let (root, cfg) = sandbox("stopped");
+        let (jobs, _shared, scanner, telemetry) = service(&cfg);
+        jobs.run(ScanKind::Scheduled, &cfg, &scanner, &telemetry);
+        let complete = engine::read_scan_report(&cfg, ScanKind::Scheduled).unwrap();
+        assert!(!complete.cancelled && complete.files_examined == 1);
+        assert_eq!(jobs.take_scheduled_outcome(), Some(true));
+        // Stopped: not counted as finished, still "stopped once", and the report stays.
+        jobs.preempted.store(true, Ordering::SeqCst);
+        jobs.cancel();
+        jobs.run(ScanKind::Scheduled, &cfg, &scanner, &telemetry);
+        assert_eq!(jobs.take_scheduled_outcome(), Some(false));
+        assert!(jobs.preempted.load(Ordering::SeqCst));
+        assert_eq!(
+            engine::read_scan_report(&cfg, ScanKind::Scheduled).unwrap(),
+            complete
+        );
+        assert!(!read_progress(&cfg).unwrap().running);
+        // Finished: counted, and the next due period may be stopped once again.
+        jobs.cancel.store(false, Ordering::SeqCst);
+        jobs.run(ScanKind::Scheduled, &cfg, &scanner, &telemetry);
+        assert_eq!(jobs.take_scheduled_outcome(), Some(true));
+        assert!(!jobs.preempted.load(Ordering::SeqCst));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn one_scan_runs_at_a_time_and_join_waits_for_the_scan_thread() {
+        let (root, cfg) = sandbox("join");
+        let (jobs, shared, scanner, telemetry) = service(&cfg);
+        // The scheduled scan ends by taking the outcome lock: holding it keeps the thread alive.
+        let held = locked(&jobs.outcome);
+        assert!(jobs.start(ScanKind::Scheduled, &shared, &scanner, &telemetry));
+        assert!(
+            !jobs.start(ScanKind::Full, &shared, &scanner, &telemetry),
+            "a second scan is refused while one runs"
+        );
+        assert!(jobs.is_running());
+        jobs.cancel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let jobs = Arc::clone(&jobs);
+            thread::spawn(move || {
+                jobs.join();
+                let _ = done_tx.send(jobs.is_running());
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "join returned while the scan thread was still running"
+        );
+        drop(held);
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(20)), Ok(false));
+        waiter.join().unwrap();
         let _ = fs::remove_dir_all(&root);
     }
 

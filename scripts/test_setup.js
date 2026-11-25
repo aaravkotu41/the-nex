@@ -8,7 +8,7 @@ const S = require(path.join(__dirname, "..", "ui", "setup.js"));
 
 const good = () => ({
   platform: "macos", daemon: { online: true }, service_installed: true, full_disk_access: true,
-  dry_run: false, toggles: { known_bad_enabled: true, zip_bomb_enabled: true, bin_ai_enabled: true, process_guard_enabled: true, canary_enabled: true }, known_bad: { loaded: false, entries: 0 }, canaries: [{}, {}], canaries_intact: 2,
+  dry_run: false, model_loaded: true, toggles: { known_bad_enabled: true, zip_bomb_enabled: true, bin_ai_enabled: true, process_guard_enabled: true, canary_enabled: true }, known_bad: { loaded: false, entries: 0 }, canaries: [{}, {}], canaries_intact: 2,
   engine_path: "/Library/Application Support/TheNex/engine/the-nex",
 });
 const row = (model, id) => model.rows.find((r) => r.id === id);
@@ -18,7 +18,7 @@ const states = (model) => Object.fromEntries(model.rows.map((r) => [r.id, r.stat
 let m = S.checklist(good());
 assert.deepStrictEqual(states(m), { service: "ok", disk: "ok", protection: "ok", list: "info", decoys: "ok" });
 assert.deepStrictEqual([m.done, m.total, m.allSet], [4, 4, true]);
-assert.match(row(m, "list").text, /No list ships yet/);
+assert.match(row(m, "list").text, /None ships yet.*refused/);
 assert.strictEqual(row(m, "list").pill, "Not available yet");
 assert.ok(S.checklist({ ...good(), known_bad: { loaded: true, entries: 1200 } }).rows.find((r) => r.id === "list").text.includes("1,200"));
 
@@ -84,6 +84,24 @@ assert.match(row(m, "protection").text, /Known Malware List/);
 m = S.checklist({ ...good(), toggles: undefined });
 assert.strictEqual(row(m, "protection").state, "unknown");
 assert.strictEqual(m.allSet, false);
+
+// Switches that are missing, empty or of the wrong kind are unknown, never "on".
+for (const toggles of [{}, [], "yes", { ...good().toggles, zip_bomb_enabled: undefined }, { ...good().toggles, canary_enabled: "true" }]) {
+  m = S.checklist({ ...good(), toggles });
+  assert.strictEqual(row(m, "protection").state, "unknown", JSON.stringify(toggles));
+  assert.strictEqual(m.allSet, false, JSON.stringify(toggles));
+}
+// The AI model not loaded: not "all set"; unknown when the service did not say; ignored when that check is off.
+m = S.checklist({ ...good(), model_loaded: false });
+assert.strictEqual(row(m, "protection").state, "todo");
+assert.match(row(m, "protection").text, /model is not loaded/);
+assert.strictEqual(m.allSet, false);
+m = S.checklist({ ...good(), model_loaded: undefined });
+assert.strictEqual(row(m, "protection").state, "unknown");
+assert.strictEqual(m.allSet, false);
+m = S.checklist({ ...good(), model_loaded: false, toggles: { ...good().toggles, bin_ai_enabled: false } });
+assert.match(row(m, "protection").text, /Switched off: ONNX Binary AI/);
+assert.match(row(S.checklist(good()), "protection").text, /every check that can run is on/);
 
 // Odd input does not throw.
 assert.doesNotThrow(() => S.checklist({ daemon: {}, canaries: null }));

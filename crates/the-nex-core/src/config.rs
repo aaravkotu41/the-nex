@@ -1353,6 +1353,34 @@ mod tests {
     }
 
     #[test]
+    fn two_settings_updates_never_run_at_the_same_time() {
+        // The changes themselves are only ever run under the lock, so overlapping closures
+        // would show it is gone (the final file alone cannot: later updates repair a lost one).
+        let dir = std::env::temp_dir().join(format!("thenex-upd-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        let inside = std::sync::atomic::AtomicUsize::new(0);
+        let worst = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..6 {
+                scope.spawn(|| {
+                    for _ in 0..5 {
+                        RuntimeToggles::update(&path, |_| {
+                            let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                            worst.fetch_max(now, Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(3));
+                            inside.fetch_sub(1, Ordering::SeqCst);
+                        })
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(worst.load(Ordering::SeqCst), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_scan_schedule_defaults_off_and_settings_files_work_both_ways() {
         assert_eq!(
             args(&["--set", "scan_schedule=weekly"]).unwrap().mode,

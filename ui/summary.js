@@ -7,6 +7,7 @@
   "use strict";
 
   const DAY_MS = 86400000;
+  const RETRY_MS = 3600000; // RETRY_GAP in schedule.rs
   const INTERVAL = { daily: DAY_MS, weekly: 7 * DAY_MS };
 
   /** When the next scan is due, in words. `now` is a Date; `fmt` turns a Date into text. */
@@ -15,6 +16,14 @@
     if (!interval) return "Off. The Nex only scans when you ask it to.";
     if (!online) return "On, but the background service is not running, so no scan will start until it is.";
     const last = info.last_run ? new Date(info.last_run) : null;
+    // The service started a scan after the last finished one and it did not finish: it tries again
+    // an hour after that start.
+    const attempt = info.last_attempt ? new Date(info.last_attempt) : null;
+    if (attempt && attempt <= now && (!last || attempt > last)) {
+      if (info.running) return "A scheduled scan is running now.";
+      const retry = new Date(attempt.getTime() + RETRY_MS);
+      if (retry > now) return `The last scheduled scan was stopped, will try again about ${fmt(retry)}.`;
+    }
     // A last run in the future means the clock was set back: the service starts over from now.
     if (!last || Number.isNaN(last.getTime()) || last > now) {
       return "The first scan starts about 10 minutes after you switch this on or the service starts.";
@@ -29,9 +38,14 @@
     if (!scan) return "No scheduled scan has run yet.";
     const when = scan.finished_at ? fmt(new Date(scan.finished_at)) : "an unknown time";
     const checked = `${scan.files_examined} file${scan.files_examined === 1 ? "" : "s"} looked at`;
+    // A stopped scan, or one that looked at nothing, is not a clean result.
     const found = scan.findings
       ? `${scan.findings} flagged (nothing was moved or deleted)`
-      : "nothing suspicious found";
+      : scan.cancelled
+        ? "nothing found so far"
+        : scan.files_examined
+          ? "nothing suspicious found"
+          : "no files could be checked";
     const notes = [
       scan.cancelled ? "stopped early" : "",
       scan.truncated ? "hit its file limit" : "",

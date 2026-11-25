@@ -52,7 +52,9 @@
     }
 
     // An engine that is switched off protects nothing; the known-malware list only counts once a list is loaded.
-    const toggles = d.toggles && typeof d.toggles === "object" ? d.toggles : null;
+    // A switch that is missing (or a list, or {}) is unknown, never "on".
+    const toggles = d.toggles && typeof d.toggles === "object"
+      && ENGINES.every(([key]) => typeof d.toggles[key] === "boolean") ? d.toggles : null;
     const listLoaded = Boolean(d.known_bad && d.known_bad.loaded);
     const off = toggles ? ENGINES.filter(([key]) => toggles[key] === false && (key !== "known_bad_enabled" || listLoaded)).map(([, name]) => name) : [];
 
@@ -69,8 +71,12 @@
       Object.assign(protection, { state: "unknown", text: "Dry Run is off, but which checks are switched on could not be read." });
     } else if (off.length) {
       Object.assign(protection, { state: "todo", text: `Switched off: ${off.join(", ")}. Turn ${off.length === 1 ? "it" : "them"} on in Engines, or that protection is missing.` });
+    } else if (toggles.bin_ai_enabled && d.model_loaded === false) {
+      Object.assign(protection, { state: "todo", text: "ONNX Binary AI is switched on, but its model is not loaded, so that check is not working. Restarting or reinstalling the service usually fixes it." });
+    } else if (toggles.bin_ai_enabled && d.model_loaded !== true) {
+      Object.assign(protection, { state: "unknown", text: "Dry Run is off, but whether the AI model is loaded could not be read." });
     } else {
-      Object.assign(protection, { state: "ok", text: "Dry Run is off and every check is on: threats are quarantined or stopped as they appear." });
+      Object.assign(protection, { state: "ok", text: "Dry Run is off and every check that can run is on: threats are quarantined or stopped as they appear." });
     }
     rows.push(protection);
 
@@ -80,7 +86,7 @@
       pill: list ? "Loaded" : "Not available yet",
       text: list
         ? `${Number(list.entries).toLocaleString("en-US")} known threats are checked by fingerprint.`
-        : "No list ships yet. That is expected: the other checks work without it.",
+        : "No list is loaded. None ships yet, so that is expected and the other checks work without it; a list you installed that stays missing was refused (damaged or unreadable), and the log says why.",
     });
 
     const canaries = Array.isArray(d.canaries) ? d.canaries.length : 0;

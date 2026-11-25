@@ -15,7 +15,9 @@ use the_nex_core::config::{AppConfig, Engine, RuntimeToggles};
 use the_nex_core::engine::{self, QuickScanReport, ScanKind};
 use the_nex_core::platform;
 use the_nex_core::quarantine::{Severity, ThreatEvent};
+use the_nex_core::scan_jobs;
 use the_nex_core::schedule::{self, ScanSchedule};
+use the_nex_core::status::EngineStatus;
 
 // ---- scheduled scan setting ----------------------------------------------------------------
 
@@ -34,14 +36,25 @@ pub struct LastScheduled {
 pub struct ScheduleInfo {
     schedule: ScanSchedule,
     last_run: Option<DateTime<Utc>>,
+    /// When the service last started a scheduled scan, finished or not.
+    last_attempt: Option<DateTime<Utc>>,
+    /// A scheduled scan is running now.
+    running: bool,
     last_scan: Option<LastScheduled>,
+}
+
+fn scheduled_scan_running(cfg: &AppConfig) -> bool {
+    scan_jobs::read_progress(cfg).is_some_and(|p| p.is_live() && p.scheduled)
 }
 
 fn schedule_info(cfg: &AppConfig) -> Result<ScheduleInfo, String> {
     let toggles = RuntimeToggles::load(&cfg.settings_file).map_err(|e| e.to_string())?;
+    let state = schedule::read_state(cfg);
     Ok(ScheduleInfo {
         schedule: toggles.scan_schedule,
-        last_run: schedule::read_state(cfg).last_run,
+        last_run: state.last_run,
+        last_attempt: state.last_attempt,
+        running: scheduled_scan_running(cfg),
         last_scan: engine::read_scan_report(cfg, ScanKind::Scheduled).map(|r| LastScheduled {
             finished_at: r.finished_at,
             files_examined: r.files_examined,
@@ -230,11 +243,13 @@ fn replace_ci(text: &str, needle: &str, with: &str, whole: bool) -> String {
     out
 }
 
-/// Replaces account names in paths: the folder after `Users`, `home`, `Profiles` and `Volumes`
-/// (`C:\Users\name\`, `/Users/name/`, `D:\Profiles\alex`, `/Volumes/Backup`), the host, share
-/// and name of a network path (`\\fs\home$\alex`), and the literal current user name and
-/// home folder wherever they appear. The same rule as `scrub` in ui/report.js for the first
-/// two, and tested with the same cases. Invisible characters go first: they could split a word.
+/// Replaces account names in paths: the folder after `Users`, `home`, `Profiles`, `Volumes` and
+/// `Documents and Settings` (`C:\Users\name\`, `/Users/name/`, `D:\Profiles\alex`,
+/// `/Volumes/Backup`, `Users/bob/` inside an archive, `/Users//bob`, and the folder after
+/// `/Users/Shared/`), the host, share and name of a network path (`\\fs\home$\alex`,
+/// `\\?\UNC\fs\home$\alex`, `//fs/share/alex`), and the literal current user name and home
+/// folder wherever they appear. The same rule as `scrub` in ui/report.js for the first two, and
+/// tested with the same cases. Invisible characters go first: they could split a word.
 fn scrub(text: &str, who: &Identity) -> String {
     let mut text = strip_invisible(text);
     if who.home.chars().count() >= 3 {
@@ -252,49 +267,110 @@ fn scrub(text: &str, who: &Identity) -> String {
             .find(|&k| "\\/\"<>|:*?\r\n".contains(chars[k]))
             .unwrap_or(chars.len())
     };
+    // Index after a run of separators.
+    let skip_separators = |mut k: usize| {
+        while chars.get(k).is_some_and(|&c| is_separator(c)) {
+            k += 1;
+        }
+        k
+    };
+    let word_at = |i: usize, word: &str| {
+        let end = i + word.chars().count();
+        chars.get(i..end).is_some_and(|w| {
+            w.iter()
+                .zip(word.chars())
+                .all(|(a, b)| a.to_ascii_lowercase() == b)
+        }) && chars.get(end).is_some_and(|&c| is_separator(c))
+    };
     let mut i = 0;
     'next: while i < chars.len() {
-        out.push(chars[i]);
-        if chars[i] == '\\' && chars.get(i + 1) == Some(&'\\') && (i == 0 || chars[i - 1] != '\\') {
-            // Network path: host, share and the account folder after it.
-            let mut end = i + 2;
-            for _ in 0..3 {
-                let next = component_end(end);
-                if next == end {
-                    break;
+        // The account folder: after one of these words, at the start of the text or after a
+        // separator or any other character that is not part of a longer word.
+        if i == 0 || !chars[i - 1].is_alphanumeric() {
+            for word in [
+                "users",
+                "home",
+                "profiles",
+                "volumes",
+                "documents and settings",
+            ] {
+                if !word_at(i, word) {
+                    continue;
                 }
-                end = (next + 1).min(chars.len());
-                if next == chars.len() || !is_separator(chars[next]) {
-                    end = next;
-                    break;
+                let name_start = skip_separators(i + word.chars().count());
+                let mut name_end = component_end(name_start);
+                if name_end == name_start {
+                    continue;
                 }
-            }
-            if end > i + 2 {
-                out.push_str("\\…\\…\\…");
-                i = if end > i + 2 && is_separator(chars[end - 1]) {
-                    end - 1
-                } else {
-                    end
-                };
+                out.extend(&chars[i..name_start]);
+                out.push('…');
+                // `/Users/Shared/<name>`: the shared folder holds people's own folders too.
+                let shared = word == "users"
+                    && chars[name_start..name_end]
+                        .iter()
+                        .collect::<String>()
+                        .eq_ignore_ascii_case("shared");
+                let next = skip_separators(name_end);
+                if shared && next > name_end && component_end(next) > next {
+                    out.extend(&chars[name_end..next]);
+                    out.push('…');
+                    name_end = component_end(next);
+                }
+                i = name_end;
                 continue 'next;
             }
         }
-        if is_separator(chars[i]) {
-            for word in ["users", "home", "profiles", "volumes"] {
-                let end = i + 1 + word.len();
-                let matches = chars.get(i + 1..end).is_some_and(|w| {
-                    w.iter()
-                        .zip(word.chars())
-                        .all(|(a, b)| a.to_ascii_lowercase() == b)
-                }) && chars.get(end).is_some_and(|&c| is_separator(c));
-                if !matches {
-                    continue;
+        out.push(chars[i]);
+        let c = chars[i];
+        // `\\host\share\name` (also `\\?\UNC\...`) and `//host/share/name`, which must not be
+        // part of a longer path or a URL.
+        let unc = is_separator(c)
+            && chars.get(i + 1) == Some(&c)
+            && if c == '\\' {
+                i == 0 || chars[i - 1] != '\\'
+            } else {
+                (i == 0 || chars[i - 1].is_whitespace() || "\"'(=,;[<>|".contains(chars[i - 1]))
+                    && chars
+                        .get(i + 2)
+                        .is_some_and(|n| !n.is_whitespace() && !is_separator(*n))
+            };
+        if unc {
+            let mut host = i + 2;
+            let mut network = true;
+            // `\\?\C:\Users\bob` is a local path, left to the rule above.
+            if c == '\\'
+                && matches!(chars.get(host), Some('?' | '.'))
+                && chars.get(host + 1).is_some_and(|&n| is_separator(n))
+            {
+                host += 2;
+                if word_at(host, "unc") {
+                    host += 4;
+                } else {
+                    network = false;
                 }
-                let name_end = component_end(end + 1);
-                if name_end > end + 1 {
-                    out.extend(&chars[i + 1..=end]);
-                    out.push('…');
-                    i = name_end;
+            }
+            if network {
+                // Host, share and the account folder after it.
+                let mut end = host;
+                for _ in 0..3 {
+                    let next = component_end(end);
+                    if next == end {
+                        break;
+                    }
+                    end = (next + 1).min(chars.len());
+                    if next == chars.len() || !is_separator(chars[next]) {
+                        end = next;
+                        break;
+                    }
+                }
+                if end > host {
+                    out.extend(&chars[i + 1..host]);
+                    out.push_str(&format!("…{c}…{c}…"));
+                    i = if is_separator(chars[end - 1]) {
+                        end - 1
+                    } else {
+                        end
+                    };
                     continue 'next;
                 }
             }
@@ -453,7 +529,7 @@ fn scan_section(
             };
             out += &format!(
                 "<li><b>{}</b>{folder} &mdash; {}{detail}</li>",
-                esc(file_name(&path)),
+                esc(&scrub(file_name(&path), who)),
                 esc(&plain(&f.threat_type, include_folders, who)),
             );
         }
@@ -494,7 +570,17 @@ fn render(i: &Input) -> String {
         Some(false) => "not granted, so some folders cannot be scanned",
         None => "not known (macOS only, and only while the service runs)",
     };
-    let headline = if t.threats == 0 {
+    // A scan's findings are not events in the log: a quiet log does not mean a clean computer.
+    let still_flagged = i
+        .scans
+        .iter()
+        .any(|(_, r)| r.as_ref().is_some_and(|r| !r.findings.is_empty()));
+    let headline = if t.threats == 0 && still_flagged {
+        format!(
+            "No threat events were recorded in the last {} days, but the latest scan still flags files (see below).",
+            i.days
+        )
+    } else if t.threats == 0 {
         format!("No threats were recorded in the last {} days.", i.days)
     } else {
         format!(
@@ -655,6 +741,71 @@ fn open_log(path: &Path) -> Result<Box<dyn BufRead>, String> {
     }
 }
 
+/// What each check is really doing: "on" only when it is working now. `toggles` is the
+/// service's own copy while it runs, else the settings file (None: unreadable). `status` is
+/// the service's report (None: not running).
+fn engine_states(
+    toggles: Option<RuntimeToggles>,
+    status: Option<&EngineStatus>,
+) -> Vec<(&'static str, String)> {
+    let state = |engine: Engine, missing: Option<String>| -> String {
+        match toggles {
+            None => "not known".to_string(),
+            Some(t) if !t.get(engine) => "off".to_string(),
+            Some(_) if status.is_none() => {
+                "switched on, but not working: the background service is not running".into()
+            }
+            Some(_) => match missing {
+                Some(why) => format!("switched on, but not working: {why}"),
+                None => "on".to_string(),
+            },
+        }
+    };
+    let list = status.is_some_and(|s| s.known_bad_entries > 0);
+    let model = status.is_some_and(|s| s.model_loaded);
+    // The three checks that read files only see folders that are watched and readable.
+    let files = status.and_then(|s| {
+        if s.watched_dirs.is_empty() {
+            Some("no folder is being watched".to_string())
+        } else if s.full_disk_access == Some(false) {
+            Some("macOS is hiding Desktop, Documents and Downloads from the service".to_string())
+        } else {
+            None
+        }
+    });
+    let decoys = status.and_then(|s| {
+        let intact = s.canaries.iter().filter(|c| c.is_intact()).count();
+        match s.canaries.len() {
+            0 => Some("no decoy files are in place".to_string()),
+            n if intact < n => Some(format!("only {intact} of {n} decoy files are in place")),
+            _ => None,
+        }
+    });
+    vec![
+        (
+            "Known-malware list",
+            state(
+                Engine::KnownBad,
+                (!list)
+                    .then(|| "the list is not loaded or is empty".to_string())
+                    .or_else(|| files.clone()),
+            ),
+        ),
+        ("Zip-bomb check", state(Engine::ZipBomb, files.clone())),
+        (
+            "AI program check",
+            state(
+                Engine::BinAi,
+                (!model)
+                    .then(|| "its model is not loaded".to_string())
+                    .or(files),
+            ),
+        ),
+        ("Misused system tools", state(Engine::ProcessGuard, None)),
+        ("Ransomware decoy files", state(Engine::Canary, decoys)),
+    ]
+}
+
 #[tauri::command]
 pub async fn save_summary_report(days: u32, include_folders: bool) -> Result<String, String> {
     if days != 7 && days != 30 {
@@ -678,41 +829,11 @@ pub async fn save_summary_report(days: u32, include_folders: bool) -> Result<Str
             .map(|s| s.toggles)
             .or_else(|| RuntimeToggles::load(&cfg.settings_file).ok());
         let running = status.is_some();
-        let state = |engine: Engine, missing: Option<&str>| -> String {
-            match toggles {
-                None => "not known".to_string(),
-                Some(t) if !t.get(engine) => "off".to_string(),
-                Some(_) if !running => {
-                    "switched on, but not working: the background service is not running".into()
-                }
-                Some(_) => match missing {
-                    Some(why) => format!("switched on, but not working: {why}"),
-                    None => "on".to_string(),
-                },
-            }
-        };
-        let model = status.as_ref().is_some_and(|s| s.model_loaded);
-        let list = status.as_ref().is_some_and(|s| s.known_bad_entries > 0);
         let protection = Protection {
             service_running: running,
             service_installed: platform::service_installed(),
             version: status.as_ref().map(|s| s.version.clone()),
-            engines: vec![
-                (
-                    "Known-malware list",
-                    state(
-                        Engine::KnownBad,
-                        (!list).then_some("the list is not loaded or is empty"),
-                    ),
-                ),
-                ("Zip-bomb check", state(Engine::ZipBomb, None)),
-                (
-                    "AI program check",
-                    state(Engine::BinAi, (!model).then_some("its model is not loaded")),
-                ),
-                ("Misused system tools", state(Engine::ProcessGuard, None)),
-                ("Ransomware decoy files", state(Engine::Canary, None)),
-            ],
+            engines: engine_states(toggles, status.as_ref()),
             dry_run: status
                 .as_ref()
                 .map(|s| s.dry_run)
@@ -822,7 +943,7 @@ mod tests {
             "score=0.97 threshold=0.65; packed code"
         );
         assert_eq!(scrub("/Users/", &nobody()), "/Users/");
-        assert_eq!(scrub("/home//x", &nobody()), "/home//x");
+        assert_eq!(scrub("/home/", &nobody()), "/home/");
         // Names with an apostrophe, other roots, network paths, volumes and the current user.
         let s = |t: &str| scrub(t, &nobody());
         assert_eq!(s("C:\\Users\\O'Brien\\a.exe"), "C:\\Users\\…\\a.exe");
@@ -832,6 +953,39 @@ mod tests {
         assert_eq!(s("/Users/carol/x and carol owns it"), "~/x and … owns it");
         assert_eq!(s("a/Users/carolyn/x"), "a/Users/…/x");
         assert_eq!(s("/Us\u{200B}ers/alex/x"), "/Users/…/x");
+        // Other places an account name hides (none of these may keep "bob").
+        for (text, expected) in [
+            ("/Users//bob/a.exe", "/Users//…/a.exe"),
+            (
+                "\\\\?\\UNC\\fs\\home$\\bob\\a.exe",
+                "\\\\?\\UNC\\…\\…\\…\\a.exe",
+            ),
+            ("\\\\?\\C:\\Users\\bob\\a.exe", "\\\\?\\C:\\Users\\…\\a.exe"),
+            ("//fs/share/bob/a.exe", "//…/…/…/a.exe"),
+            ("/Users/Shared/bob/a.exe", "/Users/…/…/a.exe"),
+            ("/users/shared//bob", "/users/…//…"),
+            ("Users/bob/Desktop/a.exe", "Users/…/Desktop/a.exe"),
+            ("pack.zip!Users/bob/a.exe", "pack.zip!Users/…/a.exe"),
+            (
+                "C:\\Documents and Settings\\bob\\a.exe",
+                "C:\\Documents and Settings\\…\\a.exe",
+            ),
+            (
+                "C:/documents and settings/bob/a.exe",
+                "C:/documents and settings/…/a.exe",
+            ),
+        ] {
+            assert_eq!(s(text), expected, "{text}");
+        }
+        // Nothing else is touched: URLs, comments, ordinary prose and shorter words.
+        for plain in [
+            "http://example.com/users/",
+            "x // comment here",
+            "5 homes/day",
+            "/usersx/bob",
+        ] {
+            assert_eq!(s(plain), plain, "{plain}");
+        }
         assert_eq!(file_name("C:\\Users\\bob\\evil.exe"), "evil.exe");
         assert_eq!(
             file_name("powershell.exe (pid 8842)"),
@@ -1066,5 +1220,118 @@ mod tests {
         assert!(save_error(&denied).starts_with("The Nex is not allowed to save"));
         assert!(!save_error(&denied).contains("denied"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn flagged_scan(path: &str) -> QuickScanReport {
+        QuickScanReport {
+            files_examined: 1,
+            finished_at: Utc::now().to_rfc3339(),
+            findings: vec![QuickScanFinding {
+                path: PathBuf::from(path),
+                threat_type: "MALWARE_AI".into(),
+                detail: "d".into(),
+            }],
+            ..QuickScanReport::default()
+        }
+    }
+
+    #[test]
+    fn a_quiet_log_does_not_say_no_threats_while_the_latest_scan_still_flags_files() {
+        let scans = |r: QuickScanReport| vec![("Quick scan", Some(r))];
+        let page = render_with(&Tally::default(), scans(flagged_scan("/x/a.exe")), false);
+        assert!(!page.contains("No threats were recorded"), "{page}");
+        assert!(page.contains("still flags files"), "{page}");
+        let clean = QuickScanReport {
+            files_examined: 1,
+            finished_at: Utc::now().to_rfc3339(),
+            ..QuickScanReport::default()
+        };
+        let page = render_with(&Tally::default(), scans(clean), false);
+        assert!(page.contains("No threats were recorded in the last 7 days."));
+        let page = render_with(&Tally::default(), vec![("Quick scan", None)], false);
+        assert!(page.contains("No threats were recorded in the last 7 days."));
+    }
+
+    #[test]
+    fn a_file_name_in_the_report_loses_the_account_name_too() {
+        // The current account is "carol" (see `nobody`): its name inside a file name goes.
+        for folders in [false, true] {
+            let page = render_with(
+                &Tally::default(),
+                vec![("Quick scan", Some(flagged_scan("/x/carol-payroll.docm")))],
+                folders,
+            );
+            assert!(!page.contains("carol"), "{folders}: {page}");
+            assert!(page.contains("…-payroll.docm"), "{folders}: {page}");
+        }
+    }
+
+    #[test]
+    fn the_report_never_says_a_check_is_on_that_is_not_working() {
+        let dir = std::env::temp_dir().join(format!("thenex-report-state-{}", std::process::id()));
+        let cfg = AppConfig::for_base_dir(&dir);
+        let mut status = the_nex_core::status::build_status(
+            &cfg,
+            &the_nex_core::status::Telemetry::default(),
+            Utc::now(),
+            Default::default(),
+        );
+        let canary = |state: &str| the_nex_core::status::CanaryStatus {
+            path: PathBuf::from("/x/decoy"),
+            state: state.to_string(),
+        };
+        let all_on = RuntimeToggles::default();
+        let states = |t: Option<RuntimeToggles>, s: Option<&EngineStatus>| -> Vec<String> {
+            engine_states(t, s).into_iter().map(|(_, v)| v).collect()
+        };
+        let working = |v: &str| v == "on";
+        // Unreadable settings, and a service that is not running: nothing is "on".
+        assert!(states(None, None).iter().all(|v| v == "not known"));
+        assert!(states(Some(all_on), None)
+            .iter()
+            .all(|v| v.contains("service is not running")));
+
+        // Running, but with nothing in place: only what needs nothing is on.
+        status.known_bad_entries = 0;
+        status.model_loaded = false;
+        status.watched_dirs.clear();
+        status.canaries.clear();
+        status.full_disk_access = None;
+        let v = states(Some(all_on), Some(&status));
+        assert!(v[0].contains("list is not loaded"), "{v:?}");
+        assert!(v[1].contains("no folder is being watched"), "{v:?}");
+        assert!(v[2].contains("model is not loaded"), "{v:?}");
+        assert!(working(&v[3]), "{v:?}");
+        assert!(v[4].contains("no decoy files"), "{v:?}");
+
+        // Everything in place: all on. Then each gap, one at a time.
+        status.known_bad_entries = 5;
+        status.model_loaded = true;
+        status.watched_dirs = vec![PathBuf::from("/x")];
+        status.canaries = vec![canary("Intact"), canary("Intact")];
+        assert!(states(Some(all_on), Some(&status))
+            .iter()
+            .all(|v| working(v)));
+        status.full_disk_access = Some(true);
+        assert!(states(Some(all_on), Some(&status))
+            .iter()
+            .all(|v| working(v)));
+        status.full_disk_access = Some(false);
+        let v = states(Some(all_on), Some(&status));
+        assert!(
+            v[0..3].iter().all(|v| v.contains("hiding Desktop")),
+            "{v:?}"
+        );
+        assert!(working(&v[3]) && working(&v[4]));
+        status.full_disk_access = None;
+        status.canaries[1] = canary("Modified");
+        assert!(states(Some(all_on), Some(&status))[4].contains("only 1 of 2"));
+        status.canaries[1] = canary("Intact");
+        // A check that is switched off says so, whatever else is wrong.
+        let mut off = all_on;
+        off.set(Engine::ZipBomb, false);
+        status.watched_dirs.clear();
+        assert_eq!(states(Some(off), Some(&status))[1], "off");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

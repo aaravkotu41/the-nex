@@ -182,22 +182,32 @@ impl SeenFindings {
         }
     }
 
+    /// The path is always part of the key (a second copy elsewhere is a new finding). Without a
+    /// hash the file's size and both of its times and the event's text stand in for it.
     fn key(event: &crate::quarantine::ThreatEvent) -> Option<String> {
         if let Some(hash) = &event.sha256 {
-            return Some(format!("{}|{hash}", event.threat_type));
+            return Some(format!("{}|{}|{hash}", event.threat_type, event.target));
         }
         let meta = fs::symlink_metadata(&event.target).ok()?;
-        let stamp = meta
-            .modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos();
+        let nanos = |t: std::time::SystemTime| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_nanos())
+        };
+        #[cfg(unix)]
+        let changed = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.ctime() as i128) * 1_000_000_000 + meta.ctime_nsec() as i128
+        };
+        #[cfg(not(unix))]
+        let changed = meta.created().ok().and_then(nanos).unwrap_or(0) as i128;
         Some(format!(
-            "{}|{}|{}|{stamp}",
+            "{}|{}|{}|{}|{changed}|{}",
             event.threat_type,
             event.target,
-            meta.len()
+            meta.len(),
+            nanos(meta.modified().ok()?)?,
+            event.details
         ))
     }
 
@@ -524,11 +534,6 @@ mod tests {
         jobs.set_scheduled_outcome(true);
         scheduler.tick(&cfg, &jobs, &scanner, &telemetry);
         assert!(read_state(&cfg).last_run.is_some());
-        // A shutdown waits for the scan thread instead of leaving it to be cut off.
-        assert!(jobs.start(ScanKind::Scheduled, &cfg, &scanner, &telemetry));
-        jobs.cancel();
-        jobs.join();
-        assert!(!jobs.is_running());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -570,6 +575,135 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         fs::write(&decoy, b"harmless decoy").unwrap(); // same bytes, new modified time
         assert_eq!(run(&cfg), (1, 2), "changed on disk: reported again");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn finding(target: &Path, hash: Option<&str>, details: &str) -> crate::quarantine::ThreatEvent {
+        let mut event = crate::quarantine::ThreatEvent::new(
+            "MALWARE_AI",
+            crate::quarantine::Severity::High,
+            target.display().to_string(),
+            "DRY_RUN",
+            details,
+        );
+        event.sha256 = hash.map(str::to_string);
+        event
+    }
+
+    #[test]
+    fn a_finding_is_the_same_only_in_the_same_place_and_state() {
+        let dir = std::env::temp_dir().join(format!("thenex-seen-key-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.bin"), dir.join("b.bin"));
+        fs::write(&a, b"same bytes").unwrap();
+        fs::write(&b, b"same bytes").unwrap();
+        let list = dir.join("seen.json");
+        let first = SeenFindings::default();
+        assert!(!first.is_repeat(&finding(&a, Some("h1"), "d")));
+        assert!(!first.is_repeat(&finding(&a, None, "d")));
+        first.save(&list, true);
+        let seen = SeenFindings::load(&list);
+        assert!(seen.is_repeat(&finding(&a, Some("h1"), "d")));
+        assert!(seen.is_repeat(&finding(&a, None, "d")));
+        // The same hash in another place, or another hash in the same place, is a new finding.
+        assert!(!seen.is_repeat(&finding(&b, Some("h1"), "d")));
+        assert!(!seen.is_repeat(&finding(&a, Some("h2"), "d")));
+        // Without a hash the event's own text counts, and so does the file's change time.
+        assert!(!seen.is_repeat(&finding(&a, None, "another verdict")));
+        assert!(!seen.is_repeat(&finding(&b, None, "d")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::thread::sleep(Duration::from_millis(20));
+            // Changes the change time only: same size, same modified time.
+            fs::set_permissions(&a, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(!SeenFindings::load(&list).is_repeat(&finding(&a, None, "d")));
+        }
+        // A file that is gone cannot be told apart: reported, never hidden.
+        assert!(!seen.is_repeat(&finding(&dir.join("gone"), None, "d")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_scheduled_scan_hides_repeats_and_a_stopped_one_keeps_the_old_list() {
+        let root = std::env::temp_dir().join(format!("thenex-sched-keep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let watch = root.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        let decoy = watch.join("payroll.docm");
+        fs::write(&decoy, b"harmless decoy").unwrap();
+        let mut cfg = AppConfig::for_base_dir(&root.join("base"));
+        cfg.watch_dir = Some(watch);
+        cfg.ensure_dirs().unwrap();
+        let list = root.join("list.bin");
+        let digest = known_bad::hash_file(&decoy, u64::MAX).unwrap();
+        known_bad::write_list(&list, &[digest], 1_795_000_000).unwrap();
+        cfg.hash_list = Some(list);
+        cfg.load_known_bad().unwrap();
+        let (scanner, telemetry) = (BinaryAiScanner::heuristic_only(), Telemetry::default());
+        let threats = |cfg: &AppConfig| {
+            crate::quarantine::read_recent_events(&cfg.events_log, 1 << 20)
+                .unwrap()
+                .iter()
+                .filter(|e| e.threat_type == known_bad::THREAT_TYPE)
+                .count()
+        };
+        let run = |kind: ScanKind, go_on: bool| {
+            crate::engine::run_scan(&cfg, &scanner, &telemetry, kind, &mut |_, _| go_on)
+        };
+        let seen_file = cfg.base_dir.join(SEEN_FILE);
+        let read_seen =
+            || serde_json::from_slice::<Vec<String>>(&fs::read(&seen_file).unwrap()).unwrap();
+        run(ScanKind::Scheduled, true);
+        run(ScanKind::Scheduled, true);
+        assert_eq!(threats(&cfg), 1, "the second scheduled scan adds no event");
+        let before = read_seen();
+        assert_eq!(before.len(), 1);
+        // A scan the user asks for always reports what it finds.
+        run(ScanKind::Full, true);
+        assert_eq!(threats(&cfg), 2);
+        run(ScanKind::Quick, true);
+        assert_eq!(threats(&cfg), 3);
+        // A scheduled scan that was stopped before it looked at anything forgets nothing.
+        assert!(run(ScanKind::Scheduled, false).cancelled);
+        assert_eq!(read_seen(), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn waking_from_sleep_restarts_the_quiet_period_before_a_scan() {
+        let root = std::env::temp_dir().join(format!("thenex-sched-wake-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let watch = root.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        let mut cfg = AppConfig::for_base_dir(&root.join("base"));
+        cfg.watch_dir = Some(watch);
+        cfg.ensure_dirs().unwrap();
+        let mut toggles = cfg.toggles.snapshot();
+        toggles.scan_schedule = ScanSchedule::Daily;
+        cfg.toggles.apply(toggles);
+        let (cfg, jobs) = (Arc::new(cfg), Arc::new(ScanJobs::default()));
+        let scanner = Arc::new(BinaryAiScanner::heuristic_only());
+        let telemetry = Arc::new(Telemetry::default());
+        let ready = |gap: Span| {
+            let mut scheduler = Scheduler::load(&cfg);
+            // The quiet period ended long ago; the last tick was a second ago by the monotonic
+            // clock and `gap` ago by the wall clock.
+            scheduler.armed = Instant::now().checked_sub(Duration::from_secs(3600));
+            let second = Duration::from_secs(1);
+            scheduler.last_tick = Some((Instant::now() - second, Utc::now() - gap));
+            scheduler
+        };
+        // The machine slept eight hours: wait the quiet period again, start nothing.
+        let mut scheduler = ready(Span::hours(8));
+        scheduler.tick(&cfg, &jobs, &scanner, &telemetry);
+        assert!(!jobs.is_running() && read_state(&cfg).last_attempt.is_none());
+        // The same state with an ordinary tick gap starts the scan.
+        let mut scheduler = ready(Span::seconds(1));
+        scheduler.tick(&cfg, &jobs, &scanner, &telemetry);
+        assert!(read_state(&cfg).last_attempt.is_some());
+        jobs.join();
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -3072,11 +3072,13 @@ mod tests {
                 ("/etc/profile", &[], NotChecked),
                 ("ls", &[], NotChecked),
                 ("./ls", &[], NotChecked),
-                // Reported by the live guard, never stopped: no more than worth a look here.
+                // osascript's own command line shows its whole program, so the live guard stops
+                // a shell call with a /tmp/ path there (only a shell that merely mentions it is
+                // alert-only), and so does this check.
                 (
                     "/usr/bin/osascript",
                     &["-e", "do shell script \"cp /tmp/a /b\""],
-                    WorthALook,
+                    Suspicious,
                 ),
             ] {
                 let item = verdict_of("com.example.x", program, given);
