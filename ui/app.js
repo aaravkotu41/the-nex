@@ -860,11 +860,14 @@ async function quarantineAction(action, id, event) {
 
 async function loadEvents() {
   const seq = refreshSeq;
-  const overview = await call("get_events", { limit: OVERVIEW_EVENTS, query: state.query || null, severity: "ALL" });
-  if (seq !== refreshSeq) return;
   const eventsSignature = (events) => events.map((e) => `${e.id}|${e.timestamp}`).join(",");
-  replaceIfChanged($("overview-events"), eventsSignature(overview), () => overview.map((e) => eventRow(e)));
-  $("overview-empty").hidden = overview.length > 0;
+  if (state.page === "overview") {
+    const overview = await call("get_events", { limit: OVERVIEW_EVENTS, query: null, severity: "ALL" });
+    if (seq !== refreshSeq) return;
+    // With the minute, so "2 min ago" stays true.
+    replaceIfChanged($("overview-events"), `${eventsSignature(overview)}|${Math.floor(Date.now() / 60000)}`, () => overview.map((e) => eventRow(e)));
+    $("overview-empty").hidden = overview.length > 0;
+  }
   if (state.page === "activity") {
     const fetched = await call("get_events", { limit: ACTIVITY_LIMIT, query: state.query || null, severity: "ALL" });
     if (seq !== refreshSeq) return;
@@ -2010,7 +2013,8 @@ function startDashboard() {
   initAppearance().then(applyTheme);
   refresh(true);
   resumeFullScan();
-  refreshTimer = setInterval(() => refresh(false), REFRESH_MS);
+  refreshTimer = setInterval(() => document.hidden || refresh(false), REFRESH_MS);
+  document.addEventListener("visibilitychange", () => document.hidden || refresh(false));
   const events = window.__TAURI__ && window.__TAURI__.event;
   if (events) {
     // Menu-bar shortcuts (macOS); only known pages are honoured.

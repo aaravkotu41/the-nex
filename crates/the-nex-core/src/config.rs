@@ -180,6 +180,8 @@ pub struct CliArgs {
     pub allow_type: Option<String>,
     /// `--allow-event` and `--allow-quarantined` only: how the recorded SHA-256 must start.
     pub expect: Option<String>,
+    /// `--install` only: the data folder was not ours before, whoever owns it now.
+    pub fresh_data: bool,
 }
 
 /// A path argument exactly as given: no trim and no lossy conversion, so a file whose name ends
@@ -217,6 +219,7 @@ where
     let mut allow_name: Option<String> = None;
     let mut allow_type: Option<String> = None;
     let mut expect: Option<String> = None;
+    let mut fresh_data = false;
     let mut iter = args.into_iter();
 
     while let Some(raw) = iter.next() {
@@ -299,6 +302,10 @@ where
                     Some(Mode::Set(engine, enabled))
                 }
             }
+            "--fresh-data" => {
+                fresh_data = true;
+                None
+            }
             "--dry-run" => {
                 dry_run = true;
                 None
@@ -369,6 +376,9 @@ where
     if expect.is_some() && !matches!(mode, Mode::AllowEvent(_) | Mode::AllowQuarantined(_)) {
         return Err("--expect is only valid with --allow-event or --allow-quarantined".into());
     }
+    if fresh_data && mode != Mode::Install {
+        return Err("--fresh-data is only valid with --install".into());
+    }
     if path_overrides && matches!(mode, Mode::Install | Mode::Uninstall | Mode::Help) {
         return Err("--quarantine-dir and --log-file cannot be combined with that mode".into());
     }
@@ -383,6 +393,7 @@ where
         allow_name,
         allow_type,
         expect,
+        fresh_data,
     })
 }
 
@@ -1098,6 +1109,8 @@ mod tests {
             vec!["--allow"],
             vec!["--disallow", "zz"],
             vec!["--never-scan"],
+            vec!["--fresh-data"],
+            vec!["--console", "--fresh-data"],
             vec!["--never-scan", "--dry-run"],
             vec!["--never-scan", "/Users/me/x", "--scan-again", "/Users/me/x"],
             vec!["--allow", &sha, "--allow-type", "KNOWN_MALWARE"],

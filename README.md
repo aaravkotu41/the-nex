@@ -144,13 +144,29 @@ developer's Mac lost protection at the moments this was tried (as a normal user,
 differed; `no_running_program_loses_its_protection`, run by hand).
 
 What an ordinary user's malware can still do: end within 0.4 s; replace or delete its own file
-that fast; run the same shell again with other arguments (`exec bash -c …`), which is not seen as
-another program; run as a script, a library or inside a signed app or interpreter, which the AI
-does not score (perl, ruby, node and others have no command-line rules either); or flood the
+that fast; run as a script, a library or inside a signed app or interpreter, which the AI does not
+score (perl, ruby, node and others have no command-line rules either); or flood the
 queue of programs to check. For programs already running when protection starts the AI and the
 malware list only report, but the command-line rules still stop them.
 
-Checked on macOS only: 362 Rust tests, the Node tests and 15 live checks. On
+**From a review of the whole app.** A small zip file of repeated end records kept the zip library
+busy for minutes and so stopped live scanning: looking for a directory now has a time limit, and
+running out is "not fully checked", not malware. A folder moved into a watched folder was not
+scanned, because the system reports only the folder. The Windows installer took ownership of a
+data folder someone had made beforehand and then trusted the settings in it; it now asks whose it
+was first (never run on Windows). Programs and archives nobody has touched for 0.3 s no longer wait their turn
+for another 0.3 s. A quarantined file gets its record before it is read again, so a crash cannot
+lose it. The ransomware response checks that a process is still the one it judged. The window
+does not freeze when decoys cannot be read, the decoy check respects its switch, and a sign-out is
+not undone by a reply that comes late. A hard link made beforehand still defeats quarantine: the
+file is reported as QUARANTINE_FAILED and stays.
+
+**Idle cost.** On macOS the process guard read everything about every process 2.5 times a second
+(17 ms of CPU each time on the developer's Mac, measured as a normal user). It now asks the kernel
+which processes changed and reads only those (1.1 ms), everything once a minute, and so also sees
+a process that starts the same program again with other instructions.
+
+Checked on macOS only: 366 Rust tests, the Node tests and 16 live checks. On
 Windows, GitHub's machines ran the state before never-scan: the live, installer and AI checks
 passed and two unit tests failed on assumptions of their own (corrected since, not rerun);
 never-scan is only type-checked there. The administrator prompts, the real window and dropping a real file were

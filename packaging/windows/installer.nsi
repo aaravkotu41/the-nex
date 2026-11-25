@@ -103,6 +103,19 @@ Section "The Nex" SecMain
 
   ; A user may have pre-created %ProgramData%\TheNex: take ownership for Administrators and drop
   ; its ACLs before anything runs as SYSTEM from here (failures are ignored if it is absent).
+  ; Whose it was has to be asked first: a folder that was neither ours nor an administrator's may
+  ; hold made-up settings, which the engine then moves aside (--fresh-data). Not knowing counts as
+  ; not ours, except over an installed copy.
+  StrCpy $2 ""
+  ReadRegStr $1 HKLM "${UNINSTKEY}" "UninstallString"
+  ${If} $1 == ""
+  ${AndIf} ${FileExists} "$INSTDIR\*.*"
+    nsExec::ExecToLog `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "if ((Get-Acl -LiteralPath '$INSTDIR').GetOwner([Security.Principal.SecurityIdentifier]).Value -in 'S-1-5-32-544','S-1-5-18') { exit 0 } else { exit 7 }"`
+    Pop $0
+    ${If} $0 != 0
+      StrCpy $2 " --fresh-data"
+    ${EndIf}
+  ${EndIf}
   CreateDirectory "$INSTDIR"
   nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C'
   Pop $0
@@ -121,7 +134,7 @@ Section "The Nex" SecMain
   WriteUninstaller "$INSTDIR\${UNINSTALLER}"
 
   DetailPrint "Registering the background service..."
-  nsExec::ExecToLog '"$INSTDIR\the-nex.exe" --install'
+  nsExec::ExecToLog '"$INSTDIR\the-nex.exe" --install$2'
   Pop $0
   ${If} $0 != 0
     MessageBox MB_ICONSTOP "Registering The Nex service failed (exit code $0). See the details list for the reason." /SD IDOK

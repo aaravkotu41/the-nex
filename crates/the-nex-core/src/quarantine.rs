@@ -535,15 +535,12 @@ pub fn quarantine_file(
         }
     };
     platform::lock_quarantined_file(&quarantined_path);
-    // A writer that still held the file open may have changed it after the move: record what is
-    // there now, or restore would refuse on a hash mismatch forever.
-    let sha256 = sha256_file(&quarantined_path).unwrap_or(moved.sha256);
 
-    let meta = QuarantineMeta {
+    let mut meta = QuarantineMeta {
         id,
         original_path,
         quarantined_path,
-        sha256,
+        sha256: moved.sha256,
         size: moved.size,
         threat_type: threat_type.to_string(),
         details: details.to_string(),
@@ -568,6 +565,17 @@ pub fn quarantine_file(
             ));
         }
         return Err(e);
+    }
+    // Only now, because it can take long and a file without a record could not be restored. A
+    // writer that still held the file open may have changed it after the move: record what is
+    // there now, or restore would refuse on a hash mismatch forever.
+    if let Ok(now) = sha256_file(&meta.quarantined_path) {
+        if now != meta.sha256 {
+            meta.sha256 = now;
+            if let Err(e) = write_meta(cfg, &meta) {
+                logger::error(format!("quarantine record {} not updated: {e}", meta.id));
+            }
+        }
     }
     Ok(meta)
 }

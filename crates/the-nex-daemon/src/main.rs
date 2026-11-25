@@ -26,7 +26,7 @@ fn main() -> ExitCode {
             println!("{}", config::USAGE);
             ExitCode::SUCCESS
         }
-        Mode::Install => report(platform::install_service()),
+        Mode::Install => report(platform::install_service(args.fresh_data)),
         Mode::Uninstall => report(platform::uninstall_service()),
         Mode::Restore(id) => restore(id, &args),
         Mode::Delete(id) => delete(id, &args),

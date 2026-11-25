@@ -373,7 +373,8 @@ pub fn request_and_wait(
     let before = engine::read_scan_report(cfg, kind);
     request(cfg, kind)?;
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    // A scan that is running has answered, however long it takes.
+    while Instant::now() < deadline || read_progress(cfg).is_some_and(|p| p.is_live()) {
         thread::sleep(POLL_STEP);
         match engine::read_scan_report(cfg, kind) {
             Some(report) if Some(&report) != before.as_ref() => return Ok(report),

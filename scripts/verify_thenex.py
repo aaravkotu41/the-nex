@@ -432,6 +432,21 @@ def check_always_allow(daemon):
         f"disallow={removed.returncode} requarantined={bool(requarantined)} hash_in_event={recorded} {added.stderr.strip()[:120]}")
 
 
+def check_moved_folder(daemon):
+    """A folder with a decoy zip bomb deep inside is moved in whole; the bomb is found."""
+    daemon.start()
+    time.sleep(1.5)
+    folder = STAGING / "moved"
+    (folder / "deep").mkdir(parents=True)
+    (folder / "deep" / "moved_bomb.zip").write_bytes(ratio_bomb(50))
+    os.replace(folder, WATCH / "moved")
+    inside = WATCH / "moved" / "deep" / "moved_bomb.zip"
+    found = wait_until(lambda: not inside.exists() and find_event("ZIP_BOMB", "moved_bomb.zip", "QUARANTINED"), ACTION_TIMEOUT)
+    daemon.stop()
+    shutil.rmtree(WATCH / "moved", ignore_errors=True)
+    return bool(found), "the bomb inside was quarantined" if found else f"still there: {inside.exists()}"
+
+
 def check_never_scan(daemon):
     """A decoy zip bomb and a listed decoy in a never-scan folder are left alone by the live watch
     and a quick scan, the same decoys beside it are quarantined, and after --scan-again a new one
@@ -668,6 +683,7 @@ def main():
         ("Live dry-run mode", lambda: check_dry_run(daemon)),
         ("Live file check (read-only)", check_file_report),
         ("Live always-allowed file", lambda: check_always_allow(daemon)),
+        ("Live moved-in folder", lambda: check_moved_folder(daemon)),
         ("Live never-scan folder", lambda: check_never_scan(daemon)),
         ("Live scheduled scan (report only)", lambda: check_scheduled_scan(daemon)),
         ("Live startup listing (read-only)", startup_listing),

@@ -161,6 +161,10 @@ pub fn check_canary(path: &Path, index: usize) -> CanaryState {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return CanaryState::Missing,
             // A FIFO/device/directory where the canary was: tampering, not a transient error.
             Err(e) if e.kind() == io::ErrorKind::InvalidInput => return CanaryState::Modified,
+            // Another person's folder stays unreadable however long one waits.
+            Err(e) if cfg!(unix) && e.kind() == io::ErrorKind::PermissionDenied => {
+                return CanaryState::Unreadable
+            }
             Err(_) if attempt + 1 < READ_RETRIES => thread::sleep(READ_RETRY_DELAY),
             Err(_) => return CanaryState::Unreadable,
         }
@@ -485,12 +489,15 @@ impl CanaryManager {
             ));
             return;
         };
+        let found = sys
+            .process(suspect.pid)
+            .map(|p| (p.start_time(), platform::program_file(p)));
         let action = if !may_terminate(suspect.exe.as_deref(), platform::is_trusted_binary) {
             "ALERT_ONLY: the busiest writer is a properly signed app, so it was not stopped"
                 .to_string()
         } else if self.cfg.is_dry_run() {
             "DRY_RUN: would terminate process".to_string()
-        } else if sys.process(suspect.pid).is_some_and(|p| p.kill()) {
+        } else if kill_if_still(&mut sys, suspect.pid, found) {
             "TERMINATED".to_string()
         } else {
             "TERMINATE_FAILED".to_string()
@@ -519,6 +526,14 @@ impl CanaryManager {
             ),
         );
     }
+}
+
+/// Ends a process only while it is still the one that was judged: checking a signature takes time,
+/// and its number may belong to another program by now.
+fn kill_if_still(sys: &mut System, pid: Pid, found: Option<(u64, Option<PathBuf>)>) -> bool {
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, hunt_refresh_kind());
+    sys.process(pid)
+        .is_some_and(|p| Some((p.start_time(), platform::program_file(p))) == found && p.kill())
 }
 
 fn hunt_refresh_kind() -> ProcessRefreshKind {

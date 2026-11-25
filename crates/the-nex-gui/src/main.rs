@@ -29,6 +29,7 @@ use the_nex_core::skiplist::{self, SkippedPlace};
 use the_nex_core::status::{self, CanaryStatus, EngineStatus};
 
 const EVENT_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+const FEW_EVENTS_TAIL_BYTES: u64 = 256 * 1024;
 const DEFAULT_EVENT_LIMIT: usize = 200;
 const MAX_EVENT_LIMIT: usize = 5000;
 
@@ -309,25 +310,29 @@ fn merged_canaries(cfg: &AppConfig, status: Option<&EngineStatus>) -> Vec<Canary
     if local.is_empty() {
         return status.canaries.clone();
     }
-    local
-        .into_iter()
-        .map(|entry| {
-            if entry.state == "Unreadable" {
-                status
-                    .canaries
-                    .iter()
-                    .find(|c| c.path == entry.path)
-                    .cloned()
-                    .unwrap_or(entry)
-            } else {
-                entry
-            }
-        })
-        .collect()
+    let mut merged = local;
+    take_service_view(&mut merged, Some(status));
+    merged
+}
+
+fn take_service_view(canaries: &mut [CanaryStatus], status: Option<&EngineStatus>) {
+    let Some(status) = status else {
+        return;
+    };
+    for entry in canaries.iter_mut().filter(|c| c.state == "Unreadable") {
+        if let Some(seen) = status.canaries.iter().find(|c| c.path == entry.path) {
+            *entry = seen.clone();
+        }
+    }
 }
 
 #[tauri::command]
-fn get_dashboard_state() -> Result<DashboardState, String> {
+async fn get_dashboard_state() -> Result<DashboardState, String> {
+    // Off the main thread: an unreadable file or a slow disk must not freeze the window.
+    blocking(dashboard_state).await
+}
+
+fn dashboard_state() -> Result<DashboardState, String> {
     let cfg = config();
     let status = fresh_status(&cfg);
     let toggles = RuntimeToggles::load(&cfg.settings_file).map_err(|e| e.to_string())?;
@@ -413,13 +418,28 @@ fn event_matches(event: &ThreatEvent, query: &str, severity: Option<Severity>) -
 }
 
 #[tauri::command]
-fn get_events(
+async fn get_events(
+    limit: Option<usize>,
+    query: Option<String>,
+    severity: Option<String>,
+) -> Result<Vec<ThreatEvent>, String> {
+    blocking(move || recent_events(limit, query, severity)).await
+}
+
+fn recent_events(
     limit: Option<usize>,
     query: Option<String>,
     severity: Option<String>,
 ) -> Result<Vec<ThreatEvent>, String> {
     let cfg = config();
-    let events = match quarantine::read_recent_events(&cfg.events_log, EVENT_TAIL_BYTES) {
+    // The few newest, for the Home page, need no more than the end of the log.
+    let few = limit.is_some_and(|n| n <= 20) && query.as_deref().is_none_or(str::is_empty);
+    let tail = if few {
+        FEW_EVENTS_TAIL_BYTES
+    } else {
+        EVENT_TAIL_BYTES
+    };
+    let events = match quarantine::read_recent_events(&cfg.events_log, tail) {
         Ok(events) => events,
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(format!("{}: {e}", cfg.events_log.display())),
@@ -631,10 +651,13 @@ async fn run_quick_scan(remote: Option<bool>) -> Result<QuickScanReport, String>
 }
 
 #[tauri::command]
-fn list_quarantine() -> Result<Vec<QuarantineMeta>, String> {
-    let cfg = config();
-    let status = fresh_status(&cfg);
-    quarantine_records(&cfg, status.as_ref())
+async fn list_quarantine() -> Result<Vec<QuarantineMeta>, String> {
+    blocking(|| {
+        let cfg = config();
+        let status = fresh_status(&cfg);
+        quarantine_records(&cfg, status.as_ref())
+    })
+    .await
 }
 
 fn audit(cfg: &AppConfig, threat_type: &str, action: &str, meta: &QuarantineMeta) {
@@ -650,6 +673,9 @@ fn audit(cfg: &AppConfig, threat_type: &str, action: &str, meta: &QuarantineMeta
     );
 }
 
+const CAUGHT_AGAIN: &str =
+    "It can be caught again by the next scan; to keep it, use Restore and always allow instead.";
+
 #[tauri::command]
 async fn restore_quarantine(id: String) -> Result<String, String> {
     blocking(move || {
@@ -660,11 +686,14 @@ async fn restore_quarantine(id: String) -> Result<String, String> {
         match quarantine::restore_file(&id, &cfg) {
             Ok(meta) => {
                 audit(&cfg, "QUARANTINE_RESTORE", "RESTORED", &meta);
-                Ok(format!("Restored to {}", meta.original_path.display()))
+                Ok(format!(
+                    "Restored to {}. {CAUGHT_AGAIN}",
+                    meta.original_path.display()
+                ))
             }
             Err(e) if is_permission_error(&e) => {
                 elevated(&["--restore", id.as_str()])?;
-                Ok(format!("Restored {id}"))
+                Ok(format!("Restored. {CAUGHT_AGAIN}"))
             }
             Err(e) => Err(e.to_string()),
         }
@@ -925,7 +954,14 @@ async fn verify_canaries(remote: Option<bool>) -> Result<Vec<CanaryStatus>, Stri
         if dirs.is_empty() {
             return Ok(Vec::new());
         }
-        let report = canary::rearm_canaries(&dirs);
+        if !cfg.engine_enabled(Engine::Canary) {
+            return Err(
+                "Ransomware decoys is switched off. Turn it on in Protection first.".into(),
+            );
+        }
+        let mut report = canary::rearm_canaries(&dirs);
+        // Other people's decoys cannot be read from here; the service's word on them counts.
+        take_service_view(&mut report, fresh_status(&cfg).as_ref());
         if !report.iter().all(CanaryStatus::is_intact) {
             if remote == Some(true) {
                 return Err(NEEDS_LOCAL.to_string());

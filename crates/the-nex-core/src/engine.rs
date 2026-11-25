@@ -327,6 +327,33 @@ pub fn scan_path(cfg: &AppConfig, scanner: &BinaryAiScanner, path: &Path, teleme
     inspect_file(cfg, scanner, path, kind, hash, telemetry);
 }
 
+/// A folder that arrived whole: the system reports the folder and none of its files.
+fn scan_moved_folder(
+    cfg: &AppConfig,
+    scanner: &BinaryAiScanner,
+    dir: &Path,
+    telemetry: &Telemetry,
+    shutdown: &AtomicBool,
+) {
+    if should_ignore(cfg, dir) {
+        return;
+    }
+    let report = scan_tree(
+        cfg,
+        scanner,
+        std::slice::from_ref(&dir.to_path_buf()),
+        telemetry,
+        &QUICK_LIMITS,
+        &mut |_, _| !shutdown.load(Ordering::SeqCst),
+    );
+    if report.truncated {
+        logger::warn(format!(
+            "{} holds too many files to check at once; the rest is left to the next scan",
+            dir.display()
+        ));
+    }
+}
+
 /// Loads the known-malware list into `cfg`. A list that is damaged, altered or not the one
 /// this build was made with is refused whole: protection carries on without it and the
 /// refusal is logged where the owner will see it.
@@ -686,13 +713,21 @@ fn dispatch_event(event: Event, scan_tx: &Sender<PathBuf>, canary_tx: &Sender<Ca
                 ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Other
             )
     );
+    // What a folder that merely changed holds is reported file by file; one that was moved here is
+    // not. Windows says "created" for both a new folder and one moved in.
+    let arrived = matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)))
+        || (cfg!(windows) && matches!(event.kind, EventKind::Create(_)));
     for path in event.paths {
         if canary::is_canary_path(&path) {
             let _ = canary_tx.send(CanaryMsg::FsEvent(path));
-        } else if scan_relevant {
+        } else if scan_relevant && (arrived || !is_real_dir(&path)) {
             let _ = scan_tx.send(path);
         }
     }
+}
+
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
 fn build_watcher(
@@ -776,18 +811,29 @@ fn scan_worker(
             ));
             pending.clear();
         }
-        let ready: Vec<PathBuf> = pending
+        let mut ready: Vec<PathBuf> = pending
             .iter()
             .filter(|(_, seen)| seen.elapsed() >= SCAN_SETTLE)
             .map(|(path, _)| path.clone())
             .collect();
+        ready.sort(); // a folder before what is in it
         for path in ready {
             if shutdown.load(Ordering::SeqCst) {
                 break;
             }
-            pending.remove(&path);
+            // A folder inside another one that is looked at now, or a second report of it.
+            if pending.remove(&path).is_none() {
+                continue;
+            }
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                scan_path(&cfg, &scanner, &path, &telemetry)
+                if is_real_dir(&path) {
+                    pending.retain(|p, seen| {
+                        seen.elapsed() < SCAN_SETTLE || !p.starts_with(&path) || !is_real_dir(p)
+                    });
+                    scan_moved_folder(&cfg, &scanner, &path, &telemetry, &shutdown)
+                } else {
+                    scan_path(&cfg, &scanner, &path, &telemetry)
+                }
             }));
             if outcome.is_err() {
                 logger::error(format!(
@@ -1430,6 +1476,48 @@ mod tests {
         }
         scan_path(&cfg, &scanner, &bomb, &telemetry);
         assert!(!bomb.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Found by an audit: for a folder that is moved in, the system reports only the folder.
+    #[test]
+    fn a_folder_that_is_moved_in_is_scanned_and_one_that_changed_is_not_walked() {
+        let root = temp_root("moved-in");
+        let cfg = Arc::new(AppConfig::for_base_dir(&root.join("base")));
+        cfg.ensure_dirs().unwrap();
+        let folder = root.join("app");
+        fs::create_dir_all(folder.join("deep")).unwrap();
+        let program = folder.join("deep").join("decoy.exe");
+        fs::write(&program, decoy_program()).unwrap();
+        let sent = |kind: EventKind| -> Vec<PathBuf> {
+            let (tx, rx) = mpsc::channel();
+            let (canary, _keep) = mpsc::channel();
+            dispatch_event(Event::new(kind).add_path(folder.clone()), &tx, &canary);
+            drop(tx);
+            rx.iter().collect()
+        };
+        use notify::event::{DataChange, RenameMode};
+        let name = ModifyKind::Name(RenameMode::Any);
+        assert_eq!(sent(EventKind::Modify(name)), [folder.clone()]);
+        assert!(sent(EventKind::Modify(ModifyKind::Data(DataChange::Any))).is_empty());
+
+        let (tx, rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let (cfg, shutdown) = (Arc::clone(&cfg), Arc::clone(&shutdown));
+            let scanner = Arc::new(BinaryAiScanner::with_fixed_score(0.99));
+            thread::spawn(move || scan_worker(cfg, scanner, Arc::default(), rx, shutdown))
+        };
+        tx.send(folder.clone()).unwrap();
+        tx.send(folder.join("deep")).unwrap(); // reported as well: looked at once
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while program.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        shutdown.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+        assert!(!program.exists(), "quarantined");
+        assert_eq!(events_of(&cfg, "MALWARE_AI").len(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 

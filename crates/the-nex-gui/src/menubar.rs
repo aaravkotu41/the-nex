@@ -16,7 +16,7 @@ use crate::quitguard::IN_MENU_BAR;
 const STATUS_REFRESH: Duration = Duration::from_secs(15);
 
 fn status_text() -> String {
-    let Ok(state) = crate::get_dashboard_state() else {
+    let Ok(state) = crate::dashboard_state() else {
         return "Engine service offline".into();
     };
     let t = &state.toggles;

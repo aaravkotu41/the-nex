@@ -3,7 +3,7 @@ use crate::config::{self, AppConfig};
 use crate::known_bad;
 use crate::logger;
 use crate::quarantine;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, Permissions};
@@ -258,6 +258,57 @@ fn kernel_path(pid: u32) -> Option<PathBuf> {
     buffer.truncate(usize::try_from(len).ok().filter(|&len| len > 0)?);
     buffer.shrink_to_fit();
     Some(std::ffi::OsString::from_vec(buffer).into())
+}
+
+/// Every process, with what the kernel changes when it becomes another program (or its number is
+/// used again). One cheap call per process, where reading what each one runs is not.
+pub fn process_versions() -> Option<HashMap<u32, (u64, i32)>> {
+    /// `proc_uniqidentifierinfo` of the system's <sys/proc_info.h>.
+    #[repr(C)]
+    struct UniqueIdentifier {
+        uuid: [u8; 16],
+        unique_id: u64,
+        parent_unique_id: u64,
+        id_version: i32,
+        parent_id_version: i32,
+        reserved: [u64; 2],
+    }
+    const PROC_PIDUNIQIDENTIFIERINFO: i32 = 17;
+    const SIZE: i32 = size_of::<UniqueIdentifier>() as i32;
+    // SAFETY: with no buffer the call only answers how many there are.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    // Room for processes that start in between.
+    let mut pids = vec![0i32; usize::try_from(count).ok().filter(|&n| n > 0)? + 64];
+    // SAFETY: the buffer is writable for the length passed, in bytes; the call returns how many
+    // numbers it wrote.
+    let count = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr().cast(),
+            i32::try_from(size_of_val(pids.as_slice())).ok()?,
+        )
+    };
+    pids.truncate(usize::try_from(count).ok().filter(|&n| n > 0)?);
+    let version = |pid: i32| {
+        let mut info = std::mem::MaybeUninit::<UniqueIdentifier>::zeroed();
+        // SAFETY: `info` is writable for SIZE bytes, and any bytes are a valid UniqueIdentifier.
+        unsafe {
+            let wrote = libc::proc_pidinfo(
+                pid,
+                PROC_PIDUNIQIDENTIFIERINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                SIZE,
+            );
+            let info = info.assume_init();
+            (wrote == SIZE).then_some((info.unique_id, info.id_version))
+        }
+    };
+    let all: HashMap<u32, (u64, i32)> = pids
+        .into_iter()
+        .filter_map(|pid| Some((u32::try_from(pid).ok()?, version(pid).unwrap_or_default())))
+        .collect();
+    // Our own must be told: if not, this system answers nothing of use.
+    (all.get(&std::process::id()).copied().unwrap_or_default() != (0, 0)).then_some(all)
 }
 
 /// The file a process runs, only as far as the kernel vouches for it: nothing a program writes
@@ -578,7 +629,8 @@ fn write_root_file(src: &mut dyn io::Read, dest: &Path, mode: u32) -> Result<(),
     fs::rename(&tmp, dest).map_err(err)
 }
 
-pub fn install_service() -> Result<String, String> {
+/// `_fresh_data` is for the Windows installer.
+pub fn install_service(_fresh_data: bool) -> Result<String, String> {
     require_root()?;
     let exe = env::current_exe()
         .and_then(fs::canonicalize)
