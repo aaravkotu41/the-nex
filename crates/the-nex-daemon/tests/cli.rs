@@ -402,19 +402,23 @@ fn always_allow_commands_work_end_to_end_in_a_temp_data_folder() {
     let unhashed = event("MALWARE_AI", "ALERT_ONLY", None);
 
     // --expect binds it to the hash a prompt showed: another one changes nothing.
-    let shown = &meta.sha256[..16];
+    let shown = meta.sha256.as_str();
+    // The 16 digits a prompt shows are right here, and the rest is another file's.
+    let same_start = format!("{}{}", &shown[..16], "0".repeat(48));
     for (mode, id) in [
         ("--allow-event", zip.id.as_str()),
         ("--allow-quarantined", meta.id.as_str()),
     ] {
-        let out = sandbox.run_with_overrides(&[mode, id, "--expect", "0123456789abcdef"]);
-        assert_eq!(out.status.code(), Some(1), "{mode}: {}", describe(&out));
-        assert!(
-            stderr(&out).contains("nothing was allowed"),
-            "{}",
-            describe(&out)
-        );
-        for bad in ["", "abc", "zzzzzzzzzzzzzzzz", meta.sha256.as_str()] {
+        for other in [&"0123456789abcdef".repeat(4), &same_start] {
+            let out = sandbox.run_with_overrides(&[mode, id, "--expect", other]);
+            assert_eq!(out.status.code(), Some(1), "{mode}: {}", describe(&out));
+            assert!(
+                stderr(&out).contains("nothing was allowed"),
+                "{}",
+                describe(&out)
+            );
+        }
+        for bad in ["", "abc", &"z".repeat(64), &shown[..16]] {
             let out = sandbox.run_with_overrides(&[mode, id, "--expect", bad]);
             assert_eq!(out.status.code(), Some(2), "{mode} {bad}");
         }

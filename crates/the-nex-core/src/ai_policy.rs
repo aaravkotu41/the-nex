@@ -14,6 +14,7 @@
 //!  7. Dry-run always wins: the action is reported, never performed.
 //!  8. Every action carries a non-empty explanation, else it is downgraded to an alert.
 
+use crate::platform;
 use std::path::{Path, PathBuf};
 
 pub const MIN_THRESHOLD: f32 = 0.5;
@@ -73,6 +74,10 @@ fn norm(path: &Path) -> String {
 /// prefix and therefore never matches an OS path (D:\Windows\System32 is not the OS).
 fn norm_on(path: &Path, system_drive: &str) -> String {
     let mut s = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    if cfg!(target_os = "macos") {
+        // The disk takes "ſ" for "s": /System/Volumeſ/Data is the Data volume, not an OS path.
+        s = s.replace('\u{17f}', "s");
+    }
     // Win32 extended/device/NT prefixes: \\?\C:\x, \\?\UNC\h\s, \\.\C:\x, \??\C:\x
     if let Some(rest) = s.strip_prefix("//?/unc/") {
         s = format!("//{rest}");
@@ -151,7 +156,13 @@ const WINDOWS_USER_WRITABLE: &[&str] = &[
     "logfiles",
 ];
 
+/// Only for one plain long spelling (see `odd_spelling`): `tasks.` and `TASKS~1` are the
+/// user-writable folder the list below would not recognise.
 fn is_windows_os_path(p: &str) -> bool {
+    !platform::odd_spelling(p, true) && under_windows_os_root(p)
+}
+
+fn under_windows_os_root(p: &str) -> bool {
     WINDOWS_OS_ROOTS.iter().any(|root| {
         within(p, root)
             && !WINDOWS_USER_WRITABLE
@@ -191,6 +202,15 @@ pub fn is_os_folder(path: &Path) -> bool {
         && (CRITICAL_ROOTS.iter().any(|r| within(&p, r)) || is_windows_os_path(&p))
 }
 
+/// A file directly in C:\Windows (explorer.exe, regedit.exe): a system tool, though that folder is
+/// not one of the protected ones.
+pub fn is_windows_folder_file(path: &Path) -> bool {
+    let p = norm(path);
+    !platform::odd_spelling(&p, true)
+        && p.strip_prefix("/windows/")
+            .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+}
+
 /// OS-critical paths and The Nex's own binaries (and, via `is_own_data`, its data directory).
 /// Callers spare what it names, so it vouches for nothing it cannot verify (see `is_os_folder`).
 pub fn is_os_critical_path(path: &Path) -> bool {
@@ -205,6 +225,11 @@ fn is_own_data(path: &Path, data_dir: &Path) -> bool {
     within(&norm(path), &norm(data_dir))
 }
 
+/// A path that is OS-critical or The Nex's own as it is written. Never with "..": see above.
+pub fn is_protected_location(path: &Path, data_dir: &Path) -> bool {
+    !has_parent_component(path) && (is_os_critical_path(path) || is_own_data(path, data_dir))
+}
+
 /// The one decision point. Pure apart from reading the daemon's own executable location.
 pub fn decide(req: &Request<'_>) -> Action {
     let threshold = effective_threshold(req.threshold);
@@ -215,8 +240,9 @@ pub fn decide(req: &Request<'_>) -> Action {
         return Action::Ignore;
     }
     if has_parent_component(req.path)
-        || is_os_critical_path(req.path)
-        || is_own_data(req.path, req.data_dir)
+        || is_protected_location(req.path, req.data_dir)
+        // However oddly it is spelled: it may well be the system's own.
+        || under_windows_os_root(&norm(req.path))
     {
         return Action::Alert("protected location or The Nex's own file; alert only");
     }
@@ -402,6 +428,73 @@ mod tests {
                 Action::Quarantine,
                 "{p}"
             );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_data_volume_is_not_the_system_however_its_s_is_written() {
+        for p in [
+            "/System/Volume\u{17f}/Data/Users/x/Downloads/evil",
+            "/\u{17f}y\u{17f}tem/Volumes/Data/private/tmp/evil",
+            "/SYSTEM/VOLUME\u{17f}/DATA/Users/x/evil",
+        ] {
+            let path = Path::new(p);
+            assert!(!is_os_critical_path(path), "{p}");
+            assert_eq!(decide(&req(path, 1.0, Target::File)), Action::Quarantine);
+            assert_eq!(
+                decide(&req(path, 1.0, Target::Process { preexisting: false })),
+                Action::TerminateAndQuarantine
+            );
+        }
+        // The system itself stays protected in that spelling too.
+        let os = Path::new("/\u{17f}ystem/Library/x");
+        assert!(matches!(
+            decide(&req(os, 1.0, Target::File)),
+            Action::Alert(_)
+        ));
+    }
+
+    #[test]
+    fn a_windows_system_path_counts_only_in_its_plain_long_spelling() {
+        for p in [
+            "C:\\Windows\\System32\\Tasks.\\evil.exe",
+            "C:\\Windows\\System32\\Tasks \\evil.exe",
+            "C:\\Windows\\System32\\Tasks::$INDEX_ALLOCATION\\evil.exe",
+            "C:\\Windows\\System32\\spool\\DRIVER~1\\color\\evil.exe",
+            "C:\\Windows\\SysWOW64\\TASKS~2\\evil.exe",
+            "\\\\?\\C:\\Windows\\System32\\LOGFIL~1\\evil.exe",
+        ] {
+            let path = Path::new(p);
+            assert!(!is_os_folder(path) && !is_os_critical_path(path), "{p}");
+            // It cannot be told from the system's own file either, so it is only reported.
+            assert!(
+                matches!(decide(&req(path, 1.0, Target::File)), Action::Alert(_)),
+                "{p}"
+            );
+        }
+        for p in [
+            "C:\\Windows\\System32\\cmd.exe",
+            "C:\\Windows\\System32\\a~b\\x.exe",
+            "C:\\Windows\\WinSxS\\amd64_x_31bf3856ad364e35_10.0.1_none_a\\y.dll",
+        ] {
+            assert!(is_os_folder(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn files_directly_in_the_windows_folder_are_system_tools() {
+        for p in ["C:\\Windows\\explorer.exe", "c:/windows/REGEDIT.exe"] {
+            assert!(is_windows_folder_file(Path::new(p)), "{p}");
+        }
+        for p in [
+            "C:\\Windows\\Temp\\a.exe",
+            "D:\\Windows\\explorer.exe",
+            "C:\\Windows\\",
+            "C:\\Windows\\a.exe:b",
+            "C:\\Users\\x\\explorer.exe",
+        ] {
+            assert!(!is_windows_folder_file(Path::new(p)), "{p}");
         }
     }
 

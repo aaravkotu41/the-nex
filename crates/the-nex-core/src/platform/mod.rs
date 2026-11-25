@@ -64,15 +64,24 @@ pub(crate) fn has_parent_dir(path: &std::path::Path) -> bool {
 }
 
 /// True when a full path is not spelled the one plain way: an empty, "." or ".." part, or on
-/// Windows (where the system drops them) a trailing dot or space, or a stream name. A check that
-/// compares path text must not trust such a path: the file it leads to may be somewhere else.
+/// Windows a trailing dot or space (which the system drops), a stream name, or a short name
+/// ("PROGRA~1"). A check that compares path text must not trust such a path: the file it leads to
+/// may be somewhere else.
 pub(crate) fn odd_spelling(path: &str, windows: bool) -> bool {
     path.split(|c| c == '/' || (windows && c == '\\'))
         .skip(1)
         .any(|part| {
             matches!(part, "" | "." | "..")
-                || (windows && (part.ends_with(['.', ' ']) || part.contains(':')))
+                || (windows
+                    && (part.ends_with(['.', ' ']) || part.contains(':') || has_short_name(part)))
         })
+}
+
+/// "~" and a digit, as in the short names Windows makes.
+fn has_short_name(part: &str) -> bool {
+    part.as_bytes()
+        .windows(2)
+        .any(|pair| pair[0] == b'~' && pair[1].is_ascii_digit())
 }
 
 pub fn is_protected_process(pid: u32, name: &str) -> bool {
@@ -193,10 +202,14 @@ mod tests {
             r"c:\windows\system32\spool \a.exe",
             r"c:\windows\system32\spool::$index_allocation\a.exe",
             r"\\host\share\a.exe",
+            r"c:\windows\system32\spool\driver~1\color\a.exe",
+            r"c:\program files\vendor\tempfo~2.x\a.exe",
         ] {
             assert!(odd_spelling(path, true), "{path}");
         }
+        assert!(!odd_spelling(r"c:\windows\a~b\~c.exe", true));
         assert!(!odd_spelling("/usr/bin/a..b/c.", false));
+        assert!(!odd_spelling("/usr/bin/a~1", false));
         for path in ["/usr//bin/a", "/usr/./a", "/usr/../a", "//usr/a"] {
             assert!(odd_spelling(path, false), "{path}");
         }

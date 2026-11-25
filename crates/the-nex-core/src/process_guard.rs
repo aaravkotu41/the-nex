@@ -228,6 +228,24 @@ fn is_protected(
     exe.is_some_and(|exe| ai_policy::is_os_critical_path(exe) || signed(exe))
 }
 
+/// The file a process runs. The system reports the path it was started by: through a link or
+/// with "..", that is not where the file is. Kept as reported when it cannot be resolved, or
+/// when it is a protected place as it is written: what was spared stays spared. A relative path
+/// is not resolved, because it would be looked up in this program's own folder.
+fn real_path(reported: &Path, data_dir: &Path) -> PathBuf {
+    if !reported.is_absolute() || ai_policy::is_protected_location(reported, data_dir) {
+        return reported.to_path_buf();
+    }
+    let Ok(real) = fs::canonicalize(reported) else {
+        return reported.to_path_buf();
+    };
+    // Windows answers \\?\C:\x; people and the event log know it as C:\x.
+    match real.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(plain) if plain.as_bytes().get(1) == Some(&b':') => PathBuf::from(plain),
+        _ => real,
+    }
+}
+
 pub struct ProcessGuard {
     cfg: Arc<AppConfig>,
     scanner: Arc<BinaryAiScanner>,
@@ -386,9 +404,10 @@ impl ProcessGuard {
             return;
         };
         let name = process_name(process);
-        let Some(exe) = process.exe().map(Path::to_path_buf) else {
+        let Some(reported) = process.exe().map(Path::to_path_buf) else {
             return;
         };
+        let exe = real_path(&reported, &self.cfg.base_dir);
         if !crate::engine::is_regular_file(&exe) {
             return;
         }
@@ -397,7 +416,8 @@ impl ProcessGuard {
         if listed && self.respond_known_bad(pid, &name, &exe, preexisting) {
             return;
         }
-        if ai {
+        // Trusted by either spelling is trusted.
+        if ai && !(reported != exe && self.is_trusted(&reported)) {
             self.scan_executable(pid, &name, &exe, preexisting);
         }
     }
@@ -580,10 +600,9 @@ impl ProcessGuard {
             .processes()
             .iter()
             .filter(|(pid, process)| {
-                process
-                    .exe()
-                    .is_some_and(|candidate| platform::path_key(candidate) == target)
-                    && !self.ancestors.contains(pid)
+                process.exe().is_some_and(|reported| {
+                    platform::path_key(&real_path(reported, &self.cfg.base_dir)) == target
+                }) && !self.ancestors.contains(pid)
                     && !self.baseline.contains(&(**pid, process.start_time()))
                     && !is_protected(pid.as_u32(), &process_name(process), process.exe(), |_| {
                         false
@@ -1342,6 +1361,134 @@ mod tests {
         for child in [&mut old, &mut signed] {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A guard whose known-malware list holds exactly `listed`.
+    #[cfg(target_os = "macos")]
+    fn guard_with_list(dir: &Path, listed: &[&Path], scanner: BinaryAiScanner) -> ProcessGuard {
+        let mut cfg = AppConfig::for_base_dir(&dir.join("base"));
+        cfg.ensure_dirs().unwrap();
+        let digests: Vec<Digest32> = listed
+            .iter()
+            .map(|p| known_bad::hash_file(p, u64::MAX).unwrap())
+            .collect();
+        let list = dir.join("list.bin");
+        known_bad::write_list(&list, &digests, 1_795_000_000).unwrap();
+        cfg.hash_list = Some(list);
+        cfg.load_known_bad().unwrap();
+        ProcessGuard::new(
+            Arc::new(cfg),
+            Arc::new(scanner),
+            Arc::new(Telemetry::default()),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn actions(g: &ProcessGuard) -> Vec<String> {
+        quarantine::read_recent_events(&g.cfg.events_log, 1 << 20)
+            .unwrap_or_default()
+            .into_iter()
+            .rev() // oldest first
+            .map(|e| format!("{}: {}", e.threat_type, e.action_taken))
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_program_started_through_a_link_is_judged_as_the_file_it_is() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("thenex-pg-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("in")).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
+        let (exe, other, link) = (dir.join("napper"), dir.join("other"), dir.join("link"));
+        // `other` is another file: whatever is done about `exe` is not done about it.
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        fs::copy(&exe, &other).unwrap();
+        symlink(&exe, &link).unwrap();
+        let dotted = dir.join("in").join("..").join("napper");
+        for (round, started_by) in [&link, &dotted].into_iter().enumerate() {
+            if !exe.exists() {
+                fs::copy(&other, &exe).unwrap(); // quarantined by the round before
+            }
+            let base = dir.join(format!("round{round}"));
+            fs::create_dir_all(&base).unwrap();
+            let mut g = guard_with_list(&base, &[&exe], BinaryAiScanner::heuristic_only());
+            let mut children = [spawn_napper(started_by), spawn_napper(&exe)];
+            let mut bystander = spawn_napper(&other);
+            let pids: Vec<Pid> = children.iter().map(|c| Pid::from_u32(c.id())).collect();
+            refresh_until_seen(&mut g, &pids);
+            refresh_until_seen(&mut g, &[Pid::from_u32(bystander.id())]);
+            assert_eq!(
+                g.sys.process(pids[0]).unwrap().exe(),
+                Some(started_by.as_path()),
+                "the system reports the path it was started by"
+            );
+            g.inspect_binary(pids[0], false);
+            let seen = actions(&g);
+            assert!(
+                seen.len() == 1
+                    && seen[0]
+                        .starts_with("KNOWN_MALWARE: TERMINATED 2 process(es); QUARANTINED id="),
+                "{}: {seen:?}",
+                started_by.display()
+            );
+            assert!(children.iter_mut().all(|c| c.wait().is_ok()) && !exe.exists());
+            assert!(bystander.try_wait().unwrap().is_none());
+            let _ = bystander.kill();
+            let _ = bystander.wait();
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_system_program_is_spared_whichever_way_it_is_spelled() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("thenex-pg-oslink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
+        let sleep = Path::new("/bin/sleep");
+        let link = dir.join("link");
+        symlink(sleep, &link).unwrap();
+        // On the list by mistake, and scored as certain malware by the AI.
+        let mut g = guard_with_list(&dir, &[sleep], BinaryAiScanner::with_fixed_score(0.99));
+        let mut child = std::process::Command::new(&link).arg("60").spawn().unwrap();
+        let pid = Pid::from_u32(child.id());
+        refresh_until_seen(&mut g, &[pid]);
+        g.inspect_binary(pid, false);
+        assert_eq!(
+            actions(&g),
+            ["KNOWN_MALWARE: ALERT_ONLY: signed by the operating system vendor; alert only"]
+        );
+        // Without the list the AI does not judge it either: the system's own is trusted.
+        let empty = dir.join("ai");
+        fs::create_dir_all(&empty).unwrap();
+        let mut g = guard_with_list(&empty, &[], BinaryAiScanner::with_fixed_score(0.99));
+        refresh_until_seen(&mut g, &[pid]);
+        g.inspect_binary(pid, false);
+        assert!(actions(&g).is_empty(), "{:?}", actions(&g));
+        assert!(child.try_wait().unwrap().is_none() && sleep.exists());
+        let _ = child.kill();
+        let _ = child.wait();
+
+        // The path as it is written can be the protected one, too: the data folder here.
+        let data = dir.join("base");
+        let inside = data.join("tool");
+        fs::write(dir.join("elsewhere"), b"x").unwrap();
+        symlink(dir.join("elsewhere"), &inside).unwrap();
+        assert_eq!(real_path(&inside, &data), inside);
+        assert_eq!(real_path(&link, &data), sleep);
+        // ".." never makes it protected, and what cannot be resolved stays as it is.
+        assert_eq!(
+            real_path(&data.join("..").join("elsewhere"), &data),
+            dir.join("elsewhere")
+        );
+        for odd in ["/nonexistent/x", "bin/sleep", "./x"] {
+            assert_eq!(real_path(Path::new(odd), &data), Path::new(odd));
         }
         let _ = fs::remove_dir_all(&dir);
     }

@@ -19,7 +19,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -32,10 +31,8 @@ const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_LOG_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_LOG_LINE: u64 = 1024 * 1024;
 const PROMPT_NAME_CHARS: usize = 60;
-/// A change to the list waits this long for another one to finish; a lock older than
-/// `STALE_LOCK` was left by a crash.
+/// How long one change waits for another to finish.
 const LOCK_WAIT: Duration = Duration::from_secs(3);
-const STALE_LOCK: Duration = Duration::from_secs(30);
 /// Detections an entry can cover: whole files judged by an estimating engine. `MANUAL` is for
 /// an entry added by hand from the command line.
 pub const ALLOWABLE_TYPES: &[&str] = &["MALWARE_AI", "MALWARE_AI_PROCESS", "ZIP_BOMB", "MANUAL"];
@@ -107,28 +104,16 @@ pub fn prompt_name(name: &str) -> String {
 
 const PREFIX_CHARS: usize = 16;
 
-/// The start of a SHA-256: what a prompt shows and what `--expect` must match.
+/// The start of a SHA-256: what a prompt shows. `--expect` takes all of it.
 pub fn shown_prefix(sha256: &str) -> &str {
     sha256.get(..PREFIX_CHARS).unwrap_or(sha256)
 }
 
-/// `--expect`: exactly as many hex digits as a prompt shows, returned lower-case.
-pub fn parse_prefix(text: &str) -> Result<String, String> {
-    if text.len() == PREFIX_CHARS && text.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Ok(text.to_ascii_lowercase())
-    } else {
-        Err(format!(
-            "--expect takes {PREFIX_CHARS} hexadecimal characters"
-        ))
-    }
-}
-
-/// Refuses a recorded SHA-256 other than the one the person was shown.
+/// Refuses a recorded SHA-256 other than exactly the one the person was asked about.
 pub fn check_expected(sha256: &str, expect: Option<&str>) -> Result<(), String> {
     match expect {
-        Some(prefix) if !sha256.to_ascii_lowercase().starts_with(prefix) => Err(format!(
-            "the recorded SHA-256 starts with {}, not with {prefix}, so nothing was allowed",
-            shown_prefix(sha256)
+        Some(expect) if !sha256.eq_ignore_ascii_case(expect) => Err(format!(
+            "the recorded SHA-256 is {sha256}, not {expect}, so nothing was allowed"
         )),
         _ => Ok(()),
     }
@@ -443,85 +428,35 @@ fn check_with(
     (digest, allowed)
 }
 
-/// Holds the list's lock file; dropping it lets the next change go ahead. The file holds this
-/// holder's own token, so a holder whose stale lock was taken over never removes the new one.
-struct UpdateLock {
-    path: PathBuf,
-    token: String,
-}
-
-impl Drop for UpdateLock {
-    fn drop(&mut self) {
-        if fs::read_to_string(&self.path).is_ok_and(|t| t == self.token) {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// Old enough to be a crash's leftover. A modified time in the future (a made-up or skewed one)
-/// counts as stale too, so such a lock cannot block changes forever.
-fn lock_is_stale(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .and_then(|m| m.modified())
-        .is_ok_and(|t| t.elapsed().map_or(true, |age| age > STALE_LOCK))
-}
-
-/// Clears a stale lock (a file, or a directory someone put there). It is moved aside first and
-/// looked at again: if another change took over in the meantime and what was moved is a fresh
-/// lock, it is put back instead of being deleted.
-fn clear_stale_lock(path: &Path) {
-    static ASIDE: AtomicU64 = AtomicU64::new(0);
-    let aside = path.with_extension(format!(
-        "lock.stale-{}-{}",
-        std::process::id(),
-        ASIDE.fetch_add(1, Ordering::Relaxed)
-    ));
-    if fs::rename(path, &aside).is_err() {
-        return; // someone else cleared it first
-    }
-    if !lock_is_stale(&aside) {
-        let _ = fs::hard_link(&aside, path); // fails when yet another lock exists: then it stays gone
-    }
-    let _ = fs::remove_file(&aside).or_else(|_| fs::remove_dir(&aside));
-}
-
-/// One change to the list at a time (an exclusive create of a lock file beside it). A lock a
-/// crash left behind goes stale after `STALE_LOCK`.
-fn lock(cfg: &AppConfig, wait: Duration) -> io::Result<UpdateLock> {
-    static TOKENS: AtomicU64 = AtomicU64::new(0);
+/// One change to the list at a time: the system's own lock on a file beside it, released when
+/// the returned file is dropped, also by a crash. Only its owner can open the file, so another
+/// user cannot hold the lock to block changes.
+fn lock(cfg: &AppConfig, wait: Duration) -> io::Result<fs::File> {
     if let Some(parent) = cfg.allowed_file.parent() {
         fs::create_dir_all(parent)?;
     }
-    let path = cfg.allowed_file.with_extension("json.lock");
-    let token = format!(
-        "{}-{}",
-        std::process::id(),
-        TOKENS.fetch_add(1, Ordering::Relaxed)
-    );
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(cfg.allowed_file.with_extension("json.lock"))?;
     let started = Instant::now();
     loop {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                io::Write::write_all(&mut file, token.as_bytes())?;
-                return Ok(UpdateLock { path, token });
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if started.elapsed() < wait => {
+                std::thread::sleep(Duration::from_millis(20));
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                if lock_is_stale(&path) {
-                    clear_stale_lock(&path);
-                } else if started.elapsed() >= wait {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "another change to the always-allowed list is in progress; try again",
-                    ));
-                } else {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "another change to the always-allowed list is in progress; try again",
+                ));
             }
-            Err(e) => return Err(e),
+            Err(fs::TryLockError::Error(e)) => return Err(e),
         }
     }
 }
@@ -1157,52 +1092,6 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_with_a_future_time_or_a_directory_does_not_block_changes_forever() {
-        let dir = temp("oddlock");
-        let cfg = AppConfig::for_base_dir(&dir);
-        cfg.ensure_dirs().unwrap();
-        let held = cfg.allowed_file.with_extension("json.lock");
-        fs::write(&held, b"x").unwrap();
-        fs::File::options()
-            .write(true)
-            .open(&held)
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() + Duration::from_secs(86_400))
-            .unwrap();
-        drop(lock(&cfg, Duration::from_millis(80)).unwrap());
-        assert!(!held.exists());
-        // A directory in its place, left long ago.
-        #[cfg(unix)]
-        {
-            fs::create_dir(&held).unwrap();
-            fs::File::open(&held)
-                .unwrap()
-                .set_modified(std::time::SystemTime::now() - STALE_LOCK - Duration::from_secs(5))
-                .unwrap();
-            drop(lock(&cfg, Duration::from_millis(80)).unwrap());
-            assert!(!held.exists());
-        }
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_holder_never_removes_a_lock_that_is_no_longer_its_own() {
-        let dir = temp("tokenlock");
-        let cfg = AppConfig::for_base_dir(&dir);
-        cfg.ensure_dirs().unwrap();
-        let held = cfg.allowed_file.with_extension("json.lock");
-        let mine = lock(&cfg, Duration::from_millis(80)).unwrap();
-        // Another change took over this one (it looked stale) and holds its own lock now.
-        fs::write(&held, b"someone-else").unwrap();
-        drop(mine);
-        assert_eq!(fs::read(&held).unwrap(), b"someone-else");
-        // A fresh lock is not cleared by a taker that looked a moment too late.
-        clear_stale_lock(&held);
-        assert_eq!(fs::read(&held).unwrap(), b"someone-else");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn a_failed_read_is_retried_but_a_verdict_on_the_content_is_kept() {
         let dir = temp("retry");
         let file = dir.join(FILE_NAME);
@@ -1233,23 +1122,16 @@ mod tests {
             }
         });
         assert_eq!(load(&cfg.allowed_file, false).unwrap().len(), 12);
-        assert!(!cfg.allowed_file.with_extension("json.lock").exists());
 
-        // A lock someone holds makes the change wait and then give up; a stale one is cleared.
-        let held = cfg.allowed_file.with_extension("json.lock");
-        fs::write(&held, b"").unwrap();
+        // A lock someone holds makes the change wait and then give up; a leftover file is no lock.
+        let held = lock(&cfg, Duration::from_millis(80)).unwrap();
         let started = Instant::now();
         let timeout = lock(&cfg, Duration::from_millis(80)).err().unwrap();
         assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2));
-        fs::File::options()
-            .write(true)
-            .open(&held)
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() - STALE_LOCK - Duration::from_secs(5))
-            .unwrap();
+        drop(held);
+        assert!(cfg.allowed_file.with_extension("json.lock").exists());
         drop(lock(&cfg, Duration::from_millis(80)).unwrap());
-        assert!(!held.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

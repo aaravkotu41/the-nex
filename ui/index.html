@@ -382,12 +382,12 @@
               <h2>Startup programs</h2>
               <button class="btn" id="startup-check">Check startup programs</button>
             </div>
-            <p class="muted small startup-note">Lists what starts by itself when this computer starts or you log in, and what The Nex makes of each one. The Nex only looks: nothing is turned off, moved, deleted or sent anywhere.</p>
+            <p class="muted small startup-note">Lists what starts by itself when this computer starts or you log in, and what The Nex makes of each one. The Nex only looks: nothing is turned off, moved, deleted or sent anywhere. It checks the program file, not what the program loads or is told to do, and some malware gets past it.</p>
             <div class="sev-tiles" id="startup-tiles" hidden>
               <button class="pill-filter active" data-filter="all" aria-pressed="true"><b id="startup-count-all">0</b>All items</button>
               <button class="pill-filter" data-filter="suspicious" aria-pressed="false"><b id="startup-count-suspicious">0</b>Suspicious</button>
               <button class="pill-filter" data-filter="worth_a_look" aria-pressed="false"><b id="startup-count-worth_a_look">0</b>Worth a look</button>
-              <button class="pill-filter" data-filter="nothing_found" aria-pressed="false"><b id="startup-count-nothing_found">0</b>Nothing suspicious found</button>
+              <button class="pill-filter" data-filter="nothing_found" aria-pressed="false"><b id="startup-count-nothing_found">0</b>No warning signs</button>
               <button class="pill-filter" data-filter="not_checked" aria-pressed="false"><b id="startup-count-not_checked">0</b>Not checked</button>
             </div>
             <p class="muted small" id="startup-status" aria-live="polite">Nothing has been checked yet. Press the button to look.</p>

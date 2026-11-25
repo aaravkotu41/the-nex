@@ -59,8 +59,8 @@ Modes:
                             this engine recorded in its own event log (what the app uses)
   --disallow <SHA256>       remove a file from the always-allowed list
   --allow-quarantined <ID>  restore a quarantined file and always allow that exact file
-  --expect <16 HEX>         with --allow-event or --allow-quarantined: refuse unless the recorded
-                            SHA-256 starts with this (the app passes what its prompt showed)
+  --expect <SHA256>         with --allow-event or --allow-quarantined: refuse unless the recorded
+                            SHA-256 is exactly this (the app passes the one it asked about)
   --list-allowed            print the always-allowed list as JSON
   --help                    show this help
 
@@ -263,9 +263,9 @@ where
                 None
             }
             "--expect" => {
-                expect = Some(allowlist::parse_prefix(&take_value(
-                    &mut iter, "--expect",
-                )?)?);
+                let value = take_value(&mut iter, "--expect")?;
+                expect =
+                    Some(allowlist::parse_sha256(&value).map_err(|e| format!("--expect: {e}"))?);
                 None
             }
             "--set" => {
@@ -1036,16 +1036,15 @@ mod tests {
             Mode::AllowEvent("20260101-1-0001".to_string())
         );
         for mode in ["--allow-event", "--allow-quarantined"] {
-            let parsed = parse(&[mode, "x1", "--expect", "ABcdef0123456789"]).unwrap();
-            assert_eq!(parsed.expect.as_deref(), Some("abcdef0123456789"));
+            let parsed = parse(&[mode, "x1", "--expect", &sha.to_uppercase()]).unwrap();
+            assert_eq!(parsed.expect, Some(sha.to_lowercase()));
         }
         for bad in [
             vec!["--allow-event", "x", "--expect"],
-            vec!["--allow-event", "x", "--expect", "abcdef012345678"],
-            vec!["--allow-event", "x", "--expect", "abcdef01234567890"],
-            vec!["--allow-event", "x", "--expect", "abcdef012345678g"],
-            vec!["--allow", &sha, "--expect", "abcdef0123456789"],
-            vec!["--expect", "abcdef0123456789"],
+            vec!["--allow-event", "x", "--expect", "abcdef0123456789"],
+            vec!["--allow-event", "x", "--expect", &sha[1..]],
+            vec!["--allow", &sha, "--expect", &sha],
+            vec!["--expect", &sha],
             vec!["--allow-event"],
             vec!["--allow-event", "../etc"],
             vec!["--allow-event", "a b"],

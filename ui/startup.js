@@ -23,11 +23,12 @@
   /** `table[key]`, own entries only: a key comes from a file anyone can write ("constructor"). */
   const lookup = (table, key) => (Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined);
 
-  /** The pill for a verdict. Never says "safe": the best answer is that nothing was found. */
+  /** The pill for a verdict. Never says "safe" and is never green: the best answer is only that
+   *  the program file showed no warning signs. */
   function pillFor(verdict) {
     if (verdict === "suspicious") return { tone: "red", pill: "Suspicious" };
     if (verdict === "worth_a_look") return { tone: "amber", pill: "Worth a look" };
-    if (verdict === "nothing_found") return { tone: "green", pill: "Nothing suspicious found" };
+    if (verdict === "nothing_found") return { tone: "gray", pill: "No warning signs" };
     return { tone: "gray", pill: "Not checked" };
   }
 
@@ -73,7 +74,7 @@
   function status(report) {
     const { counts } = summarize(report);
     const parts = [counts.all === 1 ? "Checked 1 startup item." : `Checked ${counts.all} startup items.`];
-    if (report.truncated) parts.push("There are more than could be listed here, so some are missing.");
+    if (report.truncated) parts.push("Not everything could be listed or checked, because there was too much or the time ran out.");
     parts.push(UNCHANGED);
     return parts.join(" ");
   }

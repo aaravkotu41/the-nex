@@ -267,13 +267,14 @@ pub fn is_os_vendor_signed(path: &Path) -> bool {
 pub fn is_signed_by(path: &Path, vendor: &str) -> Option<bool> {
     Some(match vendor {
         "Apple" => is_os_vendor_signed(path),
-        "Microsoft" => satisfies_requirement(
-            path,
-            "-R=anchor apple generic and certificate leaf[subject.OU] = UBF8T346G9",
-        ),
+        "Microsoft" => satisfies_requirement(path, SIGNED_BY_MICROSOFT),
         _ => false,
     })
 }
+
+/// A Developer ID of Microsoft's own team: any other maker's must not do.
+const SIGNED_BY_MICROSOFT: &str =
+    "-R=anchor apple generic and certificate leaf[subject.OU] = UBF8T346G9";
 
 /// SIP-protected system paths, or a valid signature chaining to Apple (Apple / Developer ID).
 pub fn is_trusted_binary(path: &Path) -> bool {
@@ -976,6 +977,27 @@ mod tests {
             Path::new("/Users/Ab/x"),
             Path::new("/Users/A")
         ));
+    }
+
+    #[test]
+    fn microsoft_means_microsofts_own_team() {
+        let ls = Path::new("/bin/ls");
+        assert_eq!(is_signed_by(ls, "Apple"), Some(true));
+        assert!(has_apple_anchored_signature(ls));
+        assert_eq!(is_signed_by(ls, "Microsoft"), Some(false));
+        assert_eq!(is_signed_by(ls, "Someone"), Some(false));
+        // A requirement codesign cannot read would refuse Microsoft too.
+        let parsed = Command::new("/usr/bin/csreq")
+            .args([&SIGNED_BY_MICROSOFT.replacen("-R=", "-r=", 1), "-t"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&parsed.stdout);
+        assert!(
+            parsed.status.success()
+                && text.contains("anchor apple generic and ")
+                && text.contains("leaf[subject.OU] = UBF8T346G9"),
+            "{text}"
+        );
     }
 
     #[test]

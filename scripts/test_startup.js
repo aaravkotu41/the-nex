@@ -10,8 +10,8 @@ const S = require(path.join(__dirname, "..", "ui", "startup.js"));
 const base = { name: "com.example.agent", kind: "launch_agent", location: "/Library/LaunchAgents/a.plist", program: "/opt/a", arguments: ["-x", "y z"], script: null, enabled: true, exists: true, trusted: true, verdict: "nothing_found", score: null, reasons: [], allowed: false, runs_as: "you" };
 
 const fine = S.present(base);
-assert.strictEqual(fine.pill, "Nothing suspicious found");
-assert.strictEqual(fine.tone, "green");
+assert.strictEqual(fine.pill, "No warning signs");
+assert.strictEqual(fine.tone, "gray", "neutral: no verdict is a promise");
 assert.ok(fine.reasons.some((r) => /not a guarantee/.test(r)), "the limits are stated");
 assert.ok(!/\bsafe\b/i.test(JSON.stringify(fine)), "never says safe");
 assert.deepStrictEqual(fine.facts.find(([k]) => k === "Arguments"), ["Arguments", "-x y z"]);
@@ -65,9 +65,18 @@ assert.strictEqual(S.summarize({ items: "x" }).counts.all, 0);
 
 // The status line says when something was left out and that nothing was changed.
 const line = S.status(report);
-assert.ok(/Checked 5 startup items/.test(line) && !/missing/.test(line));
+assert.ok(/Checked 5 startup items/.test(line) && !/Not everything/.test(line));
 assert.ok(line.includes(S.UNCHANGED) && /nothing|Nothing/.test(S.UNCHANGED));
 assert.ok(/Checked 1 startup item\./.test(S.status({ items: [base] })));
-assert.ok(/more than could be listed/.test(S.status({ items: [], truncated: true })));
+assert.ok(/Not everything could be listed or checked/.test(S.status({ items: [], truncated: true })));
+
+// No verdict on this page is green, and the page itself says what the check cannot see.
+for (const verdict of ["suspicious", "worth_a_look", "not_checked", "nothing_found", "other"]) {
+  assert.notStrictEqual(S.present({ ...base, verdict }).tone, "green", verdict);
+}
+const html = require("fs").readFileSync(path.join(__dirname, "..", "ui", "index.html"), "utf8");
+const page = html.slice(html.indexOf('id="page-startup"'), html.indexOf('id="page-settings"'));
+assert.ok(page.includes("It checks the program file, not what the program loads or is told to do, and some malware gets past it."));
+assert.ok(/data-filter="nothing_found"[^>]*>.*No warning signs</.test(page) && !page.includes("Nothing suspicious found"));
 
 console.log("startup.js: all checks passed");

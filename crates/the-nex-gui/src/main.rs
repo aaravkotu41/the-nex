@@ -223,10 +223,10 @@ fn allow_problem(cfg: &AppConfig) -> Option<String> {
     )
 }
 
-/// The elevated command for one file: the engine refuses it unless its own record starts with
-/// the SHA-256 the prompt shows (`allowlist::describe`).
+/// The elevated command for one file: the engine refuses it unless its own record is exactly
+/// this SHA-256. The prompt shows the start of it (`allowlist::describe`).
 fn allow_args<'a>(mode: &'a str, id: &'a str, sha256: &'a str) -> [&'a str; 4] {
-    [mode, id, "--expect", allowlist::shown_prefix(sha256)]
+    [mode, id, "--expect", sha256]
 }
 
 /// An elevated run for the always-allowed list, only when the engine can do it.
@@ -1051,10 +1051,10 @@ mod tests {
             &allow_args("--allow-quarantined", "id", &sha),
             &["--disallow", "ab"],
         ] {
-            // What the engine is told to expect is what the prompt shows.
-            if let [_, _, flag, shown] = args {
-                assert_eq!((*flag, shown.len()), ("--expect", 16));
-                assert!(subject.contains(shown));
+            // The engine is told all of the hash; the prompt shows the start of the same one.
+            if let [_, _, flag, expect] = args {
+                assert_eq!((*flag, *expect), ("--expect", sha.as_str()));
+                assert!(subject.contains(&expect[..16]) && !subject.contains(&expect[..17]));
             }
             let prompt = prompt_text(args, &subject);
             assert!(prompt.contains("SHA-256 abababababababab"), "{prompt}");
