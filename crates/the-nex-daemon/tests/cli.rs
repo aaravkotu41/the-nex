@@ -401,7 +401,27 @@ fn always_allow_commands_work_end_to_end_in_a_temp_data_folder() {
     let forged_known = event("KNOWN_MALWARE", "KILLED", Some(&sha));
     let unhashed = event("MALWARE_AI", "ALERT_ONLY", None);
 
-    let out = sandbox.run_with_overrides(&["--allow-event", zip.id.as_str()]);
+    // --expect binds it to the hash a prompt showed: another one changes nothing.
+    let shown = &meta.sha256[..16];
+    for (mode, id) in [
+        ("--allow-event", zip.id.as_str()),
+        ("--allow-quarantined", meta.id.as_str()),
+    ] {
+        let out = sandbox.run_with_overrides(&[mode, id, "--expect", "0123456789abcdef"]);
+        assert_eq!(out.status.code(), Some(1), "{mode}: {}", describe(&out));
+        assert!(
+            stderr(&out).contains("nothing was allowed"),
+            "{}",
+            describe(&out)
+        );
+        for bad in ["", "abc", "zzzzzzzzzzzzzzzz", meta.sha256.as_str()] {
+            let out = sandbox.run_with_overrides(&[mode, id, "--expect", bad]);
+            assert_eq!(out.status.code(), Some(2), "{mode} {bad}");
+        }
+    }
+    assert!(listed().is_empty() && quarantine::load_meta(&meta.id, &cfg).is_ok());
+
+    let out = sandbox.run_with_overrides(&["--allow-event", zip.id.as_str(), "--expect", shown]);
     assert!(out.status.success(), "{}", describe(&out));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -450,7 +470,12 @@ fn always_allow_commands_work_end_to_end_in_a_temp_data_folder() {
     // --allow-quarantined restores and allows; known malware and bad IDs are refused.
     let out = sandbox.run_with_overrides(&["--disallow", &meta.sha256]);
     assert!(out.status.success(), "{}", describe(&out));
-    let out = sandbox.run_with_overrides(&["--allow-quarantined", meta.id.as_str()]);
+    let out = sandbox.run_with_overrides(&[
+        "--allow-quarantined",
+        meta.id.as_str(),
+        "--expect",
+        &shown.to_uppercase(),
+    ]);
     assert!(out.status.success(), "{}", describe(&out));
     assert_eq!(fs::read(&victim).unwrap(), b"quarantined and logged");
     assert_eq!(listed()[0]["sha256"], meta.sha256.as_str());

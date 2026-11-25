@@ -160,6 +160,7 @@ fn allow_event(id: &str, args: &CliArgs) -> ExitCode {
     let result = allow_config(args).and_then(|cfg| {
         let event = allowlist::event_by_id(&cfg, id).map_err(|e| e.to_string())?;
         let entry = AllowedFile::from_event(&event)?;
+        allowlist::check_expected(&entry.sha256, args.expect.as_deref())?;
         let added = allowlist::add(&cfg, entry).map_err(|e| e.to_string())?;
         let note = event
             .quarantine_id()
@@ -197,7 +198,11 @@ fn disallow(sha256: &str, args: &CliArgs) -> ExitCode {
 
 fn allow_quarantined(id: &str, args: &CliArgs) -> ExitCode {
     match allow_config(args) {
-        Ok(cfg) => restored(id, allowlist::allow_and_restore(id, &cfg), &cfg),
+        Ok(cfg) => restored(
+            id,
+            allowlist::allow_and_restore(id, &cfg, args.expect.as_deref()),
+            &cfg,
+        ),
         Err(e) => {
             eprintln!("error: cannot allow {id}: {e}");
             ExitCode::FAILURE

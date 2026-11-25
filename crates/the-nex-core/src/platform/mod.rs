@@ -63,6 +63,18 @@ pub(crate) fn has_parent_dir(path: &std::path::Path) -> bool {
         .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
+/// True when a full path is not spelled the one plain way: an empty, "." or ".." part, or on
+/// Windows (where the system drops them) a trailing dot or space, or a stream name. A check that
+/// compares path text must not trust such a path: the file it leads to may be somewhere else.
+pub(crate) fn odd_spelling(path: &str, windows: bool) -> bool {
+    path.split(|c| c == '/' || (windows && c == '\\'))
+        .skip(1)
+        .any(|part| {
+            matches!(part, "" | "." | "..")
+                || (windows && (part.ends_with(['.', ' ']) || part.contains(':')))
+        })
+}
+
 pub fn is_protected_process(pid: u32, name: &str) -> bool {
     if matches!(pid, 0 | 1 | 4) || pid == std::process::id() {
         return true;
@@ -127,6 +139,31 @@ mod tests {
             assert!(is_protected_process(4242, name), "{name}");
         }
         assert!(!is_protected_process(99999, "malware_sim.exe"));
+    }
+
+    #[test]
+    fn only_one_plain_spelling_of_a_path_is_accepted() {
+        for path in [
+            r"c:\windows\system32\a.exe",
+            "c:/program files/a b/c.d/e.exe",
+        ] {
+            assert!(!odd_spelling(path, true), "{path}");
+        }
+        for path in [
+            r"c:\windows\system32\..\..\users\a.exe",
+            r"c:\windows\\system32\a.exe",
+            r"c:\windows\.\a.exe",
+            r"c:\windows\system32\spool.\drivers\a.exe",
+            r"c:\windows\system32\spool \a.exe",
+            r"c:\windows\system32\spool::$index_allocation\a.exe",
+            r"\\host\share\a.exe",
+        ] {
+            assert!(odd_spelling(path, true), "{path}");
+        }
+        assert!(!odd_spelling("/usr/bin/a..b/c.", false));
+        for path in ["/usr//bin/a", "/usr/./a", "/usr/../a", "//usr/a"] {
+            assert!(odd_spelling(path, false), "{path}");
+        }
     }
 
     #[test]

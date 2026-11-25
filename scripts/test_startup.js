@@ -34,6 +34,19 @@ assert.ok(look.facts.some(([k, v]) => k === "Turned on" && /turned off/.test(v))
 assert.ok(look.facts.some(([k, , c]) => k === "Script it runs" && c === "/tmp/x.sh"));
 assert.ok(look.facts.some(([k]) => k === "Always allowed"));
 
+// Something that could not be looked up is neither found nor missing.
+const unknown = S.present({ ...base, verdict: "not_checked", exists: null });
+assert.ok(unknown.facts.some(([k, v]) => k === "Program found" && v === "Not known"));
+
+// Names that mean something to JavaScript are just names, and an account called "you" is not you.
+for (const name of ["constructor", "__proto__", "toString"]) {
+  const item = S.present({ ...base, runs_as: name, kind: name });
+  assert.deepStrictEqual(item.facts.find(([k]) => k === "Runs as"), ["Runs as", name]);
+  assert.strictEqual(item.kind, "Startup item");
+  assert.strictEqual(item.runsAs, name);
+}
+assert.deepStrictEqual(S.present({ ...base, runs_as: 'account "you"' }).facts.find(([k]) => k === "Runs as"), ["Runs as", 'account "you"']);
+
 // Hostile text stays text, and a broken or empty item still shows.
 const odd = S.present({ name: "<img src=x onerror=alert(1)>", verdict: "weird", reasons: null, arguments: "no", kind: "nope", runs_as: "someone" });
 assert.strictEqual(odd.name, "<img src=x onerror=alert(1)>");
@@ -43,18 +56,18 @@ assert.ok(odd.facts.some(([k, v]) => k === "Program" && v === "not known"));
 assert.ok(S.present(null).name && S.present(undefined).pill);
 
 // Counts and order: the most worrying first, whatever order the engine used.
-const report = { items: [{ ...base, verdict: "nothing_found" }, { ...base, verdict: "not_checked" }, { ...base, verdict: "suspicious" }, { ...base, verdict: "worth_a_look" }, { ...base, verdict: "nothing_found" }], unreadable: [], skipped: 2, truncated: false };
+const report = { items: [{ ...base, verdict: "nothing_found" }, { ...base, verdict: "not_checked" }, { ...base, verdict: "suspicious" }, { ...base, verdict: "worth_a_look" }, { ...base, verdict: "nothing_found" }], unreadable: [], truncated: false };
 const sum = S.summarize(report);
-assert.deepStrictEqual(sum.items.map((i) => i.verdict), ["suspicious", "worth_a_look", "nothing_found", "nothing_found", "not_checked"]);
+assert.deepStrictEqual(sum.items.map((i) => i.verdict), ["suspicious", "worth_a_look", "not_checked", "nothing_found", "nothing_found"]);
 assert.deepStrictEqual(sum.counts, { all: 5, suspicious: 1, worth_a_look: 1, nothing_found: 2, not_checked: 1 });
 assert.strictEqual(S.summarize(null).counts.all, 0);
 assert.strictEqual(S.summarize({ items: "x" }).counts.all, 0);
 
-// The status line says what was left out and that nothing was changed.
+// The status line says when something was left out and that nothing was changed.
 const line = S.status(report);
-assert.ok(/Checked 5 startup items/.test(line) && /2 that belong to the operating system were left out/.test(line));
+assert.ok(/Checked 5 startup items/.test(line) && !/missing/.test(line));
 assert.ok(line.includes(S.UNCHANGED) && /nothing|Nothing/.test(S.UNCHANGED));
-assert.ok(/Checked 1 startup item\./.test(S.status({ items: [base], skipped: 0 })));
-assert.ok(/more than can be listed/.test(S.status({ items: [], truncated: true })));
+assert.ok(/Checked 1 startup item\./.test(S.status({ items: [base] })));
+assert.ok(/more than could be listed/.test(S.status({ items: [], truncated: true })));
 
 console.log("startup.js: all checks passed");

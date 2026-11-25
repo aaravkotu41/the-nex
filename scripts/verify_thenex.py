@@ -529,7 +529,7 @@ def startup_listing():
     report = json.loads(run.stdout.splitlines()[0]) if run.stdout.strip() else {}
     items = report.get("items", [])
     problems = []
-    if run.returncode != 0 or set(report) != {"items", "unreadable", "skipped", "truncated"}:
+    if run.returncode != 0 or set(report) != {"items", "unreadable", "truncated"}:
         problems.append(f"bad answer: {run.stdout[:300]} {run.stderr[:300]}")
     listed = [i for i in items if i.get("verdict") == "suspicious" and "known-malware list" in " ".join(i.get("reasons", []))]
     if not listed or items[0].get("verdict") != "suspicious":
@@ -538,8 +538,9 @@ def startup_listing():
         gone = [i for i in items if i.get("name") == "com.example.gone"]
         if not gone or gone[0].get("verdict") != "worth_a_look" or gone[0].get("exists"):
             problems.append(f"missing program not noted: {gone}")
-        if not any(u.get("place", "").endswith("broken.plist") for u in report.get("unreadable", [])):
-            problems.append("broken definition not listed as unreadable")
+        broken = [i for i in items if i.get("location", "").endswith("broken.plist")]
+        if not broken or broken[0].get("verdict") != "worth_a_look":
+            problems.append(f"broken definition not listed as an item: {broken}")
     if refused.returncode == 0:
         problems.append("--startup-dir was accepted without --list-startup")
     if not decoy.exists() or decoy.read_bytes() != DECOY or before != after:

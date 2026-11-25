@@ -263,20 +263,37 @@ pub fn is_os_vendor_signed(path: &Path) -> bool {
     satisfies_requirement(path, "-R=anchor apple")
 }
 
+/// Whether `vendor` ("Apple" or "Microsoft") itself signed it.
+pub fn is_signed_by(path: &Path, vendor: &str) -> Option<bool> {
+    Some(match vendor {
+        "Apple" => is_os_vendor_signed(path),
+        "Microsoft" => satisfies_requirement(
+            path,
+            "-R=anchor apple generic and certificate leaf[subject.OU] = UBF8T346G9",
+        ),
+        _ => false,
+    })
+}
+
 /// SIP-protected system paths, or a valid signature chaining to Apple (Apple / Developer ID).
 pub fn is_trusted_binary(path: &Path) -> bool {
     in_trusted_root(path) || has_apple_anchored_signature(path)
 }
 
 /// Lexical SIP-root check. The Data volume's firmlink prefix is stripped first, otherwise
-/// /System/Volumes/Data/Users/... (user-writable) would match "/System/".
+/// /System/Volumes/Data/Users/... (user-writable) would match "/System/". The disk ignores
+/// letter case (and some non-ASCII letters), so any other spelling of that prefix, or of a path
+/// at all, is not trusted; the system itself only ever reports the plain one.
 fn in_trusted_root(path: &Path) -> bool {
-    if crate::platform::has_parent_dir(path) {
+    const DATA: &str = "/System/Volumes/Data";
+    let text = path.to_string_lossy();
+    let start: Vec<&str> = text.split('/').skip(1).take(3).collect();
+    if crate::platform::odd_spelling(&text, false) || !start.iter().all(|part| part.is_ascii()) {
         return false;
     }
-    let text = path.to_string_lossy();
-    let text = match text.strip_prefix("/System/Volumes/Data") {
+    let text = match text.strip_prefix(DATA) {
         Some(rest) if rest.is_empty() || rest.starts_with('/') => rest,
+        _ if format!("/{}", start.join("/")).eq_ignore_ascii_case(DATA) => return false,
         _ => &text,
     };
     TRUSTED_ROOTS.iter().any(|root| text.starts_with(root))
@@ -856,6 +873,29 @@ mod tests {
         assert!(!in_trusted_root(Path::new("/System/Volumes/Data/tmp/x")));
         assert!(!in_trusted_root(Path::new("/System/../Users/a/evil")));
         assert!(!in_trusted_root(Path::new("/usr/local/bin/x")));
+        // The canonical spellings the system reports are trusted exactly as before...
+        for path in [
+            "/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app/Contents/MacOS/Safari",
+            "/System/Volumes/Data/System/Library/x",
+            "/System/Volumes/Database/x",
+            "/usr/libexec/xpcproxy",
+            "/bin/ls",
+            "/Library/Apple/usr/bin/x",
+        ] {
+            assert!(in_trusted_root(Path::new(path)), "{path}");
+        }
+        // ...and other spellings of a place anyone can write to are not.
+        for path in [
+            "/System//Volumes/Data/Users/a/evil",
+            "/System/./Volumes/Data/Users/a/evil",
+            "/System/volumes/data/Users/a/evil",
+            "/System/Volumes/DATA/Users/a/evil",
+            "/System/Volume\u{17f}/Data/Users/a/evil",
+            "//usr/bin/ls",
+            "/usr/bin/../local/bin/x",
+        ] {
+            assert!(!in_trusted_root(Path::new(path)), "{path}");
+        }
     }
 
     #[test]

@@ -7,12 +7,10 @@ use crate::filecheck::{run_engine, Run};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use the_nex_core::platform;
-use the_nex_core::startup::{StartupReport, TOTAL_LIMIT};
+use the_nex_core::startup::{StartupReport, MAX_REPORT_BYTES, TOTAL_LIMIT};
 
 /// The engine stops itself at `TOTAL_LIMIT`; this is the backstop.
 const TIME_LIMIT: Duration = Duration::from_secs(TOTAL_LIMIT.as_secs() + 30);
-/// 500 items of a few KB each, at most.
-const MAX_OUTPUT: u64 = 8 * 1024 * 1024;
 
 static BUSY: AtomicBool = AtomicBool::new(false);
 
@@ -20,7 +18,12 @@ fn check(engine: &std::path::Path, limit: Duration) -> Result<StartupReport, Str
     if !engine.is_file() {
         return Err("The Nex's protection engine was not found next to the app, so nothing could be checked.".into());
     }
-    match run_engine(engine, &["--list-startup".as_ref()], limit, MAX_OUTPUT) {
+    match run_engine(
+        engine,
+        &["--list-startup".as_ref()],
+        limit,
+        MAX_REPORT_BYTES,
+    ) {
         Run::NotStarted => Err("The Nex's protection engine could not be started.".into()),
         Run::TooLong => {
             Err("Checking took too long, so it was stopped. Nothing was changed.".into())
@@ -75,13 +78,13 @@ mod tests {
     }
 
     const OK_JSON: &str =
-        r#"{"items":[],"unreadable":[{"place":"p","reason":"r"}],"skipped":2,"truncated":false}"#;
+        r#"{"items":[],"unreadable":[{"place":"p","reason":"r"}],"truncated":false}"#;
 
     #[test]
     fn the_engine_gets_exactly_one_argument_and_its_answer_is_read() {
         let engine = fake_engine("ok", &format!("[ \"$#\" = 1 ] && [ \"$1\" = --list-startup ] || exit 3\ncat <<EOF\n{OK_JSON}\nEOF"));
         let report = check(&engine, Duration::from_secs(10)).unwrap();
-        assert_eq!((report.unreadable.len(), report.skipped), (1, 2));
+        assert_eq!((report.unreadable.len(), report.truncated), (1, false));
     }
 
     #[test]

@@ -356,6 +356,9 @@ fn trusted_roots() -> &'static [String] {
 
 fn is_in_trusted_root(path: &Path) -> bool {
     let key = path_key(path);
+    if super::odd_spelling(&key, true) {
+        return false;
+    }
     if USER_WRITABLE_FRAGMENTS.iter().any(|f| key.contains(f)) {
         return false;
     }
@@ -415,21 +418,63 @@ pub fn is_os_vendor_signed(_path: &Path) -> bool {
     false
 }
 
-/// The text values (name, data) under `HKLM` or `HKCU` `subkey`, read-only and bounded. A key
-/// that does not exist has none. Used by the startup listing.
-pub fn read_registry_strings(
-    local_machine: bool,
-    subkey: &str,
-) -> Result<Vec<(String, String)>, String> {
+/// Whether `vendor` itself signed it: cannot be told here (see `is_os_vendor_signed`).
+pub fn is_signed_by(_path: &Path, _vendor: &str) -> Option<bool> {
+    None
+}
+
+/// One value of a registry key, as raw bytes; None when it is too large to be a command line.
+pub struct RegistryValue {
+    pub name: String,
+    pub kind: u32,
+    pub data: Option<Vec<u8>>,
+}
+
+impl RegistryValue {
+    pub fn is_text(&self) -> bool {
+        use windows_sys::Win32::System::Registry::{REG_EXPAND_SZ, REG_SZ};
+        self.kind == REG_SZ || self.kind == REG_EXPAND_SZ
+    }
+
+    /// `%NAME%` in it is replaced by Windows.
+    pub fn expand(&self) -> bool {
+        self.kind == windows_sys::Win32::System::Registry::REG_EXPAND_SZ
+    }
+}
+
+/// A key's values; `incomplete` when there were more, or the rest could not be read.
+#[derive(Default)]
+pub struct RegistryValues {
+    pub values: Vec<RegistryValue>,
+    pub incomplete: bool,
+}
+
+/// The text of a registry value, up to its first NUL as Windows reads it.
+pub fn registry_text(data: &[u8]) -> String {
+    let units: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// The values under `HKLM` or `HKCU` `subkey`, read-only and bounded. A key that does not exist
+/// has none. Used by the startup listing.
+pub fn read_registry_values(local_machine: bool, subkey: &str) -> Result<RegistryValues, String> {
     use windows_sys::Win32::Foundation::{
         ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS,
         ERROR_SUCCESS,
     };
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegEnumValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
-        KEY_READ, REG_EXPAND_SZ, REG_SZ,
+        KEY_READ,
     };
-    const MAX_VALUES: u32 = 500;
+    const MAX_VALUES: u32 = 2000;
+    /// The longest name the registry allows, with its NUL.
+    const MAX_NAME: usize = 16384;
+    /// A command line can have 32,767 characters.
+    const MAX_DATA: usize = 128 * 1024;
     let root = if local_machine {
         HKEY_LOCAL_MACHINE
     } else {
@@ -440,16 +485,15 @@ pub fn read_registry_strings(
     // SAFETY: `wide` is NUL-terminated and `key` is a valid out pointer.
     match unsafe { RegOpenKeyExW(root, wide.as_ptr(), 0, KEY_READ, &mut key) } {
         ERROR_SUCCESS => {}
-        ERROR_FILE_NOT_FOUND => return Ok(Vec::new()),
+        ERROR_FILE_NOT_FOUND => return Ok(RegistryValues::default()),
         ERROR_ACCESS_DENIED => return Err("You do not have permission to read this key.".into()),
         _ => return Err("This key could not be read.".into()),
     }
-    let mut values = Vec::new();
-    let mut result = Ok(());
-    for index in 0..MAX_VALUES {
-        let mut name = [0u16; 512];
+    let mut found = RegistryValues::default();
+    let mut name = vec![0u16; MAX_NAME];
+    let mut data = vec![0u8; MAX_DATA];
+    for index in 0..=MAX_VALUES {
         let mut name_len = name.len() as u32;
-        let mut data = vec![0u8; 16 * 1024];
         let mut data_len = data.len() as u32;
         let mut kind = 0u32;
         // SAFETY: the buffers and their lengths match; `key` is open until RegCloseKey below.
@@ -465,31 +509,29 @@ pub fn read_registry_strings(
                 &mut data_len,
             )
         };
-        match status {
-            ERROR_SUCCESS => {}
-            ERROR_NO_MORE_ITEMS => break,
-            ERROR_MORE_DATA => continue, // a value that large is not a command line
-            _ => {
-                result = Err("This key could not be read completely.".to_string());
-                break;
-            }
+        if status == ERROR_NO_MORE_ITEMS {
+            break;
         }
-        if kind != REG_SZ && kind != REG_EXPAND_SZ {
-            continue;
+        if index == MAX_VALUES || !matches!(status, ERROR_SUCCESS | ERROR_MORE_DATA) {
+            found.incomplete = true;
+            break;
         }
-        let text: Vec<u16> = data[..data_len as usize]
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .take_while(|unit| *unit != 0)
-            .collect();
-        values.push((
-            String::from_utf16_lossy(&name[..name_len as usize]),
-            String::from_utf16_lossy(&text),
-        ));
+        // With ERROR_MORE_DATA the name's length is not given back; it ends at its NUL.
+        let end = name.iter().position(|u| *u == 0).unwrap_or(name.len());
+        let end = if status == ERROR_SUCCESS {
+            name_len as usize
+        } else {
+            end
+        };
+        found.values.push(RegistryValue {
+            name: String::from_utf16_lossy(&name[..end]),
+            kind,
+            data: (status == ERROR_SUCCESS).then(|| data[..data_len as usize].to_vec()),
+        });
     }
     // SAFETY: closes the key opened above, once.
     unsafe { RegCloseKey(key) };
-    result.map(|()| values)
+    Ok(found)
 }
 
 /// Windows command-line quoting for one argument (CommandLineToArgvW rules).
@@ -1434,6 +1476,9 @@ mod tests {
         assert!(is_trusted_binary(&system32_tool("notepad.exe")));
         assert!(!is_in_trusted_root(
             &system_root().join("Temp").join("x.exe")
+        ));
+        assert!(!is_in_trusted_root(
+            &system_root().join(r"System32\..\..\Users\a\evil.exe")
         ));
         assert!(!is_in_trusted_root(
             &system32_tool("spool")

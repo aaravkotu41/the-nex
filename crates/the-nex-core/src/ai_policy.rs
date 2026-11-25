@@ -82,6 +82,15 @@ fn norm_on(path: &Path, system_drive: &str) -> String {
     {
         s = rest.to_string();
     }
+    // One plain spelling: "//" and "/./" inside a path mean nothing to the disk. The first two
+    // characters stay, so a network share ("//host") does not become a local path.
+    let keep = s.char_indices().nth(1).map_or(s.len(), |(at, _)| at);
+    while let Some(at) = s[keep..].find("//") {
+        s.remove(keep + at);
+    }
+    while let Some(at) = s.find("/./") {
+        s.drain(at..at + 2);
+    }
     let bytes = s.as_bytes();
     if bytes.len() >= 2 && bytes[1] == b':' && s.starts_with(system_drive) {
         s.drain(..2); // system drive letter
@@ -119,8 +128,9 @@ const CRITICAL_ROOTS: &[&str] = &[
     "/bin",
     "/sbin",
     "/library/apple",
-    "/program files/windowsapps",
 ];
+/// Store apps: protected like the system, but other makers' programs.
+const STORE_APPS_ROOT: &str = "/program files/windowsapps";
 
 /// Windows OS trees, minus the subfolders ordinary users can write to. A blanket `/windows` rule
 /// made malware dropped in C:\Windows\Tasks or \Temp alert-only; the signature check cannot
@@ -173,15 +183,22 @@ fn own_paths() -> Vec<PathBuf> {
     own
 }
 
+/// Inside the operating system's own folders. Never for a path with "..": where it leads cannot
+/// be told from its text.
+pub fn is_os_folder(path: &Path) -> bool {
+    let p = norm(path);
+    !has_parent_component(path)
+        && (CRITICAL_ROOTS.iter().any(|r| within(&p, r)) || is_windows_os_path(&p))
+}
+
 /// OS-critical paths and The Nex's own binaries (and, via `is_own_data`, its data directory).
+/// Callers spare what it names, so it vouches for nothing it cannot verify (see `is_os_folder`).
 pub fn is_os_critical_path(path: &Path) -> bool {
     if has_parent_component(path) {
-        return true; // cannot be verified lexically
+        return false;
     }
     let p = norm(path);
-    CRITICAL_ROOTS.iter().any(|r| within(&p, r))
-        || is_windows_os_path(&p)
-        || own_paths().iter().any(|o| norm(o) == p)
+    is_os_folder(path) || within(&p, STORE_APPS_ROOT) || own_paths().iter().any(|o| norm(o) == p)
 }
 
 fn is_own_data(path: &Path, data_dir: &Path) -> bool {
@@ -197,7 +214,10 @@ pub fn decide(req: &Request<'_>) -> Action {
     if req.trusted {
         return Action::Ignore;
     }
-    if is_os_critical_path(req.path) || is_own_data(req.path, req.data_dir) {
+    if has_parent_component(req.path)
+        || is_os_critical_path(req.path)
+        || is_own_data(req.path, req.data_dir)
+    {
         return Action::Alert("protected location or The Nex's own file; alert only");
     }
     if std::fs::symlink_metadata(req.path).is_ok_and(|m| m.file_type().is_symlink()) {
@@ -329,6 +349,39 @@ mod tests {
         );
         r.data_dir = Path::new("/data/thenex");
         assert!(matches!(decide(&r), Action::Alert(_)));
+    }
+
+    #[test]
+    fn a_path_is_critical_only_where_its_one_plain_spelling_is() {
+        for p in [
+            "/System/Library/x",
+            "/System//Library/./x",
+            "\\\\.\\C:\\Windows\\System32\\a.exe",
+            "C:\\Windows\\\\System32\\a.exe",
+            "C:\\Program Files\\WindowsApps\\a\\b.exe",
+        ] {
+            assert!(is_os_critical_path(Path::new(p)), "{p}");
+        }
+        for p in [
+            "/Applications/X.app/Contents/MacOS/../MacOS/X",
+            "/usr/bin/../local/bin/x",
+            "/System//Volumes/Data/Users/a/x",
+            "/System/./Volumes/Data/Users/a/x",
+            "/System/volumes/data/Users/a/x",
+            "\\\\windows\\system32\\x.exe",
+            "\\\\\\windows\\system32\\x.exe",
+        ] {
+            assert!(!is_os_critical_path(Path::new(p)), "{p}");
+        }
+        // ".." still never leads to an action.
+        let path = Path::new("/Users/x/../x/evil");
+        assert!(matches!(
+            decide(&req(path, 1.0, Target::File)),
+            Action::Alert(_)
+        ));
+        assert!(!is_os_folder(Path::new(
+            "C:\\Program Files\\WindowsApps\\a\\b.exe"
+        )));
     }
 
     #[test]

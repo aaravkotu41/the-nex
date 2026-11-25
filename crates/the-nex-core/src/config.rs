@@ -59,6 +59,8 @@ Modes:
                             this engine recorded in its own event log (what the app uses)
   --disallow <SHA256>       remove a file from the always-allowed list
   --allow-quarantined <ID>  restore a quarantined file and always allow that exact file
+  --expect <16 HEX>         with --allow-event or --allow-quarantined: refuse unless the recorded
+                            SHA-256 starts with this (the app passes what its prompt showed)
   --list-allowed            print the always-allowed list as JSON
   --help                    show this help
 
@@ -167,6 +169,8 @@ pub struct CliArgs {
     /// `--allow` only: the name and detection type recorded with the entry.
     pub allow_name: Option<String>,
     pub allow_type: Option<String>,
+    /// `--allow-event` and `--allow-quarantined` only: how the recorded SHA-256 must start.
+    pub expect: Option<String>,
 }
 
 /// A path argument exactly as given: no trim and no lossy conversion, so a file whose name ends
@@ -203,6 +207,7 @@ where
     let mut startup_dir: Option<PathBuf> = None;
     let mut allow_name: Option<String> = None;
     let mut allow_type: Option<String> = None;
+    let mut expect: Option<String> = None;
     let mut iter = args.into_iter();
 
     while let Some(raw) = iter.next() {
@@ -255,6 +260,12 @@ where
                 let kind = take_value(&mut iter, "--allow-type")?;
                 allowlist::check_type(&kind)?;
                 allow_type = Some(kind);
+                None
+            }
+            "--expect" => {
+                expect = Some(allowlist::parse_prefix(&take_value(
+                    &mut iter, "--expect",
+                )?)?);
                 None
             }
             "--set" => {
@@ -339,6 +350,9 @@ where
     if (allow_name.is_some() || allow_type.is_some()) && !matches!(mode, Mode::Allow(_)) {
         return Err("--allow-name and --allow-type are only valid with --allow".into());
     }
+    if expect.is_some() && !matches!(mode, Mode::AllowEvent(_) | Mode::AllowQuarantined(_)) {
+        return Err("--expect is only valid with --allow-event or --allow-quarantined".into());
+    }
     if path_overrides && matches!(mode, Mode::Install | Mode::Uninstall | Mode::Help) {
         return Err("--quarantine-dir and --log-file cannot be combined with that mode".into());
     }
@@ -352,6 +366,7 @@ where
         startup_dir,
         allow_name,
         allow_type,
+        expect,
     })
 }
 
@@ -929,7 +944,17 @@ mod tests {
             parse(&["--allow-event", "20260101-1-0001"]).unwrap().mode,
             Mode::AllowEvent("20260101-1-0001".to_string())
         );
+        for mode in ["--allow-event", "--allow-quarantined"] {
+            let parsed = parse(&[mode, "x1", "--expect", "ABcdef0123456789"]).unwrap();
+            assert_eq!(parsed.expect.as_deref(), Some("abcdef0123456789"));
+        }
         for bad in [
+            vec!["--allow-event", "x", "--expect"],
+            vec!["--allow-event", "x", "--expect", "abcdef012345678"],
+            vec!["--allow-event", "x", "--expect", "abcdef01234567890"],
+            vec!["--allow-event", "x", "--expect", "abcdef012345678g"],
+            vec!["--allow", &sha, "--expect", "abcdef0123456789"],
+            vec!["--expect", "abcdef0123456789"],
             vec!["--allow-event"],
             vec!["--allow-event", "../etc"],
             vec!["--allow-event", "a b"],

@@ -16,9 +16,12 @@
     startup_folder: "Startup folder",
   };
   const RUNS_AS = { you: "You (your account)", system: "The system (every user, full rights)", "every user": "Whichever user logs in" };
-  const VERDICTS = ["suspicious", "worth_a_look", "nothing_found", "not_checked"];
+  const VERDICTS = ["suspicious", "worth_a_look", "not_checked", "nothing_found"];
   const LIMITS = "This is a quick look, not a guarantee. Some malware gets past checks like this.";
   const UNCHANGED = "The Nex only looks. Nothing here is turned off, moved, deleted or sent anywhere.";
+
+  /** `table[key]`, own entries only: a key comes from a file anyone can write ("constructor"). */
+  const lookup = (table, key) => (Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined);
 
   /** The pill for a verdict. Never says "safe": the best answer is that nothing was found. */
   function pillFor(verdict) {
@@ -39,21 +42,21 @@
     const args = Array.isArray(r.arguments) ? r.arguments : [];
     if (args.length) facts.push(["Arguments", args.join(" ")]);
     if (r.script) facts.push(["Script it runs", String(r.script), String(r.script)]);
-    facts.push(["Runs as", RUNS_AS[r.runs_as] || String(r.runs_as || "unknown")]);
+    facts.push(["Runs as", lookup(RUNS_AS, r.runs_as) || String(r.runs_as || "unknown")]);
     if (r.enabled === true) facts.push(["Turned on", "Yes, it starts by itself"]);
     if (r.enabled === false) facts.push(["Turned on", "No, its file says it is turned off"]);
     if (r.program) {
-      facts.push(["Program found", r.exists ? "Yes" : "No"]);
+      facts.push(["Program found", r.exists ? "Yes" : r.exists === false ? "No" : "Not known"]);
       if (r.exists) facts.push(["Signed by a trusted publisher", r.trusted ? "Yes" : "No"]);
     }
     if (Number.isFinite(r.score)) facts.push(["Program score", r.score.toFixed(2)]);
     if (r.allowed) facts.push(["Always allowed", "Yes, you chose this exact file"]);
     return {
       name: String(r.name || "unnamed"),
-      kind: KINDS[r.kind] || "Startup item",
+      kind: lookup(KINDS, r.kind) || "Startup item",
       tone, pill, reasons, facts,
       verdict: VERDICTS.includes(r.verdict) ? r.verdict : "not_checked",
-      runsAs: RUNS_AS[r.runs_as] ? r.runs_as : String(r.runs_as || "unknown"),
+      runsAs: String(r.runs_as || "unknown"),
     };
   }
 
@@ -70,8 +73,7 @@
   function status(report) {
     const { counts } = summarize(report);
     const parts = [counts.all === 1 ? "Checked 1 startup item." : `Checked ${counts.all} startup items.`];
-    if (report.skipped) parts.push(`${report.skipped} that belong to the operating system ${report.skipped === 1 ? "was" : "were"} left out.`);
-    if (report.truncated) parts.push("There are more than can be listed here; only the first ones are shown.");
+    if (report.truncated) parts.push("There are more than could be listed here, so some are missing.");
     parts.push(UNCHANGED);
     return parts.join(" ");
   }

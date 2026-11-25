@@ -106,12 +106,41 @@ pub fn prompt_name(name: &str) -> String {
     }
 }
 
+const PREFIX_CHARS: usize = 16;
+
+/// The start of a SHA-256: what a prompt shows and what `--expect` must match.
+pub fn shown_prefix(sha256: &str) -> &str {
+    sha256.get(..PREFIX_CHARS).unwrap_or(sha256)
+}
+
+/// `--expect`: exactly as many hex digits as a prompt shows, returned lower-case.
+pub fn parse_prefix(text: &str) -> Result<String, String> {
+    if text.len() == PREFIX_CHARS && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(text.to_ascii_lowercase())
+    } else {
+        Err(format!(
+            "--expect takes {PREFIX_CHARS} hexadecimal characters"
+        ))
+    }
+}
+
+/// Refuses a recorded SHA-256 other than the one the person was shown.
+pub fn check_expected(sha256: &str, expect: Option<&str>) -> Result<(), String> {
+    match expect {
+        Some(prefix) if !sha256.to_ascii_lowercase().starts_with(prefix) => Err(format!(
+            "the recorded SHA-256 starts with {}, not with {prefix}, so nothing was allowed",
+            shown_prefix(sha256)
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// What a prompt says about one file: the start of its SHA-256, then its name. The name comes
 /// last because someone else chose it: it cannot be made to look like text that follows.
 pub fn describe(name: &str, sha256: &str) -> String {
     format!(
         "SHA-256 {}, file name: {}",
-        &sha256[..sha256.len().min(16)],
+        shown_prefix(sha256),
         prompt_name(name)
     )
 }
@@ -603,8 +632,13 @@ pub fn still_quarantined_note(id: &str) -> String {
 
 /// Lists the hash from a quarantine record (the bytes that were moved) and restores the file.
 /// If the restore fails the hash does not stay allowed.
-pub fn allow_and_restore(id: &str, cfg: &AppConfig) -> io::Result<QuarantineMeta> {
+pub fn allow_and_restore(
+    id: &str,
+    cfg: &AppConfig,
+    expect: Option<&str>,
+) -> io::Result<QuarantineMeta> {
     let meta = quarantine::load_meta(id, cfg)?;
+    check_expected(&meta.sha256, expect).map_err(invalid)?;
     check_size(meta.size).map_err(invalid)?;
     let added = add(cfg, AllowedFile::from_quarantined(&meta).map_err(invalid)?)?;
     match quarantine::restore_file(id, cfg) {
@@ -845,14 +879,14 @@ mod tests {
         };
 
         let (path, meta) = place("fine.bin", "ZIP_BOMB");
-        let restored = allow_and_restore(&meta.id, &cfg).unwrap();
+        let restored = allow_and_restore(&meta.id, &cfg, None).unwrap();
         assert!(path.exists() && restored.sha256 == meta.sha256);
         assert_eq!(load(&cfg.allowed_file, false).unwrap()[0].name, "fine.bin");
 
         // The destination is taken, so the restore fails and the hash must not stay allowed.
         let (path, meta) = place("blocked.bin", "MALWARE_AI");
         fs::write(&path, b"someone else's file").unwrap();
-        assert!(allow_and_restore(&meta.id, &cfg).is_err());
+        assert!(allow_and_restore(&meta.id, &cfg, None).is_err());
         assert!(!cfg.is_allowed(&digest_of(&meta.sha256)));
         assert!(
             quarantine::load_meta(&meta.id, &cfg).is_ok(),
@@ -861,7 +895,7 @@ mod tests {
 
         // Known malware and anything that is not a file verdict cannot be allowed at all.
         let (path, meta) = place("bad.bin", "KNOWN_MALWARE");
-        assert!(allow_and_restore(&meta.id, &cfg).is_err());
+        assert!(allow_and_restore(&meta.id, &cfg, None).is_err());
         assert!(!path.exists() && quarantine::load_meta(&meta.id, &cfg).is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1100,7 +1134,7 @@ mod tests {
         json["size"] = (known_bad::MAX_HASH_BYTES + 1).into();
         fs::write(&record, serde_json::to_vec(&json).unwrap()).unwrap();
 
-        let refused = allow_and_restore(&meta.id, &cfg).unwrap_err();
+        let refused = allow_and_restore(&meta.id, &cfg, None).unwrap_err();
         assert!(refused.to_string().contains("too large"), "{refused}");
         assert!(!path.exists() && !cfg.allowed_file.exists());
         assert!(

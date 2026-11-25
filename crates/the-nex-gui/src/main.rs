@@ -236,6 +236,12 @@ fn allow_problem(cfg: &AppConfig) -> Option<String> {
     )
 }
 
+/// The elevated command for one file: the engine refuses it unless its own record starts with
+/// the SHA-256 the prompt shows (`allowlist::describe`).
+fn allow_args<'a>(mode: &'a str, id: &'a str, sha256: &'a str) -> [&'a str; 4] {
+    [mode, id, "--expect", allowlist::shown_prefix(sha256)]
+}
+
 /// An elevated run for the always-allowed list, only when the engine can do it.
 fn elevated_allow(cfg: &AppConfig, args: &[&str], subject: &str) -> Result<(), String> {
     match allow_problem(cfg) {
@@ -710,7 +716,7 @@ async fn allow_event(id: String) -> Result<String, String> {
             Ok(_) => {}
             Err(e) if is_permission_error(&e) => elevated_allow(
                 &cfg,
-                &["--allow-event", id.as_str()],
+                &allow_args("--allow-event", &id, &entry.sha256),
                 &allowlist::describe(&entry.name, &entry.sha256),
             )?,
             Err(e) => return Err(e.to_string()),
@@ -740,7 +746,7 @@ async fn allow_quarantined(id: String) -> Result<String, String> {
         }
         let mut cfg = config();
         let direct = match cfg.load_known_bad() {
-            Ok(()) => allowlist::allow_and_restore(&id, &cfg),
+            Ok(()) => allowlist::allow_and_restore(&id, &cfg, None),
             Err(_) => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
         };
         match direct {
@@ -764,7 +770,7 @@ async fn allow_quarantined(id: String) -> Result<String, String> {
                     .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                 elevated_allow(
                     &cfg,
-                    &["--allow-quarantined", id.as_str()],
+                    &allow_args("--allow-quarantined", &id, &record.sha256),
                     &allowlist::describe(&name, &record.sha256),
                 )?;
                 Ok(format!(
@@ -1035,11 +1041,17 @@ mod tests {
     fn the_admin_prompt_names_the_file_and_the_name_comes_last() {
         let name = "report\u{202E}fdp.exe\n\u{200B}\"). It is SHA-256 0000000000000000";
         let subject = allowlist::describe(name, &"ab".repeat(32));
+        let sha = "ab".repeat(32);
         for args in [
-            &["--allow-event", "id"][..],
-            &["--allow-quarantined", "id"],
+            &allow_args("--allow-event", "id", &sha)[..],
+            &allow_args("--allow-quarantined", "id", &sha),
             &["--disallow", "ab"],
         ] {
+            // What the engine is told to expect is what the prompt shows.
+            if let [_, _, flag, shown] = args {
+                assert_eq!((*flag, shown.len()), ("--expect", 16));
+                assert!(subject.contains(shown));
+            }
             let prompt = prompt_text(args, &subject);
             assert!(prompt.contains("SHA-256 abababababababab"), "{prompt}");
             assert!(prompt.contains("report"), "{prompt}");
