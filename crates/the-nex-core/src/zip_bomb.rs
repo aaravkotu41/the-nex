@@ -133,7 +133,11 @@ pub fn wait_for_file_ready(path: &Path) -> bool {
         Ok(m) if m.is_file() => {
             // Nothing wrote it lately: no need to hold up the files behind it. A later write
             // queues it again.
-            if quiet_for(&m, READY_POLL * READY_STABLE_CHECKS) && open_regular(path).is_ok() {
+            // Not on Windows: there a file's times may lag until its writer closes it.
+            if cfg!(unix)
+                && quiet_for(&m, READY_POLL * READY_STABLE_CHECKS)
+                && open_regular(path).is_ok()
+            {
                 return true;
             }
             m.len()
@@ -1253,7 +1257,7 @@ mod tests {
         assert!(started.elapsed() >= READY_POLL * READY_STABLE_CHECKS);
         let started = Instant::now();
         assert!(wait_for_file_ready(&path));
-        assert!(started.elapsed() < READY_POLL, "{:?}", started.elapsed());
+        assert!(!cfg!(unix) || started.elapsed() < READY_POLL);
         let _ = fs::remove_file(&path);
     }
 

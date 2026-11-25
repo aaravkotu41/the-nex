@@ -388,6 +388,11 @@ impl ProcessGuard {
                 let Some(process) = self.sys.process(*pid) else {
                     return false;
                 };
+                // Ended but not yet collected by its parent: the kernel tells nothing of it.
+                let told = self.versions.get(&pid.as_u32()) != Some(&(0, 0));
+                if !told && self.seen.contains_key(pid) {
+                    return false;
+                }
                 let now = (process.start_time(), Program::of(process));
                 self.seen.insert(*pid, now);
                 true
@@ -433,6 +438,8 @@ impl ProcessGuard {
             self.pending_ai.clear();
             self.primed = false;
             self.last_full = None;
+            // What was read about a program may not hold any more by then.
+            self.sys = System::new();
             self.baseline.clear();
             self.telemetry.processes_watched.store(0, Ordering::Relaxed);
             return;
@@ -2026,7 +2033,9 @@ mod tests {
         );
         // Nothing was read in full meanwhile.
         assert!(g.last_full.unwrap().elapsed() < FULL_REFRESH);
+        // Ended, and not collected yet: nothing new about it.
         let _ = child.kill();
+        assert!(!seen_after(&mut g), "a zombie is not a new program");
         let _ = child.wait();
         for _ in 0..40 {
             g.refresh();

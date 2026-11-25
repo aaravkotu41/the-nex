@@ -82,7 +82,8 @@ which events do not record.
   elevated engine looks the detection up in its own log, and the prompt names the file and the
   start of its hash. Files on the known-malware list, scripts and decoy alerts can never be
   allowed. Settings lists what is allowed, with Remove. Limits: an updated program has to be
-  allowed again; files over 256 MB cannot be; an archive's hash is taken by reading it again.
+  allowed again; files over 256 MB cannot be; an archive's hash is taken by reading it again, and on Windows only
+  its size and time tell whether it was swapped in between.
 - **Never scan** (Settings, Exceptions; `--never-scan`, `--never-scan-file`, `--scan-again`,
   `--list-never-scan`): folders and
   files whose contents are not opened, moved or deleted by the live watch, any scan, the startup

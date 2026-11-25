@@ -15,7 +15,7 @@ use chrono::Utc;
 use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::panic::{self, AssertUnwindSafe};
@@ -110,11 +110,15 @@ pub fn classify_file(path: &Path) -> FileKind {
 
 /// The Nex's own data, quarantine and log folders are never scanned, nor what the owner listed.
 fn should_ignore(cfg: &AppConfig, path: &Path) -> bool {
+    is_own_or_skipped(cfg, path)
+        || is_engine_output(cfg, path)
+        || zip_bomb::is_ignored_extension(path)
+}
+
+fn is_own_or_skipped(cfg: &AppConfig, path: &Path) -> bool {
     platform::path_is_within(path, &cfg.base_dir)
         || platform::path_is_within(path, &cfg.quarantine_dir)
-        || is_engine_output(cfg, path)
         || cfg.is_skipped(path)
-        || zip_bomb::is_ignored_extension(path)
 }
 
 /// The files the engine itself writes next to the event log (including rotated and
@@ -239,17 +243,19 @@ const MAX_UNREADABLE_LISTED: usize = 50;
 
 /// iCloud / File Provider placeholders ("dataless" files and folders): opening one makes macOS
 /// download it, so a scan would pull down the user's whole cloud drive.
-#[cfg(target_os = "macos")]
 fn is_cloud_placeholder(entry: &fs::DirEntry) -> bool {
+    cfg!(target_os = "macos") && is_dataless(&entry.path())
+}
+
+#[cfg(target_os = "macos")]
+fn is_dataless(path: &Path) -> bool {
     use std::os::macos::fs::MetadataExt;
     const SF_DATALESS: u32 = 0x4000_0000;
-    entry
-        .metadata()
-        .is_ok_and(|m| m.st_flags() & SF_DATALESS != 0)
+    fs::symlink_metadata(path).is_ok_and(|m| m.st_flags() & SF_DATALESS != 0)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn is_cloud_placeholder(_entry: &fs::DirEntry) -> bool {
+fn is_dataless(_path: &Path) -> bool {
     false
 }
 
@@ -327,30 +333,45 @@ pub fn scan_path(cfg: &AppConfig, scanner: &BinaryAiScanner, path: &Path, teleme
     inspect_file(cfg, scanner, path, kind, hash, telemetry);
 }
 
-/// A folder that arrived whole: the system reports the folder and none of its files.
-fn scan_moved_folder(
-    cfg: &AppConfig,
-    scanner: &BinaryAiScanner,
-    dir: &Path,
-    telemetry: &Telemetry,
-    shutdown: &AtomicBool,
-) {
-    if should_ignore(cfg, dir) {
-        return;
+/// What has arrived inside a folder that was moved here whole: for that, the system reports the
+/// folder and none of its files. Entered folder by folder, behind everything newer.
+#[derive(Default)]
+struct Arrived {
+    queue: VecDeque<PathBuf>,
+    queued: HashSet<PathBuf>,
+}
+
+impl Arrived {
+    fn push(&mut self, path: PathBuf) {
+        if self.queue.len() >= MAX_PENDING_SCANS {
+            if self.queued.insert(PathBuf::new()) {
+                logger::warn("too many files arrived at once; the rest is left to the next scan");
+            }
+        } else if self.queued.insert(path.clone()) {
+            self.queue.push_back(path);
+        }
     }
-    let report = scan_tree(
-        cfg,
-        scanner,
-        std::slice::from_ref(&dir.to_path_buf()),
-        telemetry,
-        &QUICK_LIMITS,
-        &mut |_, _| !shutdown.load(Ordering::SeqCst),
-    );
-    if report.truncated {
-        logger::warn(format!(
-            "{} holds too many files to check at once; the rest is left to the next scan",
-            dir.display()
-        ));
+
+    fn pop(&mut self) -> Option<PathBuf> {
+        let path = self.queue.pop_front()?;
+        self.queued.remove(&path);
+        if self.queue.is_empty() {
+            self.queued.clear();
+        }
+        Some(path)
+    }
+
+    /// Queues what a folder holds. A link is never followed.
+    fn enter(&mut self, cfg: &AppConfig, dir: &Path) {
+        if is_own_or_skipped(cfg, dir) || is_dataless(dir) {
+            return;
+        }
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let is_link = entry.file_type().map_or(true, |t| t.is_symlink());
+            if !is_link && !is_cloud_placeholder(&entry) {
+                self.push(entry.path());
+            }
+        }
     }
 }
 
@@ -713,10 +734,12 @@ fn dispatch_event(event: Event, scan_tx: &Sender<PathBuf>, canary_tx: &Sender<Ca
                 ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Other
             )
     );
-    // What a folder that merely changed holds is reported file by file; one that was moved here is
-    // not. Windows says "created" for both a new folder and one moved in.
-    let arrived = matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)))
-        || (cfg!(windows) && matches!(event.kind, EventKind::Create(_)));
+    // What a folder that merely changed holds is reported file by file; one that was moved or cloned
+    // here whole is not, and "created" may be either.
+    let arrived = matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
+    );
     for path in event.paths {
         if canary::is_canary_path(&path) {
             let _ = canary_tx.send(CanaryMsg::FsEvent(path));
@@ -794,8 +817,29 @@ fn scan_worker(
     shutdown: Arc<AtomicBool>,
 ) {
     let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
+    let mut arrived = Arrived::default();
+    let look_at = |path: &Path, arrived: &mut Arrived| {
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            if is_real_dir(path) {
+                arrived.enter(&cfg, path);
+            } else {
+                scan_path(&cfg, &scanner, path, &telemetry);
+            }
+        }));
+        if outcome.is_err() {
+            logger::error(format!(
+                "file scanner recovered from a panic on {}",
+                path.display()
+            ));
+        }
+    };
     while !shutdown.load(Ordering::SeqCst) {
-        match rx.recv_timeout(SCAN_RECV_TIMEOUT) {
+        let wait = if arrived.queue.is_empty() {
+            SCAN_RECV_TIMEOUT
+        } else {
+            Duration::ZERO
+        };
+        match rx.recv_timeout(wait) {
             Ok(path) => {
                 pending.insert(path, Instant::now());
                 while let Ok(more) = rx.try_recv() {
@@ -811,35 +855,25 @@ fn scan_worker(
             ));
             pending.clear();
         }
-        let mut ready: Vec<PathBuf> = pending
+        let ready: Vec<PathBuf> = pending
             .iter()
             .filter(|(_, seen)| seen.elapsed() >= SCAN_SETTLE)
             .map(|(path, _)| path.clone())
             .collect();
-        ready.sort(); // a folder before what is in it
-        for path in ready {
+        for path in &ready {
             if shutdown.load(Ordering::SeqCst) {
                 break;
             }
-            // A folder inside another one that is looked at now, or a second report of it.
-            if pending.remove(&path).is_none() {
-                continue;
-            }
-            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                if is_real_dir(&path) {
-                    pending.retain(|p, seen| {
-                        seen.elapsed() < SCAN_SETTLE || !p.starts_with(&path) || !is_real_dir(p)
-                    });
-                    scan_moved_folder(&cfg, &scanner, &path, &telemetry, &shutdown)
-                } else {
-                    scan_path(&cfg, &scanner, &path, &telemetry)
+            pending.remove(path);
+            look_at(path, &mut arrived);
+        }
+        // One at a time, so that a big folder never holds up a file that has just come.
+        if ready.is_empty() {
+            if let Some(path) = arrived.pop() {
+                // It has its own report, which is newer.
+                if !pending.contains_key(&path) {
+                    look_at(&path, &mut arrived);
                 }
-            }));
-            if outcome.is_err() {
-                logger::error(format!(
-                    "file scanner recovered from a panic on {}",
-                    path.display()
-                ));
             }
         }
     }
@@ -1485,9 +1519,11 @@ mod tests {
         let root = temp_root("moved-in");
         let cfg = Arc::new(AppConfig::for_base_dir(&root.join("base")));
         cfg.ensure_dirs().unwrap();
-        let folder = root.join("app");
-        fs::create_dir_all(folder.join("deep")).unwrap();
-        let program = folder.join("deep").join("decoy.exe");
+        // Deeper than a Quick Scan goes, and named like a download in progress.
+        let folder = root.join("app.download");
+        let deep = folder.join("1/2/3/4/5/6/7/8/9/10");
+        fs::create_dir_all(&deep).unwrap();
+        let program = deep.join("decoy.exe");
         fs::write(&program, decoy_program()).unwrap();
         let sent = |kind: EventKind| -> Vec<PathBuf> {
             let (tx, rx) = mpsc::channel();
@@ -1499,6 +1535,8 @@ mod tests {
         use notify::event::{DataChange, RenameMode};
         let name = ModifyKind::Name(RenameMode::Any);
         assert_eq!(sent(EventKind::Modify(name)), [folder.clone()]);
+        let created = EventKind::Create(notify::event::CreateKind::Folder);
+        assert_eq!(sent(created), [folder.clone()]);
         assert!(sent(EventKind::Modify(ModifyKind::Data(DataChange::Any))).is_empty());
 
         let (tx, rx) = mpsc::channel();
@@ -1509,7 +1547,6 @@ mod tests {
             thread::spawn(move || scan_worker(cfg, scanner, Arc::default(), rx, shutdown))
         };
         tx.send(folder.clone()).unwrap();
-        tx.send(folder.join("deep")).unwrap(); // reported as well: looked at once
         let deadline = Instant::now() + Duration::from_secs(10);
         while program.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(50));

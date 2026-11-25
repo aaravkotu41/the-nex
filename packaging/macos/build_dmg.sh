@@ -32,8 +32,18 @@ if [[ ! -f "${MODEL}" ]]; then
   "${VENV}/bin/python" scripts/train_onnx.py --out "${MODEL}"
 fi
 
+# Paths of a person's computer (with the account name) stay out of the programs; GitHub's have none.
+# Encoded, because a path may hold spaces. Tauri writes its own folder in whatever the flags say, so
+# the build goes through a link.
+SRC="${ROOT}"
+if [[ -z "${GITHUB_ACTIONS:-}" ]]; then
+  SRC="/tmp/the-nex-src-${UID}"
+  ln -sfn "${ROOT}" "${SRC}"
+  trap 'rm -f "${SRC}"' EXIT
+  export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${ROOT}=/the-nex"$'\x1f'"--remap-path-prefix=${HOME}=/home"
+fi
 echo "==> cargo build --release --workspace"
-cargo build --release --locked --workspace
+cargo build --release --locked --workspace --manifest-path "${SRC}/Cargo.toml"
 
 echo "==> Assembling ${APP}"
 rm -rf "${APP}" "${STAGE}" "${DMG}"

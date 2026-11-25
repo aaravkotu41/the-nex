@@ -982,7 +982,8 @@ mod tests {
         let late = |path: &Path, max: u64| {
             let digest = known_bad::hash_file(path, max);
             fs::remove_file(path).unwrap();
-            fs::write(path, b"another one").unwrap();
+            // Another length: on Windows a swap within one clock tick shows in nothing else.
+            fs::write(path, b"yet another one").unwrap();
             digest
         };
         let judged = stamp_of(&file);

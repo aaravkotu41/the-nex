@@ -491,7 +491,7 @@ impl CanaryManager {
         };
         let found = sys
             .process(suspect.pid)
-            .map(|p| (p.start_time(), platform::program_file(p)));
+            .map(|p| (p.start_time(), program_identity(p)));
         let action = if !may_terminate(suspect.exe.as_deref(), platform::is_trusted_binary) {
             "ALERT_ONLY: the busiest writer is a properly signed app, so it was not stopped"
                 .to_string()
@@ -528,12 +528,21 @@ impl CanaryManager {
     }
 }
 
+fn program_identity(process: &sysinfo::Process) -> Option<(u64, u64)> {
+    platform::program_file(process).and_then(|path| platform::file_identity(&path))
+}
+
 /// Ends a process only while it is still the one that was judged: checking a signature takes time,
-/// and its number may belong to another program by now.
-fn kill_if_still(sys: &mut System, pid: Pid, found: Option<(u64, Option<PathBuf>)>) -> bool {
+/// and its number may belong to another program by now. Renaming or deleting its own file does not
+/// save it.
+fn kill_if_still(sys: &mut System, pid: Pid, found: Option<(u64, Option<(u64, u64)>)>) -> bool {
     sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, hunt_refresh_kind());
-    sys.process(pid)
-        .is_some_and(|p| Some((p.start_time(), platform::program_file(p))) == found && p.kill())
+    sys.process(pid).is_some_and(|p| {
+        let now = program_identity(p);
+        found.is_some_and(|(started, before)| {
+            p.start_time() == started && (now.is_none() || before.is_none() || now == before)
+        }) && p.kill()
+    })
 }
 
 fn hunt_refresh_kind() -> ProcessRefreshKind {
