@@ -8,7 +8,8 @@ Runs the real release binary against harmless decoys confined to ./thenex_live_s
   4 nested zip bomb           8 canary trip & recovery
   11 --check-file (read-only report on a bomb outside the watched folder)
   13 scheduled scan (reports a bomb and a listed decoy, moves nothing, runs once)
-Exit status is 0 only when all thirteen checks pass.
+  14 --list-startup (read-only listing of a sandbox folder of startup definitions)
+Exit status is 0 only when all fourteen checks pass.
 
 Note: like the real product, the console engine watches every process on the machine while
 it runs; checks 7 and 8 rely on that and only target the decoy processes this script starts.
@@ -496,6 +497,55 @@ def check_file_report():
     return not problems, "bomb and listed decoy reported; nothing moved, nothing logged" if not problems else "; ".join(problems)
 
 
+def startup_listing():
+    """--list-startup on a sandbox folder reports a listed decoy, and changes and logs nothing."""
+    from xml.sax.saxutils import escape
+    folder = SANDBOX / "startup_places"
+    data_dir = SANDBOX / "startup_data"
+    decoys = SANDBOX / "startup_decoys"
+    for d in (folder, data_dir, decoys):
+        d.mkdir(exist_ok=True)
+    shutil.copy(MODEL, data_dir / MODEL.name)
+    decoy = decoys / DECOY_NAME
+    decoy.write_bytes(DECOY)
+
+    def plist(label, program):
+        return ('<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>Label</key><string>%s</string>'
+                '<key>ProgramArguments</key><array><string>%s</string></array></dict></plist>' % (label, escape(str(program))))
+
+    if WINDOWS:  # a file in a Startup folder is its own program
+        shutil.copy(decoy, folder / DECOY_NAME)
+    else:
+        (folder / "listed.plist").write_text(plist("com.example.listed", decoy))
+        (folder / "gone.plist").write_text(plist("com.example.gone", SANDBOX / "no-such-program"))
+        (folder / "broken.plist").write_text("<plist><dict><key>Label</key>")
+    before = (tree(SANDBOX), EVENTS.read_bytes() if EVENTS.exists() else b"")
+    env = {**os.environ, "THENEX_DATA_DIR": str(data_dir)}
+    run = subprocess.run([str(EXE), "--list-startup", "--startup-dir", str(folder), "--hash-list", str(HASH_LIST)],
+                         cwd=ROOT, capture_output=True, text=True, timeout=120, env=env)
+    refused = subprocess.run([str(EXE), "--startup-dir", str(folder)], cwd=ROOT, capture_output=True, text=True, timeout=30, env=env)
+    after = (tree(SANDBOX), EVENTS.read_bytes() if EVENTS.exists() else b"")
+    report = json.loads(run.stdout.splitlines()[0]) if run.stdout.strip() else {}
+    items = report.get("items", [])
+    problems = []
+    if run.returncode != 0 or set(report) != {"items", "unreadable", "skipped", "truncated"}:
+        problems.append(f"bad answer: {run.stdout[:300]} {run.stderr[:300]}")
+    listed = [i for i in items if i.get("verdict") == "suspicious" and "known-malware list" in " ".join(i.get("reasons", []))]
+    if not listed or items[0].get("verdict") != "suspicious":
+        problems.append(f"listed decoy not reported first: {items}")
+    if not WINDOWS:
+        gone = [i for i in items if i.get("name") == "com.example.gone"]
+        if not gone or gone[0].get("verdict") != "worth_a_look" or gone[0].get("exists"):
+            problems.append(f"missing program not noted: {gone}")
+        if not any(u.get("place", "").endswith("broken.plist") for u in report.get("unreadable", [])):
+            problems.append("broken definition not listed as unreadable")
+    if refused.returncode == 0:
+        problems.append("--startup-dir was accepted without --list-startup")
+    if not decoy.exists() or decoy.read_bytes() != DECOY or before != after:
+        problems.append("something on disk or in the event log changed")
+    return not problems, "listed decoy reported first; nothing moved, nothing logged" if not problems else "; ".join(problems)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Live end-to-end verification of The Nex.")
     parser.add_argument("--skip-build", action="store_true", help="fail instead of building missing binaries")
@@ -527,6 +577,7 @@ def main():
         ("Live file check (read-only)", check_file_report),
         ("Live always-allowed file", lambda: check_always_allow(daemon)),
         ("Live scheduled scan (report only)", lambda: check_scheduled_scan(daemon)),
+        ("Live startup listing (read-only)", startup_listing),
     ]
     results = []
     try:

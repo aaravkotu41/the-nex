@@ -52,12 +52,28 @@ fn not_checked(file: &Path, why: &str) -> FileCheck {
     }
 }
 
-/// Runs the engine on one file. Never fails: anything that goes wrong is a "not checked" result.
-fn check_one(engine: &Path, file: &Path, limit: Duration) -> FileCheck {
+/// How one run of the engine ended.
+pub enum Run {
+    NotStarted,
+    TooLong,
+    /// Its output (at most `max_output` bytes) and whether it exited successfully.
+    Done {
+        ok: bool,
+        output: Vec<u8>,
+    },
+}
+
+/// Runs `engine args` as a child process with the user's own rights, no shell, no input, a time
+/// limit and bounded output (shared with the startup check).
+pub fn run_engine(
+    engine: &Path,
+    args: &[&std::ffi::OsStr],
+    limit: Duration,
+    max_output: u64,
+) -> Run {
     let mut command = Command::new(engine);
     command
-        .arg("--check-file")
-        .arg(file)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -67,20 +83,17 @@ fn check_one(engine: &Path, file: &Path, limit: Duration) -> FileCheck {
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flash
     }
     let Ok(mut child) = command.spawn() else {
-        return not_checked(
-            file,
-            "The Nex's protection engine could not be started, so the file was not checked.",
-        );
+        return Run::NotStarted;
     };
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
-        return not_checked(file, "The check could not be started.");
+        return Run::NotStarted;
     };
     // A channel, not a join: a leftover grandchild holding the pipe must not hold us up.
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut out = Vec::new();
-        let _ = stdout.take(MAX_OUTPUT).read_to_end(&mut out);
+        let _ = stdout.take(max_output).read_to_end(&mut out);
         let _ = sender.send(out);
     });
     let deadline = Instant::now() + limit;
@@ -98,22 +111,41 @@ fn check_one(engine: &Path, file: &Path, limit: Duration) -> FileCheck {
     let output = receiver
         .recv_timeout(Duration::from_secs(2))
         .unwrap_or_default();
-    if finished.is_none() {
-        return not_checked(
+    match finished {
+        None => Run::TooLong,
+        Some(ok) => Run::Done { ok, output },
+    }
+}
+
+/// Runs the engine on one file. Never fails: anything that goes wrong is a "not checked" result.
+fn check_one(engine: &Path, file: &Path, limit: Duration) -> FileCheck {
+    match run_engine(
+        engine,
+        &["--check-file".as_ref(), file.as_os_str()],
+        limit,
+        MAX_OUTPUT,
+    ) {
+        Run::NotStarted => not_checked(
+            file,
+            "The Nex's protection engine could not be started, so the file was not checked.",
+        ),
+        Run::TooLong => not_checked(
             file,
             "Checking took too long, so it was stopped. The file was not changed.",
-        );
-    }
-    let line = output.split(|&b| b == b'\n').next().unwrap_or_default();
-    match serde_json::from_slice::<FileCheck>(line) {
-        Ok(mut result) if finished == Some(true) => {
-            result.reasons.truncate(MAX_REASONS);
-            result
-        }
-        _ => not_checked(
-            file,
-            "The check could not finish, so the file was not checked.",
         ),
+        Run::Done { ok, output } => {
+            let line = output.split(|&b| b == b'\n').next().unwrap_or_default();
+            match serde_json::from_slice::<FileCheck>(line) {
+                Ok(mut result) if ok => {
+                    result.reasons.truncate(MAX_REASONS);
+                    result
+                }
+                _ => not_checked(
+                    file,
+                    "The check could not finish, so the file was not checked.",
+                ),
+            }
+        }
     }
 }
 

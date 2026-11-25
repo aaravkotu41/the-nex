@@ -13,6 +13,7 @@ const PAGE_TITLES = {
   activity: "Activity",
   quarantine: "Quarantine",
   canaries: "Canaries",
+  startup: "Startup",
   devices: "Devices",
   settings: "Settings",
   aegismesh: "AegisMesh",
@@ -22,6 +23,7 @@ const PAGE_SUBS = {
   activity: "Everything the engines saw and did, newest first.",
   quarantine: "Files that were stopped. Restore or delete them here.",
   canaries: "Decoy files that reveal ransomware the moment they change.",
+  startup: "What starts by itself on this computer, and whether anything looks off.",
   devices: "Every computer signed in to your account. Run a scan on any of them.",
   settings: "Background service, watched folders and the look of the app.",
   aegismesh: "Silent SOS simulation: wearables, tap rhythms, emergency signs and the relay mesh.",
@@ -1849,6 +1851,7 @@ function startDashboard() {
   // Offline assistant (ui/bot.js): read-only, starts only after sign-in like everything else here.
   if (window.NexBot) window.NexBot.start({ call, showPage, openActivity });
   if (window.NexFileCheck) window.NexFileCheck.start(copyButton); // drop a file on the window to check it
+  if (window.NexStartup) window.NexStartup.start({ call, el, expandable, detailGrid, chevron, errorText });
   if (window.NexSetup) window.NexSetup.start({ copyButton, run: runSetupAction });
   $("page-sub").textContent = greeting();
   wireTheme();

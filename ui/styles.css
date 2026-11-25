@@ -424,6 +424,16 @@ h1, h2, h3 { margin: 0; }
 .q-facts b { font-size: 20px; font-family: var(--sans); overflow: hidden; text-overflow: ellipsis; max-width: 100%; white-space: nowrap; }
 .pill-filter.active { background: var(--ink); color: var(--on-ink); }
 .pill-filter.active b { color: var(--on-ink); }
+.startup-note { margin: 0 0 16px; }
+.startup-table thead th:nth-child(1) { width: 32%; }
+.startup-table thead th:nth-child(2) { width: 24%; }
+.startup-table thead th:nth-child(3) { width: 24%; }
+.startup-table thead th:nth-child(4) { width: 14%; }
+.startup-table thead th:nth-child(5) { width: 6%; }
+.startup-places { margin-top: 22px; }
+.startup-places h3 { margin: 0 0 10px; font-size: 14px; font-weight: 500; }
+.startup-places ul { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.startup-places li { word-break: break-word; }
 .filter-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
 .filter-chip { display: inline-flex; align-items: center; gap: 8px; padding: 5px 6px 5px 12px; border-radius: 10px; background: var(--mint-soft); font-size: 13px; }
 .filter-chip small { color: var(--muted); }

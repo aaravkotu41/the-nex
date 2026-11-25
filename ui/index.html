@@ -70,6 +70,7 @@
         <button class="nav-item" data-page="activity"><span>Activity</span></button>
         <button class="nav-item" data-page="quarantine"><span>Quarantine</span><span class="badge" id="quarantine-badge" hidden>0</span></button>
         <button class="nav-item" data-page="canaries"><span>Canaries</span></button>
+        <button class="nav-item" data-page="startup"><span>Startup</span></button>
         <button class="nav-item" data-page="devices"><span>Devices</span></button>
         <button class="nav-item aegis" data-page="aegismesh"><span>AegisMesh</span><span class="nav-new">SOS</span></button>
         <button class="nav-item" data-page="settings"><span>Settings</span></button>
@@ -375,6 +376,33 @@
           </div>
         </section>
 
+        <section class="page" id="page-startup">
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Startup programs</h2>
+              <button class="btn" id="startup-check">Check startup programs</button>
+            </div>
+            <p class="muted small startup-note">Lists what starts by itself when this computer starts or you log in, and what The Nex makes of each one. The Nex only looks: nothing is turned off, moved, deleted or sent anywhere.</p>
+            <div class="sev-tiles" id="startup-tiles" hidden>
+              <button class="pill-filter active" data-filter="all" aria-pressed="true"><b id="startup-count-all">0</b>All items</button>
+              <button class="pill-filter" data-filter="suspicious" aria-pressed="false"><b id="startup-count-suspicious">0</b>Suspicious</button>
+              <button class="pill-filter" data-filter="worth_a_look" aria-pressed="false"><b id="startup-count-worth_a_look">0</b>Worth a look</button>
+              <button class="pill-filter" data-filter="nothing_found" aria-pressed="false"><b id="startup-count-nothing_found">0</b>Nothing suspicious found</button>
+              <button class="pill-filter" data-filter="not_checked" aria-pressed="false"><b id="startup-count-not_checked">0</b>Not checked</button>
+            </div>
+            <p class="muted small" id="startup-status" aria-live="polite">Nothing has been checked yet. Press the button to look.</p>
+            <table class="table startup-table" id="startup-table" hidden>
+              <thead><tr><th>Name</th><th>Type</th><th>Result</th><th>Runs as</th><th><span class="sr-only">Details</span></th></tr></thead>
+              <tbody id="startup-rows"></tbody>
+            </table>
+            <p class="empty" id="startup-empty" hidden>No items in this group.</p>
+            <div id="startup-unreadable" class="startup-places" hidden>
+              <h3>Places that could not be read</h3>
+              <ul id="startup-unreadable-list"></ul>
+            </div>
+          </div>
+        </section>
+
         <section class="page" id="page-settings">
           <div class="settings-grid">
             <div class="panel setup-panel">
@@ -547,6 +575,7 @@
   <script src="report.js"></script>
   <script src="summary.js"></script>
   <script src="filecheck.js"></script>
+  <script src="startup.js"></script>
   <script src="setup.js"></script>
   <script src="app.js"></script>
 </body>

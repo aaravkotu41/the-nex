@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         Mode::RearmCanaries => rearm_canaries(&args),
         Mode::ScanFile(target) => scan_file(target, &args),
         Mode::CheckFile(target) => check_file(target, &args),
+        Mode::ListStartup => list_startup(&args),
         Mode::Notifier => {
             platform::detach_console();
             logger::init_without_file(false);
@@ -347,6 +348,25 @@ fn check_file(target: &Path, args: &CliArgs) -> ExitCode {
     let scanner = BinaryAiScanner::load(&cfg.model_path).with_max_scan_bytes(cfg.max_ai_scan_bytes);
     let result = the_nex_core::check_file::check(&cfg, &scanner, target);
     println!("{}", serde_json::to_string(&result).unwrap_or_default());
+    ExitCode::SUCCESS
+}
+
+/// Read-only: one JSON document of everything that starts by itself, each item judged. Never
+/// logs an event (see the_nex_core::startup).
+fn list_startup(args: &CliArgs) -> ExitCode {
+    logger::init_without_file(false);
+    let mut cfg = AppConfig::from_cli(args);
+    if let Err(e) = cfg.load_known_bad() {
+        eprintln!("known-malware list not used: {e}");
+    }
+    let scanner = BinaryAiScanner::load(&cfg.model_path).with_max_scan_bytes(cfg.max_ai_scan_bytes);
+    let report = the_nex_core::startup::list(
+        &Arc::new(cfg),
+        &Arc::new(scanner),
+        args.startup_dir.as_deref(),
+        the_nex_core::startup::Limits::default(),
+    );
+    println!("{}", serde_json::to_string(&report).unwrap_or_default());
     ExitCode::SUCCESS
 }
 

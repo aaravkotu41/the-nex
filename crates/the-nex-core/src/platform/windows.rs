@@ -415,6 +415,83 @@ pub fn is_os_vendor_signed(_path: &Path) -> bool {
     false
 }
 
+/// The text values (name, data) under `HKLM` or `HKCU` `subkey`, read-only and bounded. A key
+/// that does not exist has none. Used by the startup listing.
+pub fn read_registry_strings(
+    local_machine: bool,
+    subkey: &str,
+) -> Result<Vec<(String, String)>, String> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS,
+        ERROR_SUCCESS,
+    };
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegEnumValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+        KEY_READ, REG_EXPAND_SZ, REG_SZ,
+    };
+    const MAX_VALUES: u32 = 500;
+    let root = if local_machine {
+        HKEY_LOCAL_MACHINE
+    } else {
+        HKEY_CURRENT_USER
+    };
+    let wide = to_wide(OsStr::new(subkey));
+    let mut key: HKEY = ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated and `key` is a valid out pointer.
+    match unsafe { RegOpenKeyExW(root, wide.as_ptr(), 0, KEY_READ, &mut key) } {
+        ERROR_SUCCESS => {}
+        ERROR_FILE_NOT_FOUND => return Ok(Vec::new()),
+        ERROR_ACCESS_DENIED => return Err("You do not have permission to read this key.".into()),
+        _ => return Err("This key could not be read.".into()),
+    }
+    let mut values = Vec::new();
+    let mut result = Ok(());
+    for index in 0..MAX_VALUES {
+        let mut name = [0u16; 512];
+        let mut name_len = name.len() as u32;
+        let mut data = vec![0u8; 16 * 1024];
+        let mut data_len = data.len() as u32;
+        let mut kind = 0u32;
+        // SAFETY: the buffers and their lengths match; `key` is open until RegCloseKey below.
+        let status = unsafe {
+            RegEnumValueW(
+                key,
+                index,
+                name.as_mut_ptr(),
+                &mut name_len,
+                ptr::null_mut(),
+                &mut kind,
+                data.as_mut_ptr(),
+                &mut data_len,
+            )
+        };
+        match status {
+            ERROR_SUCCESS => {}
+            ERROR_NO_MORE_ITEMS => break,
+            ERROR_MORE_DATA => continue, // a value that large is not a command line
+            _ => {
+                result = Err("This key could not be read completely.".to_string());
+                break;
+            }
+        }
+        if kind != REG_SZ && kind != REG_EXPAND_SZ {
+            continue;
+        }
+        let text: Vec<u16> = data[..data_len as usize]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .take_while(|unit| *unit != 0)
+            .collect();
+        values.push((
+            String::from_utf16_lossy(&name[..name_len as usize]),
+            String::from_utf16_lossy(&text),
+        ));
+    }
+    // SAFETY: closes the key opened above, once.
+    unsafe { RegCloseKey(key) };
+    result.map(|()| values)
+}
+
 /// Windows command-line quoting for one argument (CommandLineToArgvW rules).
 fn quote_arg(arg: &str) -> String {
     if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {

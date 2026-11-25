@@ -45,6 +45,8 @@ Modes:
   --scan-file <PATH>        explain the binary AI verdict for PATH (a file, a folder or
                             @list.txt); prints JSON lines and never changes anything
   --check-file <PATH>       check one file with every engine and print one JSON line; read-only
+  --list-startup            list what starts by itself (launch items, Run keys) and judge each one;
+                            prints one JSON document and never changes anything
   --restore <ID>          restore a quarantined file by its quarantine ID
   --delete <ID>             permanently delete a quarantined file by its quarantine ID
   --set <ENGINE>=<on|off>   toggle known_bad, zip_bomb, bin_ai, process_guard, canary or
@@ -135,6 +137,7 @@ pub enum Mode {
     RearmCanaries,
     ScanFile(PathBuf),
     CheckFile(PathBuf),
+    ListStartup,
     Restore(String),
     Delete(String),
     Set(Engine, bool),
@@ -155,6 +158,8 @@ pub struct CliArgs {
     pub log_file: Option<PathBuf>,
     /// Console and one-shot scans only: a known-malware list to use instead of the shipped one.
     pub hash_list: Option<PathBuf>,
+    /// `--startup-dir` (testing, `--list-startup` only): list this one folder instead of the real places.
+    pub startup_dir: Option<PathBuf>,
     /// `--allow` only: the name and detection type recorded with the entry.
     pub allow_name: Option<String>,
     pub allow_type: Option<String>,
@@ -181,6 +186,7 @@ where
     let mut quarantine_dir: Option<PathBuf> = None;
     let mut log_file: Option<PathBuf> = None;
     let mut hash_list: Option<PathBuf> = None;
+    let mut startup_dir: Option<PathBuf> = None;
     let mut allow_name: Option<String> = None;
     let mut allow_type: Option<String> = None;
     let mut iter = args.into_iter();
@@ -207,6 +213,11 @@ where
                 &mut iter,
                 "--check-file",
             )?))),
+            "--list-startup" => Some(Mode::ListStartup),
+            "--startup-dir" => {
+                startup_dir = Some(PathBuf::from(take_value(&mut iter, "--startup-dir")?));
+                None
+            }
             "--allow" => Some(Mode::Allow(allowlist::parse_sha256(&take_value(
                 &mut iter, "--allow",
             )?)?)),
@@ -295,13 +306,20 @@ where
     if hash_list.is_some()
         && !matches!(
             mode,
-            Mode::Console | Mode::QuickScan | Mode::FullScan | Mode::CheckFile(_)
+            Mode::Console
+                | Mode::QuickScan
+                | Mode::FullScan
+                | Mode::CheckFile(_)
+                | Mode::ListStartup
         )
     {
         return Err(
-            "--hash-list is only valid with --console, --quick-scan, --full-scan or --check-file"
+            "--hash-list is only valid with --console, --quick-scan, --full-scan, --check-file or --list-startup"
                 .into(),
         );
+    }
+    if startup_dir.is_some() && mode != Mode::ListStartup {
+        return Err("--startup-dir is only valid with --list-startup".into());
     }
     if (allow_name.is_some() || allow_type.is_some()) && !matches!(mode, Mode::Allow(_)) {
         return Err("--allow-name and --allow-type are only valid with --allow".into());
@@ -316,6 +334,7 @@ where
         quarantine_dir,
         log_file,
         hash_list,
+        startup_dir,
         allow_name,
         allow_type,
     })
@@ -930,6 +949,16 @@ mod tests {
         assert!(args(&["--check-file"]).is_err());
         assert!(args(&["--check-file", "--dry-run"]).is_err());
         assert!(args(&["--check-file", "a.zip", "--dry-run"]).is_err());
+        assert_eq!(args(&["--list-startup"]).unwrap().mode, Mode::ListStartup);
+        assert!(args(&["--list-startup", "--dry-run"]).is_err());
+        assert!(args(&["--list-startup", "--restore", "x"]).is_err());
+        let sandbox = args(&["--list-startup", "--startup-dir", "/tmp/x"]).unwrap();
+        assert_eq!(sandbox.startup_dir, Some(PathBuf::from("/tmp/x")));
+        assert!(
+            args(&["--startup-dir", "/tmp/x"]).is_err(),
+            "never for normal use"
+        );
+        assert!(args(&["--check-file", "a", "--startup-dir", "/tmp/x"]).is_err());
         assert!(args(&["--scan-file"]).is_err());
         assert!(args(&["--scan-file", "a.exe", "--dry-run"]).is_err());
     }
