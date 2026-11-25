@@ -481,6 +481,7 @@ function renderDashboard(d) {
   setCount($("stat-quarantined"), d.quarantined);
   $("stat-cpu").textContent = online ? `${(d.daemon.cpu_percent || 0).toFixed(1)}%` : "—";
   renderScore(d);
+  if (window.NexSetup) window.NexSetup.render(d);
 
   const badge = $("quarantine-badge");
   badge.textContent = String(d.quarantined);
@@ -683,6 +684,7 @@ function renderOffline(reason) {
   $("service-state").className = "pill status red";
   $("service-state").textContent = "Unavailable";
   renderToggles(null, false);
+  if (window.NexSetup) window.NexSetup.render(null);
   for (const id of ["quick-scan", "full-scan", "verify-canaries", "install-service", "uninstall-service"]) $(id).disabled = true;
 }
 
@@ -1166,6 +1168,14 @@ function wireCameraDialog() {
     dialog.close();
     call("open_camera_settings").catch((error) => notice(errorText(error), true));
   });
+}
+
+/** The Setup checklist's buttons do what the matching controls elsewhere already do. */
+function runSetupAction(id) {
+  if (id === "install") $("install-service").click();
+  else if (id === "decoys") $("verify-canaries").click();
+  else if (id === "open_disk_settings") call("open_full_disk_settings").catch((error) => notice(errorText(error), true));
+  else if (id === "dry_run_off") call("toggle_engine", { engine: "dry_run", enabled: false }).then(() => refresh(true)).catch((error) => notice(errorText(error), true));
 }
 
 async function toggleEngine(button) {
@@ -1722,6 +1732,7 @@ function startDashboard() {
   // Offline assistant (ui/bot.js): read-only, starts only after sign-in like everything else here.
   if (window.NexBot) window.NexBot.start({ call, showPage, openActivity });
   if (window.NexFileCheck) window.NexFileCheck.start(copyButton); // drop a file on the window to check it
+  if (window.NexSetup) window.NexSetup.start({ copyButton, run: runSetupAction });
   $("page-sub").textContent = greeting();
   wireTheme();
   initAppearance().then(applyTheme);

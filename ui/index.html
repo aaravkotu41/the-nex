@@ -153,6 +153,10 @@
         </section>
 
         <section class="page active" id="page-overview">
+          <button class="setup-hint" id="setup-hint" type="button" data-goto="settings" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>
+            <span id="setup-hint-text"></span><span class="setup-hint-go">Finish setup</span>
+          </button>
           <div class="overview-top">
             <div class="hero" id="hero" data-tone="idle">
               <div class="hero-body">
@@ -373,6 +377,14 @@
 
         <section class="page" id="page-settings">
           <div class="settings-grid">
+            <div class="panel setup-panel">
+              <div class="panel-head">
+                <h2>Setup</h2>
+                <span class="pill status" id="setup-summary">Checking…</span>
+              </div>
+              <ul class="setup-rows" id="setup-rows"></ul>
+            </div>
+
             <div class="panel">
               <div class="panel-head"><h2>Background Service</h2></div>
               <div class="row">
@@ -499,6 +511,7 @@
   <script src="bot.js"></script>
   <script src="report.js"></script>
   <script src="filecheck.js"></script>
+  <script src="setup.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

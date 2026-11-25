@@ -80,6 +80,14 @@ struct DashboardState {
     service_installed: bool,
     thresholds: Thresholds,
     platform: &'static str,
+    /// Reported by the service itself (the app cannot see another process's access).
+    full_disk_access: Option<bool>,
+    /// The copy macOS lists under Full Disk Access: the service runs from here, not from the app.
+    engine_path: String,
+}
+
+fn engine_copy_path(cfg: &AppConfig) -> PathBuf {
+    cfg.base_dir.join("engine").join(platform::DAEMON_EXE_STEM)
 }
 
 fn config() -> AppConfig {
@@ -101,10 +109,7 @@ fn is_permission_error(error: &io::Error) -> bool {
 /// Runs `the-nex <args>` through the OS administrator prompt: the root-only engine copy once the
 /// service is installed (the app's own copy may be user-writable), the app's copy to install it.
 fn elevated(args: &[&str]) -> Result<(), String> {
-    let engine = config()
-        .base_dir
-        .join("engine")
-        .join(platform::DAEMON_EXE_STEM);
+    let engine = engine_copy_path(&config());
     let exe = if cfg!(target_os = "macos") && args.first() != Some(&"--install") && engine.is_file()
     {
         engine
@@ -275,6 +280,8 @@ fn get_dashboard_state() -> Result<DashboardState, String> {
             ai_threshold: cfg.ai_threshold,
         },
         platform: std::env::consts::OS,
+        full_disk_access: status.as_ref().and_then(|s| s.full_disk_access),
+        engine_path: display(&engine_copy_path(&cfg)),
     })
 }
 
@@ -632,6 +639,26 @@ async fn open_camera_settings() -> Result<(), String> {
     Err("Open your system camera settings and allow The Nex.".to_string())
 }
 
+/// The Full Disk Access page of System Settings. Fixed: the page never chooses what is opened.
+#[cfg(target_os = "macos")]
+const FULL_DISK_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
+
+#[tauri::command]
+async fn open_full_disk_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return blocking(|| {
+        std::process::Command::new("/usr/bin/open")
+            .arg(FULL_DISK_SETTINGS_URL)
+            .status()
+            .map(|_| ())
+            .map_err(|e| format!("cannot open System Settings: {e}"))
+    })
+    .await;
+    #[cfg(not(target_os = "macos"))]
+    Err("Full Disk Access is a macOS setting.".to_string())
+}
+
 /// The website's report form for one kind of problem. Only these fixed addresses can be opened:
 /// the page never chooses the URL.
 fn report_url(kind: &str) -> Option<String> {
@@ -709,6 +736,7 @@ fn main() {
             aegismesh,
             camera_access,
             open_camera_settings,
+            open_full_disk_settings,
             open_report_page,
             start_full_scan,
             scan_progress,
@@ -734,6 +762,27 @@ mod tests {
         for bad in ["", "bug&x=1", "https://evil.example", "../x", "BUG"] {
             assert_eq!(report_url(bad), None, "{bad}");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_full_disk_access_page_is_a_fixed_system_settings_address() {
+        assert_eq!(
+            FULL_DISK_SETTINGS_URL,
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+        );
+    }
+
+    #[test]
+    fn the_engine_copy_to_grant_is_the_one_under_the_data_folder() {
+        let cfg = AppConfig::for_base_dir(Path::new("/data/TheNex"));
+        let path = engine_copy_path(&cfg);
+        assert_eq!(path.parent(), Some(Path::new("/data/TheNex/engine")));
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("the-nex"));
     }
 
     fn event(kind: &str, severity: Severity, target: &str) -> ThreatEvent {
