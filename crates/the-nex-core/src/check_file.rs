@@ -24,6 +24,8 @@ pub enum Verdict {
     NothingFound,
     /// No engine applies to this kind of file.
     NotScanned,
+    /// Nothing was found, but a time or size limit stopped the check before it was finished.
+    PartlyChecked,
     /// The file was not opened (folder, device, too big, unreadable).
     Refused,
 }
@@ -40,16 +42,32 @@ pub struct FileCheck {
     pub sha256: Option<String>,
     /// Plain-language sentences, strongest first.
     pub reasons: Vec<String>,
-    /// Which checks actually ran: "program", "archive", "list".
+    /// Which checks actually ran: "program", "signature", "archive", "list".
     pub checks: Vec<String>,
 }
 
-fn display_name(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy();
-    name.chars().take(200).collect()
+/// Bidi controls and zero-width characters: invisible, but they change how text reads.
+pub fn is_invisible_format(c: char) -> bool {
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{061C}' | '\u{FEFF}')
+}
+
+/// A file name made safe to show: no bidi or zero-width characters (they can make `exe.txt`
+/// read as `txt.exe`), control characters become spaces, at most 200 characters.
+pub fn clean_display_name(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !is_invisible_format(*c))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(200)
+        .collect()
+}
+
+pub fn display_name(path: &Path) -> String {
+    clean_display_name(
+        &path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy(),
+    )
 }
 
 fn refused(name: String, size: Option<u64>, why: String) -> FileCheck {
@@ -178,10 +196,14 @@ pub fn check(cfg: &AppConfig, scanner: &BinaryAiScanner, path: &Path) -> FileChe
     let mut checks = Vec::new();
     let mut reasons = Vec::new();
     let mut suspicious = false;
+    // True once something other than the list looked at the file's contents.
+    let mut examined = false;
+    let mut partial = false;
     let (mut score, mut threshold) = (None, None);
     let kind = engine::classify_file(&target);
+    let listed = !cfg.known_bad.is_empty();
 
-    if !cfg.known_bad.is_empty() {
+    if listed {
         checks.push("list".to_string());
         if cfg.known_bad.contains(&digest) {
             suspicious = true;
@@ -194,20 +216,35 @@ pub fn check(cfg: &AppConfig, scanner: &BinaryAiScanner, path: &Path) -> FileChe
     match kind {
         FileKind::Archive => {
             checks.push("archive".to_string());
-            if let Some(threat) = zip_bomb::inspect_zip_file(&target, cfg) {
+            examined = true;
+            let (threat, incomplete) = zip_bomb::inspect_zip_file_checked(&target, cfg);
+            if let Some(threat) = threat {
                 suspicious = true;
                 reasons.push(zip_reason(&threat));
+            } else if incomplete {
+                partial = true;
+                reasons.push(
+                    "It is too large or complicated to check completely, so the check stopped early and part of it was not examined."
+                        .into(),
+                );
             }
+            reasons.push(
+                "Only the archive's structure was checked. The files inside it were not checked for malware."
+                    .into(),
+            );
         }
         FileKind::Binary if scanner.is_trusted(&target) => {
-            checks.push("program".to_string());
+            checks.push("signature".to_string());
+            examined = true;
             reasons.push(
-                "It is signed by a publisher this computer trusts, so it was not scored.".into(),
+                "It was trusted because it carries a signature from a publisher this computer trusts. It was not scored, and only its signature was checked."
+                    .into(),
             );
         }
         FileKind::Binary => match scanner.assess(&target) {
             Some(assessment) => {
                 checks.push("program".to_string());
+                examined = true;
                 let limit = ai_policy::effective_threshold(cfg.ai_threshold);
                 score = Some(assessment.score);
                 threshold = Some(limit);
@@ -221,19 +258,29 @@ pub fn check(cfg: &AppConfig, scanner: &BinaryAiScanner, path: &Path) -> FileChe
                     .into(),
             ),
         },
-        FileKind::Other => {
-            reasons.push(if checks.is_empty() {
-                "This is not a program or archive, so there is nothing to score.".to_string()
-            } else {
-                "This is not a program or archive, so only the known-malware list was checked."
-                    .to_string()
-            });
-        }
+        FileKind::Other => reasons.push(
+            "This is not a program or archive, so there is nothing to score.".to_string(),
+        ),
+    }
+    if !examined && !suspicious {
+        reasons.push(if listed {
+            "It is not on the known-malware list. Nothing else could be checked for it.".to_string()
+        } else {
+            "No known-malware list is installed, so nothing could be checked.".to_string()
+        });
+    }
+    if cfg.is_allowed(&digest) {
+        reasons.push(
+            "This exact file is on your always-allow list. That does not change this result."
+                .into(),
+        );
     }
     let verdict = if suspicious {
         Verdict::Suspicious
-    } else if checks.is_empty() {
+    } else if !examined {
         Verdict::NotScanned
+    } else if partial {
+        Verdict::PartlyChecked
     } else {
         Verdict::NothingFound
     };
@@ -412,5 +459,130 @@ mod tests {
         assert_eq!(fs::metadata(&cfg.events_log).unwrap().len(), 0, "no event");
         assert_eq!(fs::read_dir(&cfg.quarantine_dir).unwrap().count(), 0);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A config with a one-entry known-malware list that holds something else.
+    fn listed_cfg(dir: &Path) -> AppConfig {
+        let other = dir.join("other-listed.bin");
+        fs::write(&other, b"some other listed file").unwrap();
+        let list = dir.join("list.bin");
+        let digest = known_bad::hash_file(&other, MAX_CHECK_BYTES).unwrap();
+        known_bad::write_list(&list, &[digest], 1).unwrap();
+        let mut cfg = AppConfig::for_base_dir(&dir.join("TheNex"));
+        cfg.ensure_dirs().unwrap();
+        cfg.hash_list = Some(list);
+        cfg.load_known_bad().unwrap();
+        cfg
+    }
+
+    #[test]
+    fn an_archive_says_its_contents_were_not_checked() {
+        let dir = scratch("archive-words");
+        let fine = dir.join("fine.zip");
+        fs::write(&fine, zip_of(b"a short harmless note\n")).unwrap();
+        let result = run(&dir, &fine);
+        assert_eq!(result.verdict, Verdict::NothingFound);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|r| r.contains("inside it were not checked for malware")),
+            "{:?}",
+            result.reasons
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_check_cut_short_by_a_budget_is_not_reported_as_nothing_found() {
+        let dir = scratch("partial");
+        // 70 MB of noise: it cannot be a ratio bomb, but it is more than the 64 MB the archive
+        // check is willing to decompress.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let noise: Vec<u8> = (0..70 * 1024 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 32) as u8
+            })
+            .collect();
+        let mut cursor = Cursor::new(Vec::new());
+        let mut writer = ZipWriter::new(&mut cursor);
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .compression_level(Some(1));
+        writer.start_file("big.bin", options).unwrap();
+        writer.write_all(&noise).unwrap();
+        writer.finish().unwrap();
+        let file = dir.join("big.zip");
+        fs::write(&file, cursor.into_inner()).unwrap();
+        let result = run(&dir, &file);
+        assert_eq!(result.verdict, Verdict::PartlyChecked, "{result:?}");
+        assert!(result.reasons.iter().any(|r| r.contains("stopped early")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_a_list_loaded_a_file_nothing_could_score_is_not_green() {
+        let dir = scratch("list-only");
+        let cfg = listed_cfg(&dir);
+        let scanner = BinaryAiScanner::heuristic_only();
+        let note = dir.join("note.txt");
+        fs::write(&note, b"hello").unwrap();
+        let broken = dir.join("broken.exe");
+        fs::write(&broken, b"MZ not really a program").unwrap();
+        for file in [&note, &broken] {
+            let result = check(&cfg, &scanner, file);
+            assert_eq!(result.verdict, Verdict::NotScanned, "{file:?}: {result:?}");
+            assert_eq!(result.checks, ["list"]);
+            assert!(
+                result
+                    .reasons
+                    .iter()
+                    .any(|r| r.contains("not on the known-malware list")),
+                "{:?}",
+                result.reasons
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_signed_program_shows_a_signature_check_not_a_score() {
+        let dir = scratch("signed");
+        let result = run(&dir, Path::new("/bin/ls"));
+        assert_eq!(result.verdict, Verdict::NothingFound, "{result:?}");
+        assert_eq!(result.checks, ["signature"]);
+        assert!(result.score.is_none());
+        assert!(result.reasons[0].contains("because it carries a signature"));
+        assert!(result.reasons[0].contains("not scored"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_always_allowed_file_says_so_and_keeps_its_verdict() {
+        let dir = scratch("allowed");
+        let cfg = listed_cfg(&dir);
+        let scanner = BinaryAiScanner::heuristic_only();
+        let note = dir.join("note.txt");
+        fs::write(&note, b"hello").unwrap();
+        let before = check(&cfg, &scanner, &note);
+        assert!(!before.reasons.iter().any(|r| r.contains("always-allow")));
+        let sha = before.sha256.clone().unwrap();
+        let entry = crate::allowlist::AllowedFile::new(&sha, "note.txt", "ZIP_BOMB").unwrap();
+        crate::allowlist::add(&cfg, entry).unwrap();
+        let after = check(&cfg, &scanner, &note);
+        assert_eq!(after.verdict, before.verdict);
+        assert!(after.reasons.iter().any(|r| r.contains("always-allow")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn names_shown_to_people_lose_bidi_and_zero_width_characters() {
+        let tricky = "invoice\u{202E}gpj.exe\u{200B}\u{FEFF}\u{2066}x\u{061C}\n.zip";
+        assert_eq!(clean_display_name(tricky), "invoicegpj.exex .zip");
+        assert_eq!(display_name(Path::new("/a/b\u{202E}c.txt")), "bc.txt");
     }
 }

@@ -1,7 +1,9 @@
 //! Drag a file onto the window to check it.
 //!
-//! The drop is handled here, not by a command the page can call: the page never supplies a path,
-//! so it cannot use this to look at files the user did not drop. Each file is inspected by the
+//! The drop is handled here, not by a command the page can call: there is no command that takes
+//! a path, so the page cannot ask for a check of a file the user did not drop. (Tauri's own
+//! drag-drop event does carry the dropped paths to the page, so the page does see them; it just
+//! cannot send one back.) Each file is inspected by the
 //! bundled engine (`the-nex --check-file`) in a child process with the user's own rights, a time
 //! limit and bounded output, because a dropped file is hostile input. The engine only reads.
 //! The page gets back name, verdict, score, plain reasons, size, sha256 and which checks ran.
@@ -23,8 +25,19 @@ const TIME_LIMIT: Duration = Duration::from_secs(30);
 /// A real answer is well under 2 KB.
 const MAX_OUTPUT: u64 = 64 * 1024;
 const MAX_REASONS: usize = 8;
+/// For one whole drop; files not reached by then are reported as not checked.
+const TOTAL_LIMIT: Duration = Duration::from_secs(120);
 
 static BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Clears [`BUSY`] when dropped, so a panic cannot leave every later drop refused.
+struct ClearBusy;
+
+impl Drop for ClearBusy {
+    fn drop(&mut self) {
+        BUSY.store(false, Ordering::SeqCst);
+    }
+}
 
 #[derive(Serialize, Clone)]
 struct Outcome {
@@ -35,13 +48,7 @@ struct Outcome {
 
 fn not_checked(file: &Path, why: &str) -> FileCheck {
     FileCheck {
-        name: file
-            .file_name()
-            .unwrap_or(file.as_os_str())
-            .to_string_lossy()
-            .chars()
-            .take(200)
-            .collect(),
+        name: the_nex_core::check_file::display_name(file),
         verdict: Verdict::Refused,
         score: None,
         threshold: None,
@@ -149,7 +156,7 @@ fn check_one(engine: &Path, file: &Path, limit: Duration) -> FileCheck {
     }
 }
 
-fn check_all(engine: &Path, paths: &[PathBuf], limit: Duration) -> Outcome {
+fn check_all(engine: &Path, paths: &[PathBuf], limit: Duration, total: Duration) -> Outcome {
     let error = if paths.is_empty() {
         Some("Nothing to check.".to_string())
     } else if paths.len() > MAX_FILES {
@@ -165,7 +172,19 @@ fn check_all(engine: &Path, paths: &[PathBuf], limit: Duration) -> Outcome {
     Outcome {
         results: match error {
             Some(_) => Vec::new(),
-            None => paths.iter().map(|p| check_one(engine, p, limit)).collect(),
+            None => {
+                let started = Instant::now();
+                paths
+                    .iter()
+                    .map(|p| match total.checked_sub(started.elapsed()) {
+                        Some(left) if !left.is_zero() => check_one(engine, p, limit.min(left)),
+                        _ => not_checked(
+                            p,
+                            "This drop took too long, so this file was not checked. Drop it again on its own.",
+                        ),
+                    })
+                    .collect()
+            }
         },
         error,
     }
@@ -188,10 +207,9 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
                 error: Some("Still checking the last files. Try again in a moment.".into()),
             }
         } else {
+            let _clear = ClearBusy; // also on a panic
             let engine = platform::sibling_executable(platform::DAEMON_EXE_STEM);
-            let outcome = check_all(&engine, &paths, TIME_LIMIT);
-            BUSY.store(false, Ordering::SeqCst);
-            outcome
+            check_all(&engine, &paths, TIME_LIMIT, TOTAL_LIMIT)
         };
         let _ = window.emit(RESULT_EVENT, outcome);
     });
@@ -271,18 +289,34 @@ mod tests {
         let many: Vec<PathBuf> = (0..=MAX_FILES)
             .map(|i| PathBuf::from(format!("/tmp/{i}")))
             .collect();
-        let outcome = check_all(&engine, &many, Duration::from_secs(5));
+        let outcome = check_all(
+            &engine,
+            &many,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        );
         assert!(outcome.results.is_empty());
         assert!(outcome.error.unwrap().contains("at most 20"));
-        assert!(check_all(&engine, &[], Duration::from_secs(5))
-            .error
-            .is_some());
-        let twenty = check_all(&engine, &many[..MAX_FILES], Duration::from_secs(5));
+        assert!(check_all(
+            &engine,
+            &[],
+            Duration::from_secs(5),
+            Duration::from_secs(60)
+        )
+        .error
+        .is_some());
+        let twenty = check_all(
+            &engine,
+            &many[..MAX_FILES],
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        );
         assert_eq!((twenty.results.len(), twenty.error), (20, None));
         let no_engine = check_all(
             Path::new("/nonexistent/engine"),
             &many[..1],
             Duration::from_secs(5),
+            Duration::from_secs(60),
         );
         assert!(no_engine.error.unwrap().contains("not found"));
     }
@@ -293,5 +327,38 @@ mod tests {
             serde_json::to_value(not_checked(Path::new("/secret/folder/a.zip"), "why")).unwrap();
         assert_eq!(json["name"], "a.zip");
         assert!(!json.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn a_drop_that_runs_out_of_total_time_reports_the_rest_as_not_checked() {
+        let engine = fake_engine("total", "sleep 30");
+        let files: Vec<PathBuf> = (0..3)
+            .map(|i| PathBuf::from(format!("/tmp/{i}.zip")))
+            .collect();
+        let started = Instant::now();
+        let outcome = check_all(
+            &engine,
+            &files,
+            Duration::from_secs(10),
+            Duration::from_millis(400),
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(outcome.results.len(), 3);
+        assert!(outcome.results[0].reasons[0].contains("too long"));
+        for rest in &outcome.results[1..] {
+            assert_eq!(rest.verdict, Verdict::Refused);
+            assert!(rest.reasons[0].contains("drop took too long"), "{rest:?}");
+        }
+    }
+
+    #[test]
+    fn busy_is_cleared_even_when_the_check_panics() {
+        BUSY.store(true, Ordering::SeqCst);
+        let result = std::panic::catch_unwind(|| {
+            let _clear = ClearBusy;
+            panic!("check blew up");
+        });
+        assert!(result.is_err());
+        assert!(!BUSY.load(Ordering::SeqCst));
     }
 }

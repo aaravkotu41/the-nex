@@ -10,6 +10,11 @@
 
   const UPDATE_NOTE = "After The Nex is updated, macOS may ask for this again: switch it off and on once more.";
 
+  const ENGINES = [
+    ["known_bad_enabled", "Known Malware List"], ["zip_bomb_enabled", "Zip Bomb Guard"], ["bin_ai_enabled", "ONNX Binary AI"],
+    ["process_guard_enabled", "LotL Process Guard"], ["canary_enabled", "Canary Honeypots"],
+  ];
+
   /** states: ok (done), todo (needs you), unknown (cannot tell), info (shown, never counted). */
   function checklist(d) {
     const online = Boolean(d.daemon && d.daemon.online);
@@ -46,6 +51,11 @@
       rows.push(row);
     }
 
+    // An engine that is switched off protects nothing; the known-malware list only counts once a list is loaded.
+    const toggles = d.toggles && typeof d.toggles === "object" ? d.toggles : null;
+    const listLoaded = Boolean(d.known_bad && d.known_bad.loaded);
+    const off = toggles ? ENGINES.filter(([key]) => toggles[key] === false && (key !== "known_bad_enabled" || listLoaded)).map(([, name]) => name) : [];
+
     const protection = { id: "protection", title: "Protection is on" };
     if (d.dry_run) {
       Object.assign(protection, {
@@ -55,8 +65,12 @@
       });
     } else if (!online) {
       Object.assign(protection, { state: "unknown", text: "Dry Run is off, but protection only works while the service is running." });
+    } else if (!toggles) {
+      Object.assign(protection, { state: "unknown", text: "Dry Run is off, but which checks are switched on could not be read." });
+    } else if (off.length) {
+      Object.assign(protection, { state: "todo", text: `Switched off: ${off.join(", ")}. Turn ${off.length === 1 ? "it" : "them"} on in Engines, or that protection is missing.` });
     } else {
-      Object.assign(protection, { state: "ok", text: "Dry Run is off: threats are quarantined or stopped as they appear." });
+      Object.assign(protection, { state: "ok", text: "Dry Run is off and every check is on: threats are quarantined or stopped as they appear." });
     }
     rows.push(protection);
 
@@ -71,7 +85,10 @@
 
     const canaries = Array.isArray(d.canaries) ? d.canaries.length : 0;
     const intact = Number(d.canaries_intact) || 0;
-    rows.push(canaries > 0 && intact === canaries
+    const watching = !toggles || toggles.canary_enabled !== false;
+    rows.push(canaries > 0 && intact === canaries && !watching
+      ? { id: "decoys", title: "Decoy files", state: "todo", text: `All ${canaries} decoy files are in place, but Canary Honeypots is switched off, so changes to them are not noticed. Turn it on in Engines.` }
+      : canaries > 0 && intact === canaries
       ? { id: "decoys", title: "Decoy files", state: "ok", text: `All ${canaries} decoy files are in place. They reveal ransomware the moment one changes.` }
       : {
         id: "decoys", title: "Decoy files", state: "todo",

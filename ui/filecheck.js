@@ -1,14 +1,15 @@
 // "Check a file": drop files on the window and see what The Nex's engines make of them.
 // The drop itself is handled by the app (crates/the-nex-gui/src/filecheck.rs), which sends the
-// result as an event; this page never passes a path to anything and has no command to call, so
-// nothing here (or in a synced command) can point the check at a file the user did not drop.
+// result as an event. Tauri's drag-drop event does hand the dropped paths to this page, so the page
+// can see them, but it has no command that takes a path and never sends one back, so nothing here
+// (or in a synced command) can point the check at a file the user did not drop.
 (function (root, factory) {
   if (typeof module === "object" && module.exports) module.exports = factory();
   else root.NexFileCheck = factory();
 })(typeof self !== "undefined" ? self : this, function () {
   "use strict";
 
-  const CHECK_NAMES = { program: "Program check (AI score)", archive: "Archive check (zip bombs)", list: "Known-malware list" };
+  const CHECK_NAMES = { program: "Program check (AI score)", signature: "Signature check (trusted, not scored)", archive: "Archive check (zip bombs)", list: "Known-malware list" };
   const LIMITS = "This is a quick look at how the file is built, not a guarantee. Some malware gets past checks like this.";
   const RESULT_EVENT = "filecheck://result";
 
@@ -36,6 +37,7 @@
     let pill = "Not checked";
     if (r.verdict === "suspicious") { tone = "red"; pill = "Suspicious"; }
     else if (r.verdict === "nothing_found") { tone = "green"; pill = "Nothing suspicious found"; lines.push(LIMITS); }
+    else if (r.verdict === "partly_checked") { tone = "amber"; pill = "Not fully checked"; }
     else if (r.verdict === "not_scanned") { pill = "Nothing to score"; }
     else if (r.verdict === "refused") { tone = "amber"; }
     const facts = [];

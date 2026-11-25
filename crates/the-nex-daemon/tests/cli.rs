@@ -255,6 +255,28 @@ fn scan_file_explains_verdicts_and_changes_nothing() {
 }
 
 #[test]
+fn check_file_checks_the_file_whose_name_was_given_not_a_trimmed_one() {
+    let sandbox = Sandbox::new("checkname");
+    let dir = sandbox.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    // A harmless (empty) archive under the plain name, a bomb under the name plus a space.
+    let (plain, spaced) = (dir.join("pack.zip"), dir.join("pack.zip "));
+    let empty_zip = [
+        0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    fs::write(&plain, empty_zip).unwrap();
+    fs::write(&spaced, overlapping_zip()).unwrap();
+    let verdict = |file: &Path| -> String {
+        let output = sandbox.run(&["--check-file", file.to_str().unwrap()]);
+        assert!(output.status.success(), "{}", describe(&output));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        json["verdict"].as_str().unwrap().to_string()
+    };
+    assert_eq!(verdict(&plain), "nothing_found");
+    assert_eq!(verdict(&spaced), "suspicious");
+}
+
+#[test]
 fn quick_scan_finds_bombs_without_touching_them_in_dry_run() {
     let sandbox = Sandbox::new("scan");
     let watch = sandbox.path().join("watch");

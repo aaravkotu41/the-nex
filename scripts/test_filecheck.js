@@ -26,6 +26,15 @@ assert.strictEqual(other.pill, "Nothing to score");
 assert.ok(other.lines[0].includes("nothing to score"));
 assert.strictEqual(other.tone, "gray");
 
+const partly = C.present({ ...base, verdict: "partly_checked", checks: ["archive"], reasons: ["The check stopped early."] });
+assert.strictEqual(partly.tone, "amber");
+assert.strictEqual(partly.pill, "Not fully checked");
+assert.ok(!partly.lines.some((l) => /not a guarantee/.test(l)) || partly.tone !== "green");
+
+const signed = C.present({ ...base, verdict: "nothing_found", checks: ["signature"], reasons: ["It was trusted because it carries a signature."] });
+const checksRun = signed.facts.find(([k]) => k === "Checks run")[1];
+assert.ok(/Signature check/.test(checksRun) && !/AI score/.test(checksRun), checksRun);
+
 const refused = C.present({ name: "Docs", verdict: "refused", size: null, sha256: null, reasons: ["That is a folder."], checks: [] });
 assert.strictEqual(refused.tone, "amber");
 assert.strictEqual(refused.pill, "Not checked");
@@ -33,7 +42,7 @@ assert.deepStrictEqual(refused.facts, []);
 assert.strictEqual(refused.sha256, "");
 
 // Nothing a result can say includes the word "safe", and a score never shows for a refusal.
-const everything = [bad, fine, other, refused].map((v) => JSON.stringify(v)).join(" ");
+const everything = [bad, fine, other, partly, signed, refused].map((v) => JSON.stringify(v)).join(" ");
 assert.ok(!/\bsafe\b/i.test(everything), everything);
 assert.ok(!C.present({ verdict: "refused", score: 0.9, threshold: 0.6, reasons: [], checks: [] }).lines.some((l) => /score/i.test(l)));
 

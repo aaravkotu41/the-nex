@@ -8,7 +8,7 @@ const S = require(path.join(__dirname, "..", "ui", "setup.js"));
 
 const good = () => ({
   platform: "macos", daemon: { online: true }, service_installed: true, full_disk_access: true,
-  dry_run: false, known_bad: { loaded: false, entries: 0 }, canaries: [{}, {}], canaries_intact: 2,
+  dry_run: false, toggles: { known_bad_enabled: true, zip_bomb_enabled: true, bin_ai_enabled: true, process_guard_enabled: true, canary_enabled: true }, known_bad: { loaded: false, entries: 0 }, canaries: [{}, {}], canaries_intact: 2,
   engine_path: "/Library/Application Support/TheNex/engine/the-nex",
 });
 const row = (model, id) => model.rows.find((r) => r.id === id);
@@ -62,6 +62,28 @@ assert.strictEqual(row(S.checklist({ ...good(), canaries: [], canaries_intact: 0
 m = S.checklist({ ...good(), canaries_intact: 1 });
 assert.strictEqual(row(m, "decoys").text, "1 of 2 decoy files are in place.");
 assert.strictEqual(row(m, "decoys").action.label, "Repair decoy files");
+
+// An engine that is switched off: never "all set", never "Protection is on" or a decoy promise.
+for (const key of ["zip_bomb_enabled", "bin_ai_enabled", "process_guard_enabled", "canary_enabled"]) {
+  m = S.checklist({ ...good(), toggles: { ...good().toggles, [key]: false } });
+  assert.strictEqual(m.allSet, false, key);
+  assert.strictEqual(row(m, "protection").state, "todo", key);
+  assert.match(row(m, "protection").text, /Switched off/);
+}
+m = S.checklist({ ...good(), toggles: { ...good().toggles, canary_enabled: false } });
+assert.strictEqual(row(m, "decoys").state, "todo");
+assert.match(row(m, "decoys").text, /switched off, so changes to them are not noticed/);
+assert.ok(!/reveal ransomware/.test(row(m, "decoys").text));
+// The list engine only counts once a list is loaded.
+m = S.checklist({ ...good(), toggles: { ...good().toggles, known_bad_enabled: false } });
+assert.strictEqual(m.allSet, true);
+m = S.checklist({ ...good(), known_bad: { loaded: true, entries: 5 }, toggles: { ...good().toggles, known_bad_enabled: false } });
+assert.strictEqual(m.allSet, false);
+assert.match(row(m, "protection").text, /Known Malware List/);
+// Toggles not reported: cannot say protection is on.
+m = S.checklist({ ...good(), toggles: undefined });
+assert.strictEqual(row(m, "protection").state, "unknown");
+assert.strictEqual(m.allSet, false);
 
 // Odd input does not throw.
 assert.doesNotThrow(() => S.checklist({ daemon: {}, canaries: null }));

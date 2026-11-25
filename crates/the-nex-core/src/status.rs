@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 /// A status.json older than this means the daemon is not running.
 pub const STALE_AFTER_SECS: i64 = 10;
+/// A heartbeat this far ahead of our clock is only skew; further ahead is not a live service.
+pub const FUTURE_SKEW_SECS: i64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanaryStatus {
@@ -41,8 +43,8 @@ pub struct Telemetry {
 /// database behind it). Opening it asks nothing of the user: macOS just refuses.
 #[cfg(target_os = "macos")]
 const FDA_PROBE_FILE: &str = "/Library/Application Support/com.apple.TCC/TCC.db";
-/// Cheap, but a refused open is logged by the OS, so it is not repeated on every status write.
-const FDA_RECHECK: Duration = Duration::from_secs(6);
+/// Cheap, but a refused open is logged by the OS, so it is repeated at most once a minute.
+const FDA_RECHECK: Duration = Duration::from_secs(60);
 
 /// Some(true) when `path` opens, Some(false) when the OS refuses it, None when it cannot say
 /// (missing file, any other error). The file is closed at once and never read.
@@ -71,21 +73,27 @@ impl Telemetry {
     pub fn full_disk_access(&self) -> Option<bool> {
         #[cfg(target_os = "macos")]
         {
-            let mut last = lock_or_recover(&self.full_disk_access);
-            if let Some((at, value)) = *last {
-                if at.elapsed() < FDA_RECHECK {
-                    return value;
-                }
-            }
-            let value = probe_open(Path::new(FDA_PROBE_FILE));
-            *last = Some((Instant::now(), value));
-            value
+            self.full_disk_access_with(|| probe_open(Path::new(FDA_PROBE_FILE)))
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&self.full_disk_access, FDA_RECHECK);
             None
         }
+    }
+
+    /// The remembered answer while it is under [`FDA_RECHECK`] old, else `probe()`'s.
+    #[cfg(any(target_os = "macos", test))]
+    fn full_disk_access_with(&self, probe: impl FnOnce() -> Option<bool>) -> Option<bool> {
+        let mut last = lock_or_recover(&self.full_disk_access);
+        if let Some((at, value)) = *last {
+            if at.elapsed() < FDA_RECHECK {
+                return value;
+            }
+        }
+        let value = probe();
+        *last = Some((Instant::now(), value));
+        value
     }
 
     pub fn set_watched_dirs(&self, dirs: Vec<PathBuf>) {
@@ -136,7 +144,13 @@ pub struct EngineStatus {
 
 impl EngineStatus {
     pub fn is_fresh(&self) -> bool {
-        (Utc::now() - self.heartbeat).num_seconds() <= STALE_AFTER_SECS
+        self.is_fresh_at(Utc::now())
+    }
+
+    /// Fresh means recent: a heartbeat from the future (a copied or forged file, or a wrong
+    /// clock) beyond a small skew is not a running service.
+    pub fn is_fresh_at(&self, now: DateTime<Utc>) -> bool {
+        (-FUTURE_SKEW_SECS..=STALE_AFTER_SECS).contains(&(now - self.heartbeat).num_seconds())
     }
 
     pub fn scanned(&self) -> u64 {
@@ -220,6 +234,57 @@ mod tests {
         assert!(!status.is_fresh());
         assert!(status.canaries[0].is_intact());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_heartbeat_from_the_future_is_not_fresh() {
+        let cfg = AppConfig::for_base_dir(&std::env::temp_dir().join("thenex-status-future"));
+        let mut status = build_status(
+            &cfg,
+            &Telemetry::default(),
+            Utc::now(),
+            ResourceUsage::default(),
+        );
+        let now = Utc::now();
+        for (offset, fresh) in [
+            (-2, true),
+            (0, true),
+            (8, true),
+            (11, false),
+            (-4, true),
+            (-6, false),
+            (3600, false),
+        ] {
+            status.heartbeat = now - chrono::Duration::seconds(offset);
+            assert_eq!(status.is_fresh_at(now), fresh, "heartbeat {offset}s ago");
+        }
+        status.heartbeat = Utc::now() + chrono::Duration::days(365);
+        assert!(!status.is_fresh());
+    }
+
+    #[test]
+    fn full_disk_access_is_probed_at_most_once_a_minute() {
+        let telemetry = Telemetry::default();
+        let calls = std::cell::Cell::new(0);
+        let probe = |answer| {
+            calls.set(calls.get() + 1);
+            Some(answer)
+        };
+        assert_eq!(
+            telemetry.full_disk_access_with(|| probe(false)),
+            Some(false)
+        );
+        // Within the minute the remembered answer is used and the probe never runs.
+        assert_eq!(telemetry.full_disk_access_with(|| probe(true)), Some(false));
+        assert_eq!(calls.get(), 1);
+        assert!(FDA_RECHECK >= Duration::from_secs(60));
+        // An old answer is probed again.
+        *telemetry.full_disk_access.lock().unwrap() = Some((
+            Instant::now() - FDA_RECHECK - Duration::from_secs(1),
+            Some(false),
+        ));
+        assert_eq!(telemetry.full_disk_access_with(|| probe(true)), Some(true));
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]

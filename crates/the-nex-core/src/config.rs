@@ -165,6 +165,16 @@ pub struct CliArgs {
     pub allow_type: Option<String>,
 }
 
+/// A path argument exactly as given: no trim and no lossy conversion, so a file whose name ends
+/// in a space or newline, or is not UTF-8, is the one that gets used. Only missing/empty (or
+/// something that looks like the next flag) is refused.
+fn take_path<I: Iterator<Item = OsString>>(iter: &mut I, flag: &str) -> Result<PathBuf, String> {
+    match iter.next() {
+        Some(v) if !v.is_empty() && !v.as_encoded_bytes().starts_with(b"--") => Ok(v.into()),
+        _ => Err(format!("{flag} requires a value")),
+    }
+}
+
 fn take_value<I: Iterator<Item = OsString>>(iter: &mut I, flag: &str) -> Result<String, String> {
     let value = iter
         .next()
@@ -205,17 +215,11 @@ where
             "--help" | "-h" | "/?" => Some(Mode::Help),
             "--restore" => Some(Mode::Restore(take_value(&mut iter, "--restore")?)),
             "--delete" => Some(Mode::Delete(take_value(&mut iter, "--delete")?)),
-            "--scan-file" => Some(Mode::ScanFile(PathBuf::from(take_value(
-                &mut iter,
-                "--scan-file",
-            )?))),
-            "--check-file" => Some(Mode::CheckFile(PathBuf::from(take_value(
-                &mut iter,
-                "--check-file",
-            )?))),
+            "--scan-file" => Some(Mode::ScanFile(take_path(&mut iter, "--scan-file")?)),
+            "--check-file" => Some(Mode::CheckFile(take_path(&mut iter, "--check-file")?)),
             "--list-startup" => Some(Mode::ListStartup),
             "--startup-dir" => {
-                startup_dir = Some(PathBuf::from(take_value(&mut iter, "--startup-dir")?));
+                startup_dir = Some(take_path(&mut iter, "--startup-dir")?);
                 None
             }
             "--allow" => Some(Mode::Allow(allowlist::parse_sha256(&take_value(
@@ -961,6 +965,30 @@ mod tests {
         assert!(args(&["--check-file", "a", "--startup-dir", "/tmp/x"]).is_err());
         assert!(args(&["--scan-file"]).is_err());
         assert!(args(&["--scan-file", "a.exe", "--dry-run"]).is_err());
+    }
+
+    #[test]
+    fn path_arguments_are_taken_exactly_as_given() {
+        for name in ["pack.zip ", "pack.zip\n", " pack.zip", " "] {
+            assert_eq!(
+                args(&["--check-file", name]).unwrap().mode,
+                Mode::CheckFile(PathBuf::from(name))
+            );
+            assert_eq!(
+                args(&["--scan-file", name]).unwrap().mode,
+                Mode::ScanFile(PathBuf::from(name))
+            );
+            let sandbox = args(&["--list-startup", "--startup-dir", name]).unwrap();
+            assert_eq!(sandbox.startup_dir, Some(PathBuf::from(name)));
+        }
+        assert!(args(&["--check-file", ""]).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = OsString::from_vec(b"bad-\xff\xfe.zip".to_vec());
+            let parsed = parse_args([OsString::from("--check-file"), raw.clone()]).unwrap();
+            assert_eq!(parsed.mode, Mode::CheckFile(PathBuf::from(raw)));
+        }
     }
 
     #[test]

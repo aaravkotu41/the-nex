@@ -134,25 +134,42 @@ pub fn wait_for_file_ready(path: &Path) -> bool {
 /// Reads the central directory, local headers and (bounded, in-memory) nested archives; never
 /// extracts to disk. Work is bounded by byte and time budgets, and failures fail open.
 pub fn inspect_zip_file(path: &Path, cfg: &AppConfig) -> Option<ZipThreat> {
-    let file = open_regular(path).ok()?;
-    let len = file.metadata().ok()?.len();
+    inspect_zip_file_checked(path, cfg).0
+}
+
+/// Like [`inspect_zip_file`], and also says whether a time, sample or nesting budget ran out
+/// before everything was verified (then "no threat" only means none was found in what was read).
+pub fn inspect_zip_file_checked(path: &Path, cfg: &AppConfig) -> (Option<ZipThreat>, bool) {
+    let Ok(file) = open_regular(path) else {
+        return (None, true);
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return (None, true);
+    };
     // Small buffer: every header probe seeks, and a seek throws the buffer away.
     inspect_root(BufReader::with_capacity(4096, file), len, &cfg.zip_limits)
 }
 
 pub fn inspect_zip_bytes(bytes: &[u8], limits: &ZipLimits) -> Option<ZipThreat> {
-    inspect_root(Cursor::new(bytes), bytes.len() as u64, limits)
+    inspect_root(Cursor::new(bytes), bytes.len() as u64, limits).0
 }
 
-fn inspect_root<R: Read + Seek>(reader: R, len: u64, limits: &ZipLimits) -> Option<ZipThreat> {
+fn inspect_root<R: Read + Seek>(
+    reader: R,
+    len: u64,
+    limits: &ZipLimits,
+) -> (Option<ZipThreat>, bool) {
     let mut scan = Scan {
         cumulative: 0,
         root_len: len.max(1),
         sample_left: SAMPLE_BUDGET,
         nested_left: NESTED_BUDGET,
         deadline: Instant::now() + TIME_BUDGET,
+        incomplete: false,
     };
-    inspect_level(reader, 1, limits, &mut scan)
+    let threat = inspect_level(reader, 1, limits, &mut scan);
+    let late = Instant::now() > scan.deadline;
+    (threat, scan.incomplete || late)
 }
 
 /// Per-top-level-archive work budgets shared by every nesting level.
@@ -163,6 +180,8 @@ struct Scan {
     sample_left: u64,
     nested_left: u64,
     deadline: Instant,
+    /// A budget cut some verification short.
+    incomplete: bool,
 }
 
 /// One central-directory entry plus what its local header says.
@@ -761,6 +780,7 @@ fn inspect_level<R: Read + Seek>(
     sample.sort_unstable_by_key(|r| r.uncompressed);
     for r in sample {
         if scan.sample_left == 0 || Instant::now() > scan.deadline {
+            scan.incomplete = true;
             break;
         }
         let Ok(entry) = archive.by_index(r.cd_index) else {
@@ -768,6 +788,7 @@ fn inspect_level<R: Read + Seek>(
         };
         let declared = entry.size();
         let cap = declared.saturating_add(1).min(scan.sample_left);
+        scan.incomplete |= cap <= declared;
         let got = read_up_to(entry, cap);
         scan.sample_left -= got;
         if got > declared {
@@ -784,6 +805,7 @@ fn inspect_level<R: Read + Seek>(
     // A declared size is only a claim: always read up to the cap and trust what comes out.
     for r in recs.iter().filter(|r| r.nested) {
         if scan.nested_left == 0 || Instant::now() > scan.deadline {
+            scan.incomplete = true;
             continue;
         }
         let cap = limits.max_nested_mem_read.min(scan.nested_left);
@@ -824,6 +846,7 @@ fn inspect_level<R: Read + Seek>(
                     ),
                 );
             }
+            scan.incomplete = true;
             continue;
         }
         if actual < declared {
@@ -1047,6 +1070,7 @@ mod tests {
             sample_left: SAMPLE_BUDGET,
             nested_left: NESTED_BUDGET,
             deadline: Instant::now() - Duration::from_secs(1),
+            incomplete: false,
         };
         let threat = inspect_level(Cursor::new(bomb.as_slice()), 1, &limits, &mut scan)
             .expect("ratio verdict survives an expired deadline");

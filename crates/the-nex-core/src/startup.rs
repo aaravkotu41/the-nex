@@ -89,6 +89,7 @@ pub struct StartupReport {
 
 fn clean(text: &str, max: usize) -> String {
     text.chars()
+        .filter(|c| !check_file::is_invisible_format(*c))
         .take(max)
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
@@ -428,6 +429,42 @@ fn digest_of(hex: &str) -> Option<[u8; 32]> {
     Some(digest)
 }
 
+/// Whether this is The Nex's own launchd service, exactly as the installer writes it: the right
+/// label for its kind, the arguments the installer gives, and the program is the installed engine
+/// itself. `file_secure` / `folder_secure` say that file and its folder are root-owned and
+/// not writable by others (see `root_owned_closed`), so nobody else could have swapped it.
+pub fn is_own_service(
+    name: &str,
+    kind: &str,
+    program: &str,
+    arguments: &[String],
+    engine: &Path,
+    file_secure: bool,
+    folder_secure: bool,
+) -> bool {
+    let shape = match (name, kind) {
+        ("com.thenex.edr", "launch_daemon") => arguments.is_empty(),
+        ("com.thenex.edr.notifier", "launch_agent") => arguments == ["--notifier"],
+        _ => false,
+    };
+    shape && Path::new(program) == engine && file_secure && folder_secure
+}
+
+/// Root-owned, not a link, and no one but the owner may write it. Always false off Unix.
+#[cfg(unix)]
+fn root_owned_closed(path: &Path, want_dir: bool) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).is_ok_and(|m| {
+        let kind_ok = if want_dir { m.is_dir() } else { m.is_file() };
+        kind_ok && m.uid() == 0 && m.mode() & 0o022 == 0
+    })
+}
+
+#[cfg(not(unix))]
+fn root_owned_closed(_path: &Path, _want_dir: bool) -> bool {
+    false
+}
+
 /// Writable by everyone, or (for a root-owned file) by a group beyond wheel and admin, who can
 /// become root anyway.
 #[cfg(unix)]
@@ -521,6 +558,22 @@ fn judge(cfg: &AppConfig, scanner: &BinaryAiScanner, c: Candidate) -> Judged {
     };
     item.exists = true;
     item.trusted = scanner.is_trusted(path);
+    let engine = crate::config::default_base_dir()
+        .join("engine")
+        .join(platform::DAEMON_EXE_STEM);
+    let own = is_own_service(
+        &c.name,
+        c.kind,
+        program,
+        &c.arguments,
+        &engine,
+        root_owned_closed(path, false),
+        path.parent()
+            .is_some_and(|dir| root_owned_closed(dir, true)),
+    );
+    if own {
+        info.push("This is The Nex's own background service.".into());
+    }
     let stem = program_stem(program);
     let name_claims = claimed_vendor(&c.name);
     if let Some(vendor) = name_claims {
@@ -617,7 +670,7 @@ fn judge(cfg: &AppConfig, scanner: &BinaryAiScanner, c: Candidate) -> Judged {
             FileVerdict::Refused => soft.extend(r.reasons),
             _ => {}
         }
-        if !item.trusted && engine::classify_file(&file) == FileKind::Binary {
+        if !own && !item.trusted && engine::classify_file(&file) == FileKind::Binary {
             soft.push("It is not signed by a publisher this computer trusts, so its maker cannot be confirmed.".into());
         }
     }
@@ -1347,6 +1400,186 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(top.len(), 4);
+    }
+
+    #[test]
+    fn only_the_real_own_service_is_recognised() {
+        let engine = Path::new("/Library/Application Support/TheNex/engine/the-nex");
+        let program = engine.to_str().unwrap();
+        let none: Vec<String> = Vec::new();
+        let notifier = vec!["--notifier".to_string()];
+        let check = |name, kind, program, args: &[String], file, folder| {
+            is_own_service(name, kind, program, args, engine, file, folder)
+        };
+        assert!(check(
+            "com.thenex.edr",
+            "launch_daemon",
+            program,
+            &none,
+            true,
+            true
+        ));
+        assert!(check(
+            "com.thenex.edr.notifier",
+            "launch_agent",
+            program,
+            &notifier,
+            true,
+            true
+        ));
+        // Each condition on its own is needed.
+        assert!(
+            !check(
+                "com.thenex.edr",
+                "launch_daemon",
+                program,
+                &none,
+                false,
+                true
+            ),
+            "file"
+        );
+        assert!(
+            !check(
+                "com.thenex.edr",
+                "launch_daemon",
+                program,
+                &none,
+                true,
+                false
+            ),
+            "folder"
+        );
+        assert!(!check(
+            "com.thenex.edr",
+            "launch_daemon",
+            "/tmp/the-nex",
+            &none,
+            true,
+            true
+        ));
+        assert!(!check(
+            "com.thenex.edr",
+            "launch_daemon",
+            "/Library/Application Support/TheNex/Engine/the-nex",
+            &none,
+            true,
+            true
+        ));
+        assert!(!check(
+            "com.thenex.edr",
+            "launch_daemon",
+            "/Library/Application Support/TheNex/engine/../engine/x/the-nex",
+            &none,
+            true,
+            true
+        ));
+        assert!(!check(
+            "com.thenex.edr.",
+            "launch_daemon",
+            program,
+            &none,
+            true,
+            true
+        ));
+        assert!(
+            !check("com.thenex.edr", "launch_agent", program, &none, true, true),
+            "wrong kind"
+        );
+        assert!(!check(
+            "com.thenex.edr",
+            "run_key",
+            program,
+            &none,
+            true,
+            true
+        ));
+        assert!(
+            !check(
+                "com.thenex.edr",
+                "launch_daemon",
+                program,
+                &notifier,
+                true,
+                true
+            ),
+            "extra arguments"
+        );
+        assert!(!check(
+            "com.thenex.edr.notifier",
+            "launch_agent",
+            program,
+            &none,
+            true,
+            true
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_the_user_owns_or_a_link_is_never_root_owned_and_closed() {
+        let dir = std::env::temp_dir().join(format!("thenex-own-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("the-nex");
+        fs::write(&file, b"x").unwrap();
+        // Owned by whoever runs the tests; only root-run tests could ever see "true" here.
+        if !fs::metadata(&file)
+            .map(|m| std::os::unix::fs::MetadataExt::uid(&m) == 0)
+            .unwrap_or(false)
+        {
+            assert!(!root_owned_closed(&file, false));
+            assert!(!root_owned_closed(&dir, true));
+        }
+        let link = dir.join("link");
+        std::os::unix::fs::symlink("/bin/sh", &link).unwrap();
+        assert!(!root_owned_closed(&link, false), "a link is not the file");
+        assert!(!root_owned_closed(&dir.join("missing"), false));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(root_owned_closed(Path::new("/bin/ls"), false));
+            assert!(root_owned_closed(Path::new("/bin"), true));
+            assert!(
+                !root_owned_closed(Path::new("/bin/ls"), true),
+                "a file is not a folder"
+            );
+            assert!(
+                !root_owned_closed(Path::new("/tmp"), true),
+                "/tmp is writable by others"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn names_shown_to_people_lose_bidi_and_zero_width_characters() {
+        assert_eq!(
+            clean("evil\u{202E}gpj.exe\u{200B}\u{FEFF}", 300),
+            "evilgpj.exe"
+        );
+        let mut report = StartupReport {
+            items: vec![StartupItem {
+                name: "a\u{2066}b\u{202E}".into(),
+                kind: "cron".into(),
+                location: "l\u{200F}".into(),
+                program: None,
+                arguments: vec![],
+                script: None,
+                enabled: None,
+                exists: false,
+                trusted: false,
+                verdict: Verdict::NotChecked,
+                score: None,
+                reasons: vec!["r\u{200E}".into()],
+                allowed: false,
+                runs_as: "you".into(),
+            }],
+            ..StartupReport::default()
+        };
+        report.clamp();
+        assert_eq!(report.items[0].name, "ab");
+        assert_eq!(report.items[0].location, "l");
+        assert_eq!(report.items[0].reasons[0], "r");
     }
 
     #[test]

@@ -484,7 +484,8 @@ def check_file_report():
         problems.append(f"bomb not reported: {bomb_json}")
     if listed_json.get("verdict") != "suspicious" or "known-malware list" not in " ".join(listed_json.get("reasons", [])):
         problems.append(f"listed decoy not reported: {listed_json}")
-    if note_json.get("verdict") != "nothing_found" or note_json.get("checks") != ["list"]:
+    # Only the list could look at a text file: not on the list is not "nothing found".
+    if note_json.get("verdict") != "not_scanned" or note_json.get("checks") != ["list"]:
         problems.append(f"control file wrongly reported: {note_json}")
     if folder_json.get("verdict") != "refused":
         problems.append(f"folder not refused: {folder_json}")
