@@ -55,9 +55,9 @@ async function ask(q, over) {
 (async () => {
   console.log("intents");
   let r = await ask("Am I protected?");
-  check("protected: reads dashboard", r.call.calls.join() === "get_dashboard_state" && /Mostly/.test(text(r.reply)) && /Process guard/.test(text(r.reply)) && /3 of 3 intact/.test(text(r.reply)));
+  check("protected: reads dashboard", r.call.calls.join() === "get_dashboard_state" && /Mostly/.test(text(r.reply)) && /Dangerous commands/.test(text(r.reply)) && /3 of 3 intact/.test(text(r.reply)));
   r = await ask("am i protected", { get_dashboard_state: { ...DASH, toggles: { ...DASH.toggles, known_bad_enabled: false } } });
-  check("protected: names the Known malware list when it is off", /Known malware list/.test(text(r.reply)) && /4 of 5 on|3 of 5 on/.test(text(r.reply)));
+  check("protected: names the Known malware list when it is off", /Known malware/.test(text(r.reply)) && /4 of 5 on|3 of 5 on/.test(text(r.reply)));
   r = await ask("am i protected", { get_dashboard_state: { ...DASH, dry_run: true } });
   check("protected: dry run is called out", /Dry run/.test(text(r.reply)));
   r = await ask("is it safe?", { get_dashboard_state: { daemon: { online: false } } });
@@ -77,7 +77,7 @@ async function ask(q, over) {
   r = await ask("what is MALWARE_AI_PROCESS");
   check("explain picks the most specific type", /image of a running program/.test(text(r.reply)) && !/new program/.test(text(r.reply)));
   r = await ask("How does the AI decide?");
-  check("ai: on-device ONNX, explanation, never deletes", /ONNX/.test(text(r.reply)) && /explanation/.test(text(r.reply)) && /never deletes/i.test(text(r.reply)));
+  check("ai: on-device model, explanation, never deletes", /runs on this computer/.test(text(r.reply)) && /explanation/.test(text(r.reply)) && /never deletes/i.test(text(r.reply)));
   r = await ask("Run a scan");
   check("scan: runs nothing, offers Overview button", r.call.calls.length === 0 && r.nav.length === 0 && r.reply.buttons[0].go.page === "overview");
   r.brain.run(r.reply.buttons[0].go);

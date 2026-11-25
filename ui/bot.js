@@ -39,11 +39,11 @@
     [/ransomware/, ["RANSOMWARE_CANARY", "RANSOMWARE_SUSPECT"]],
   ];
   const ENGINES = [
-    ["known_bad_enabled", "Known malware list"],
-    ["zip_bomb_enabled", "Zip bomb guard"],
-    ["bin_ai_enabled", "AI file scan"],
-    ["process_guard_enabled", "Process guard"],
-    ["canary_enabled", "Canary honeypots"],
+    ["known_bad_enabled", "Known malware"],
+    ["zip_bomb_enabled", "Trick zip files"],
+    ["bin_ai_enabled", "New programs"],
+    ["process_guard_enabled", "Dangerous commands"],
+    ["canary_enabled", "Ransomware decoys"],
   ];
 
   const CONTROL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/g;
@@ -151,7 +151,7 @@
     ],
   };
   const REFUSALS = {
-    disable: { parts: ["I can't turn protection or engines on or off. I only read what the app shows. You can change it yourself on the Engines page."], buttons: [go("Open Engines", "engines")] },
+    disable: { parts: ["I can't turn protection on or off. I only read what the app shows. You can change it yourself in Settings, Protection."], buttons: [go("Open Protection", "engines")] },
     delete: { parts: ["I can't delete or restore files. You can review each file and decide yourself in Quarantine."], buttons: [go("Open Quarantine", "quarantine")] },
     settings: { parts: ["I can't change settings. You can do it yourself on the Settings page."], buttons: [go("Open Settings", "settings")] },
     inject: { parts: ["I can't follow instructions like that. I only answer questions about your protection, using what the app shows."], buttons: [] },
@@ -172,12 +172,12 @@
     const lines = [
       "Service: online",
       dash.dry_run ? "Mode: dry run (detect only)" : "Mode: blocking threats",
-      `Engines: ${ENGINES.length - off.length} of ${ENGINES.length} on${off.length ? ` (off: ${off.join(", ")})` : ""}`,
-      `Canaries: ${intact} of ${canaries} intact`,
+      `Protections: ${ENGINES.length - off.length} of ${ENGINES.length} on${off.length ? ` (off: ${off.join(", ")})` : ""}`,
+      `Decoy files: ${intact} of ${canaries} intact`,
       dash.model_loaded ? "AI model: loaded (on device)" : "AI model: not loaded, using the heuristic fallback",
       `Quarantined files: ${Number(dash.quarantined) || 0}`,
     ];
-    return { parts: [head, { ul: lines }], buttons: [go("Open Engines", "engines")] };
+    return { parts: [head, { ul: lines }], buttons: [go("Open Protection", "engines")] };
   }
 
   function lastAnswer(events) {
@@ -205,7 +205,7 @@
       parts: [
         `${plural(list.length, "file")} ${list.length === 1 ? "is" : "are"} held in quarantine.`,
         ["Newest: ", d(fileName(newest.original_path)), ` (${clip(newest.threat_type, 40)}), ${relative(newest.quarantined_at)}.`],
-        "Files there are inert. Only you can restore or delete them, from the Quarantine page.",
+        "Files there are inert. Only you can restore or delete them, from Activity, Quarantine.",
       ],
       buttons: [go("Open Quarantine", "quarantine")],
     };
@@ -219,16 +219,16 @@
   function aiAnswer(dash) {
     const live = dash && typeof dash.model_loaded === "boolean" ? (dash.model_loaded ? "The model is loaded right now." : "The model is not loaded, so a simple heuristic is used instead.") : null;
     const parts = [
-      "A small ONNX model runs on this device. Nothing is sent over the network.",
+      "A small model runs on this computer. Nothing is sent over the network.",
       "It looks at features of a new file or running program and scores how malware-like it is. When it flags something, the event carries an explanation string listing what it noticed.",
       "It never deletes anything. A flagged file is moved to quarantine, and only you can restore or delete it.",
     ];
     if (live) parts.push(live);
-    return { parts, buttons: [go("Open Engines", "engines")] };
+    return { parts, buttons: [go("Open Protection", "engines")] };
   }
 
-  const SCAN = { parts: ["I can't run a scan myself. Quick Scan is a button at the top right of the Overview page. I'll take you there and you press it."], buttons: [go("Go to Overview", "overview")] };
-  const NAV_LABEL = { quarantine: "Quarantine", settings: "Settings", activity: "Activity", engines: "Engines", canaries: "Canaries", overview: "Overview" };
+  const SCAN = { parts: ["I can't run a scan myself. Quick Scan is a button at the top right of Home. I'll take you there and you press it."], buttons: [go("Go to Home", "overview")] };
+  const NAV_LABEL = { quarantine: "Quarantine", settings: "Settings", activity: "Activity", engines: "Protection", canaries: "Decoy files", overview: "Home" };
   const FALLBACK = { parts: ["I'm not sure what you mean. I can answer:", HELP_LIST], buttons: [] };
   const HELP = { parts: ["Hi, I'm Nex. I'm offline and read-only: I answer from what the app shows right now. Try:", HELP_LIST], buttons: [] };
 

@@ -11,8 +11,8 @@
   const UPDATE_NOTE = "After The Nex is updated, macOS may ask for this again: switch it off and on once more.";
 
   const ENGINES = [
-    ["known_bad_enabled", "Known Malware List"], ["zip_bomb_enabled", "Zip Bomb Guard"], ["bin_ai_enabled", "ONNX Binary AI"],
-    ["process_guard_enabled", "LotL Process Guard"], ["canary_enabled", "Canary Honeypots"],
+    ["known_bad_enabled", "Known malware"], ["zip_bomb_enabled", "Trick zip files"], ["bin_ai_enabled", "New programs"],
+    ["process_guard_enabled", "Dangerous commands"], ["canary_enabled", "Ransomware decoys"],
   ];
 
   /** states: ok (done), todo (needs you), unknown (cannot tell), info (shown, never counted). */
@@ -70,9 +70,9 @@
     } else if (!toggles) {
       Object.assign(protection, { state: "unknown", text: "Dry Run is off, but which checks are switched on could not be read." });
     } else if (off.length) {
-      Object.assign(protection, { state: "todo", text: `Switched off: ${off.join(", ")}. Turn ${off.length === 1 ? "it" : "them"} on in Engines, or that protection is missing.` });
+      Object.assign(protection, { state: "todo", text: `Switched off: ${off.join(", ")}. Turn ${off.length === 1 ? "it" : "them"} on in Protection, or that protection is missing.` });
     } else if (toggles.bin_ai_enabled && d.model_loaded === false) {
-      Object.assign(protection, { state: "todo", text: "ONNX Binary AI is switched on, but its model is not loaded, so that check is not working. Restarting or reinstalling the service usually fixes it." });
+      Object.assign(protection, { state: "todo", text: "The check of new programs is switched on, but its model is not loaded, so that check is not working. Restarting or reinstalling the service usually fixes it." });
     } else if (toggles.bin_ai_enabled && d.model_loaded !== true) {
       Object.assign(protection, { state: "unknown", text: "Dry Run is off, but whether the AI model is loaded could not be read." });
     } else {
@@ -93,7 +93,7 @@
     const intact = Number(d.canaries_intact) || 0;
     const watching = !toggles || toggles.canary_enabled !== false;
     rows.push(canaries > 0 && intact === canaries && !watching
-      ? { id: "decoys", title: "Decoy files", state: "todo", text: `All ${canaries} decoy files are in place, but Canary Honeypots is switched off, so changes to them are not noticed. Turn it on in Engines.` }
+      ? { id: "decoys", title: "Decoy files", state: "todo", text: `All ${canaries} decoy files are in place, but Ransomware decoys is switched off, so changes to them are not noticed. Turn it on in Protection.` }
       : canaries > 0 && intact === canaries
       ? { id: "decoys", title: "Decoy files", state: "ok", text: `All ${canaries} decoy files are in place. They reveal ransomware the moment one changes.` }
       : {

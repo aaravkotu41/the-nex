@@ -5,27 +5,25 @@ const invoke = tauri && tauri.core && typeof tauri.core.invoke === "function" ? 
 
 const REFRESH_MS = 2000;
 const CONFIRM_MS = 4000;
-const OVERVIEW_EVENTS = 8;
+const OVERVIEW_EVENTS = 5;
 const ACTIVITY_LIMIT = 1000;
-const PAGE_TITLES = {
-  overview: "Overview",
-  engines: "Engines",
-  activity: "Activity",
-  quarantine: "Quarantine",
-  canaries: "Canaries",
-  startup: "Startup",
-  devices: "Devices",
-  settings: "Settings",
-  aegismesh: "AegisMesh",
+const PAGE_TITLES = { overview: "Home", activity: "Activity", startup: "Startup", aegismesh: "AegisMesh", settings: "Settings" };
+// The five tabs; two of them hold several pages, shown as a second row of buttons.
+const SUBPAGES = {
+  activity: [["activity", "History"], ["quarantine", "Quarantine"]],
+  settings: [["settings", "General"], ["engines", "Protection"], ["exceptions", "Exceptions"], ["canaries", "Decoy files"], ["devices", "Computers"], ["look", "Look"]],
 };
+const tabOf = (page) => Object.keys(SUBPAGES).find((tab) => SUBPAGES[tab].some(([id]) => id === page)) || page;
 const PAGE_SUBS = {
-  engines: "Five local engines. Nothing leaves this computer.",
-  activity: "Everything the engines saw and did, newest first.",
-  quarantine: "Files that were stopped. Restore or delete them here.",
-  canaries: "Decoy files that reveal ransomware the moment they change.",
-  startup: "What starts by itself on this computer, and whether anything looks off.",
-  devices: "Every computer signed in to your account. Run a scan on any of them.",
-  settings: "Background service, watched folders and the look of the app.",
+  activity: "What The Nex saw and did, newest first.",
+  quarantine: "Files that were moved to a safe place. Put them back or delete them here.",
+  startup: "What starts by itself on this computer.",
+  settings: "Setup, scheduled scans and reports.",
+  engines: "Everything runs on this computer. Nothing is uploaded.",
+  exceptions: "Files and folders The Nex leaves alone.",
+  canaries: "Hidden decoys that reveal ransomware the moment they change.",
+  devices: "Every computer signed in to your account.",
+  look: "Theme and wallpaper.",
   aegismesh: "Silent SOS simulation: wearables, tap rhythms, emergency signs and the relay mesh.",
 };
 
@@ -45,6 +43,26 @@ const TOGGLE_FIELDS = {
 };
 const RED_TYPES = new Set(["ZIP_BOMB", "RANSOMWARE_CANARY", "RANSOMWARE_SUSPECT", "MALWARE_AI", "MALWARE_AI_PROCESS", "KNOWN_MALWARE"]);
 const AMBER_TYPES = new Set(["LOTL_SCRIPT"]);
+// What people see; the names in the event log stay as they are.
+const TYPE_LABELS = {
+  KNOWN_MALWARE: "Known malware",
+  ZIP_BOMB: "Trick zip file",
+  MALWARE_AI: "Risky program",
+  MALWARE_AI_PROCESS: "Risky running program",
+  LOTL_SCRIPT: "Dangerous command",
+  RANSOMWARE_CANARY: "Ransomware alarm",
+  RANSOMWARE_SUSPECT: "Possible ransomware",
+  QUICK_SCAN: "Quick scan",
+  FULL_SCAN: "Full scan",
+  SCHEDULED_SCAN: "Scheduled scan",
+  QUARANTINE_RESTORE: "Put back",
+  QUARANTINE_DELETE: "Deleted",
+  ALLOWLIST: "Always allowed",
+  NEVER_SCAN: "Never scan",
+};
+function typeLabel(type) {
+  return TYPE_LABELS[type] || String(type || "").toLowerCase().replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+}
 const GREEN_TYPES = new Set(["QUARANTINE_RESTORE"]);
 // Detections that "Always allow" can cover: whole files judged by an estimating engine.
 const ALLOWABLE_TYPES = new Set(["MALWARE_AI", "MALWARE_AI_PROCESS", "ZIP_BOMB"]);
@@ -93,7 +111,7 @@ const state = {
   scanning: false,
 };
 
-const SEARCH_PAGES = new Set(["overview", "activity", "quarantine", "canaries"]);
+const SEARCH_PAGES = new Set(["activity", "quarantine"]);
 const TYPE_NOTES = {
   ZIP_BOMB: "An archive built to expand far beyond its size and exhaust the disk or memory. It was caught before anything was extracted.",
   LOTL_SCRIPT: "A built-in tool (PowerShell, cmd, mshta, osascript…) was started the way malware uses it, for example with a hidden window, an encoded command or a download.",
@@ -330,30 +348,31 @@ function typeClass(type) {
 
 function actionLabel(action) {
   const text = String(action || "");
-  if (text.startsWith("DRY_RUN")) return "Dry run";
+  if (text.startsWith("DRY_RUN")) return "Only watched";
   if (text.includes("QUARANTINE_FAILED") || text === "TERMINATE_FAILED") return "Failed";
-  if (text.startsWith("TERMINATED") && text.includes("QUARANTINED")) return "Terminated + quarantined";
-  if (text.startsWith("QUARANTINED")) return "Quarantined";
-  if (text.startsWith("TERMINATED")) return "Terminated";
-  if (text === "ALERT_RAISED") return "Alerted";
-  if (text === "RESTORED") return "Restored";
+  if (text.startsWith("TERMINATED") && text.includes("QUARANTINED")) return "Stopped and held";
+  if (text.startsWith("QUARANTINED")) return "Held";
+  if (text.startsWith("TERMINATED")) return "Stopped";
+  if (text === "ALERT_RAISED" || text.startsWith("ALERT_ONLY")) return "Told you";
+  if (text === "RESTORED") return "Put back";
   if (text === "DELETED") return "Deleted";
+  const found = /^(\d+) threat/.exec(text); // a finished scan
+  if (found) return found[1] === "0" ? "Nothing found" : `${found[1]} found`;
   const word = text.split(/[\s=]/)[0].replace(/_/g, " ");
   return word ? word.charAt(0).toUpperCase() + word.slice(1).toLowerCase() : "—";
 }
 
-function severityBadge(severity) {
+function severityName(severity) {
   const key = severityKey(severity);
-  return el("span", { className: `sev ${key.toLowerCase()}`, text: key.charAt(0) + key.slice(1).toLowerCase() });
+  return key.charAt(0) + key.slice(1).toLowerCase();
 }
 
 function eventRow(event) {
   const row = el("tr", { title: "Open in Activity", attrs: { tabindex: "0" } }, [
-    el("td", { text: formatWhen(event.timestamp), title: formatDateTime(event.timestamp) }),
-    el("td", {}, [el("span", { className: typeClass(event.threat_type), text: event.threat_type })]),
-    el("td", { text: shortPath(event.target), title: event.target }),
-    el("td", { text: event.details, title: event.details }),
+    el("td", {}, [el("span", { className: typeClass(event.threat_type), text: typeLabel(event.threat_type) })]),
+    el("td", { text: fileName(event.target), title: event.target }),
     el("td", { text: actionLabel(event.action_taken), title: event.action_taken }),
+    el("td", { className: "right muted", text: relativeTime(event.timestamp), title: formatDateTime(event.timestamp) }),
   ]);
   const open = () => openActivity({ open: event.id });
   row.addEventListener("click", open);
@@ -375,7 +394,7 @@ function openActivity({ type = null, day = null, open = null } = {}) {
 
 function renderActivityFilters() {
   const chips = [];
-  if (state.activityType) chips.push(["Type", state.activityType, () => { state.activityType = null; }]);
+  if (state.activityType) chips.push(["What", typeLabel(state.activityType), () => { state.activityType = null; }]);
   if (state.activityDay !== null) {
     const label = new Date(state.activityDay).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "short" });
     chips.push(["Day", label, () => { state.activityDay = null; }]);
@@ -396,19 +415,19 @@ function activityRows(event) {
       el("span", { className: "cell-main", text: formatWhen(event.timestamp) }),
       el("span", { className: "cell-sub", text: relativeTime(event.timestamp) }),
     ]),
-    el("td", {}, [el("span", { className: typeClass(event.threat_type), text: event.threat_type })]),
-    el("td", { className: "sans" }, [severityBadge(event.severity)]),
+    el("td", {}, [el("span", { className: typeClass(event.threat_type), text: typeLabel(event.threat_type) })]),
     el("td", { title: event.target }, [
       el("span", { className: "cell-main", text: fileName(event.target) }),
       el("span", { className: "cell-sub", text: folderOf(event.target) || "—" }),
     ]),
-    el("td", { text: event.details, title: event.details }),
     el("td", { className: "sans", text: actionLabel(event.action_taken), title: event.action_taken }),
     el("td", {}, [chevron()]),
   ];
   const detail = detailGrid([
     ["When", `${formatDateTime(event.timestamp)} (${relativeTime(event.timestamp)})`],
-    ["Target", event.target, event.target],
+    ["Where", event.target, event.target],
+    ["How serious", severityName(event.severity)],
+    ["Type", event.threat_type],
     ["Detail", event.details],
     ["Action taken", event.action_taken],
     ["Event ID", event.id, event.id],
@@ -419,7 +438,7 @@ function activityRows(event) {
   return expandable(cells, detail, open, () => {
     state.openEvent = open ? null : event.id;
     loadEvents().catch(() => {});
-  }, 7);
+  }, 5);
 }
 
 function setSwitch(button, checked) {
@@ -449,16 +468,16 @@ function focusEngine(engine) {
 function buildEngineRows() {
   const rows = $("engine-rows");
   const engines = [
-    ["known_bad", "Known Malware List", "Matches files and programs against a list of known malware hashes."],
-    ["zip_bomb", "Zip Bomb Guard", "Central-directory inspection before extraction: ratio, size, overlap and nesting."],
-    ["bin_ai", "ONNX Binary AI", "Scores new PE and Mach-O files and processes with the local tract model."],
-    ["process_guard", "LotL Process Guard", "Terminates script hosts and shells launched with download or obfuscation patterns."],
-    ["canary", "Canary Honeypots", "Decoy documents that reveal ransomware the moment they change."],
+    ["known_bad", "Known malware", "Compares files and programs with a list of known malware."],
+    ["zip_bomb", "Trick zip files", "Spots zip files built to fill up the computer, before they are opened."],
+    ["bin_ai", "New programs", "Gives programs from unknown makers a risk score."],
+    ["process_guard", "Dangerous commands", "Stops commands that attacks often use to download or hide things."],
+    ["canary", "Ransomware decoys", "Hidden decoy files that raise the alarm the moment something tampers with them."],
   ];
   for (const [engine, title, description] of engines) {
     const thresholds = el("div", { className: "thresholds", attrs: { "data-thresholds": engine } });
     rows.append(el("div", { className: "row", attrs: { "data-engine-row": engine } }, [
-      el("div", {}, [el("h3", { text: title }), el("p", { className: "muted", text: description }), thresholds]),
+      el("div", {}, [el("h3", { text: title }), el("p", { className: "muted", text: description }), el("details", { className: "more" }, [el("summary", { text: "Technical details" }), thresholds])]),
       el("button", { className: "switch", attrs: { role: "switch", "aria-checked": "false", "data-engine": engine, "aria-label": title } }),
     ]));
   }
@@ -482,40 +501,39 @@ function renderDashboard(d) {
   const footerDot = $("service-dot");
   footerDot.className = online ? "dot ok" : "dot";
   $("service-text").textContent = online
-    ? `Service Active · ${(d.daemon.memory_mb || 0).toFixed(1)} MB`
-    : "Daemon Offline";
+    ? `Running · ${(d.daemon.memory_mb || 0).toFixed(1)} MB`
+    : "Not running";
 
   const topDot = $("top-status-dot");
   const topText = $("top-status-text");
   if (!online) {
     topDot.className = "dot bad";
-    topText.textContent = "Service offline";
+    topText.textContent = "Not protected";
   } else if (d.dry_run) {
     topDot.className = "dot warn";
-    topText.textContent = "Dry run · detect only";
+    topText.textContent = "Only watching";
   } else {
     topDot.className = "dot ok";
-    topText.textContent = `Protected · ${protectionScore(d).score}`;
+    topText.textContent = "Protected";
   }
 
   const protection = $("protection-dot");
   if (!online) {
     protection.className = "dot bad";
-    $("protection-text").textContent = "Unprotected — Service Offline";
+    $("protection-text").textContent = "You're not protected";
   } else if (d.dry_run) {
     protection.className = "dot warn";
-    $("protection-text").textContent = "Dry Run — Detect Only";
+    $("protection-text").textContent = "Only watching";
   } else {
     protection.className = "dot ok";
-    $("protection-text").textContent = "Protected — Local Rust Engine";
+    $("protection-text").textContent = "You're protected";
   }
   setCount($("stat-scanned"), d.scanned);
   setCount($("stat-threats"), d.threats_detected);
   // In dry run nothing is stopped: say what actually happened.
-  $("stat-threats-sub").textContent = d.dry_run ? "detected (dry run)" : "stopped so far";
+  $("stat-threats-sub").textContent = d.dry_run ? "threats seen, not stopped" : "threats so far";
   setCount($("stat-quarantined"), d.quarantined);
-  $("stat-cpu").textContent = online ? `${(d.daemon.cpu_percent || 0).toFixed(1)}%` : "—";
-  renderScore(d);
+  renderProtection(d);
   if (window.NexSetup) window.NexSetup.render(d);
 
   const badge = $("quarantine-badge");
@@ -524,15 +542,6 @@ function renderDashboard(d) {
 
   const t = d.thresholds;
   const kb = d.known_bad || {};
-  $("card-known").textContent = kb.loaded ? `${count(kb.entries)} hashes · list of ${String(kb.created).slice(0, 10)}` : "no list installed";
-  $("card-zip").textContent = `Ratio >${t.max_ratio}:1 · Depth ≤${t.max_depth} · Pre-extraction`;
-  let model;
-  if (d.model_loaded) model = "thenex_model.onnx · Offline · Local tract";
-  else if (d.model_present) model = "thenex_model.onnx · Loads with the service";
-  else model = "Model missing · Heuristic fallback";
-  $("card-ai").textContent = model;
-  $("card-lotl").textContent = `${count(d.processes_watched)} processes watched · Shell & Script Shield`;
-  $("card-canary").textContent = `${d.canaries_intact} decoy file${d.canaries_intact === 1 ? "" : "s"} intact · Desktop & Docs`;
   renderToggles(d.toggles, true);
 
   fillThresholds("known_bad", kb.loaded ? [`${count(kb.entries)} hashes`, `list of ${String(kb.created).slice(0, 10)}`] : ["no list installed"]);
@@ -567,8 +576,8 @@ function renderDashboard(d) {
     servicePill.textContent = "Not installed";
   }
   $("service-detail").textContent = online
-    ? `PID ${d.daemon.pid} · v${d.daemon.version} · up ${formatUptime(d.daemon.uptime_seconds)} · ${(d.daemon.memory_mb || 0).toFixed(1)} MB`
-    : "The engine is not running in the background.";
+    ? `PID ${d.daemon.pid} · v${d.daemon.version} · up ${formatUptime(d.daemon.uptime_seconds)} · ${(d.daemon.memory_mb || 0).toFixed(1)} MB · ${(d.daemon.cpu_percent || 0).toFixed(1)}% CPU`
+    : "Nothing is being checked.";
   if (!$("install-service").dataset.busy) $("install-service").textContent = d.service_installed ? "Reinstall" : "Install";
   if (!$("uninstall-service").dataset.busy) $("uninstall-service").disabled = !d.service_installed;
 
@@ -583,42 +592,28 @@ function renderDashboard(d) {
   ], true);
 }
 
-/** 0-100: service 30, engines 40, AI model 10, canaries 10, blocking (not dry run) 10. */
-function protectionScore(d) {
+/** What protection needs, each on or off. */
+function protectionItems(d) {
   const t = d.toggles || {};
-  const enginesOn = ["known_bad_enabled", "zip_bomb_enabled", "bin_ai_enabled", "process_guard_enabled", "canary_enabled"].filter((k) => t[k]).length;
-  const kbLoaded = d.known_bad && d.known_bad.loaded;
-  const canaries = (d.canaries || []).length;
-  const canariesOk = canaries > 0 && d.canaries_intact === canaries;
-  const items = [
-    { ok: d.daemon.online, text: d.daemon.online ? "Background service running" : "Background service offline", goto: "settings" },
-    { ok: enginesOn === 5, text: `${enginesOn} of 5 engines on`, goto: "engines" },
-    ...(t.known_bad_enabled ? [{ ok: Boolean(kbLoaded), text: kbLoaded ? "Known-malware list loaded" : "No known-malware list installed", goto: "engines" }] : []),
-    { ok: Boolean(d.model_loaded), text: d.model_loaded ? "AI model loaded" : "AI on heuristic fallback", goto: "engines", focus: "bin_ai" },
-    { ok: canariesOk, text: `${d.canaries_intact} of ${canaries} canaries intact`, goto: "canaries" },
-    { ok: !d.dry_run, text: d.dry_run ? "Dry run: detecting only" : "Blocking threats", goto: "engines" },
+  const on = ["known_bad_enabled", "zip_bomb_enabled", "bin_ai_enabled", "process_guard_enabled", "canary_enabled"].filter((k) => t[k]).length;
+  const decoys = (d.canaries || []).length;
+  return [
+    { ok: d.daemon.online, text: "The background service is off", goto: "settings" },
+    { ok: on === 5, text: `${on} of 5 protections are on`, goto: "engines" },
+    ...(t.known_bad_enabled ? [{ ok: Boolean(d.known_bad && d.known_bad.loaded), text: "No list of known malware installed", goto: "engines" }] : []),
+    { ok: Boolean(d.model_loaded), text: "The risk score model is not loaded", goto: "engines", focus: "bin_ai" },
+    { ok: decoys > 0 && d.canaries_intact === decoys, text: `${d.canaries_intact} of ${decoys} decoy files in place`, goto: "canaries" },
+    { ok: !d.dry_run, text: "Only watching: nothing is stopped", goto: "engines" },
   ];
-  const score = d.daemon.online
-    ? Math.round(30 + (40 * enginesOn) / 5 + (d.model_loaded ? 10 : 0) + (canariesOk ? 10 : 0) + (d.dry_run ? 0 : 10))
-    : 0;
-  return { score, items };
 }
 
-function setRing(score, tone) {
-  $("ring-value").style.strokeDasharray = `${score} 100`;
-  $("score-value").textContent = score === null ? "–" : String(score);
-  $("hero").dataset.tone = tone;
-}
-
-function renderScore(d) {
-  const { score, items } = protectionScore(d);
-  const allOk = items.every((item) => item.ok);
-  const tone = allOk ? "ok" : score >= 60 ? "warn" : "bad";
-  setRing(score, tone);
-  $("protection-detail").textContent = allOk
-    ? "Every engine is active. New downloads, archives and processes are checked as they appear."
-    : "Some protection is off or degraded; the items marked ! need attention.";
-  replaceIfChanged($("score-items"), JSON.stringify(items), () => items.map((item) => el("li", { className: item.ok ? "ok" : "no" }, [
+function renderProtection(d) {
+  const missing = protectionItems(d).filter((item) => !item.ok);
+  $("hero").dataset.tone = !missing.length ? "ok" : d.daemon.online ? "warn" : "bad";
+  $("protection-detail").textContent = missing.length
+    ? "This needs a look:"
+    : "New files and programs are checked as they appear.";
+  replaceIfChanged($("score-items"), JSON.stringify(missing), () => missing.map((item) => el("li", { className: "no" }, [
     el("button", { text: item.text, attrs: { type: "button", "data-goto": item.goto, ...(item.focus ? { "data-focus": item.focus } : {}) } }),
   ])));
 }
@@ -698,8 +693,8 @@ function renderChartFacts(days, byType) {
     const bar = el("i");
     bar.style.setProperty("--w", `${Math.max(6, (n / top) * 100)}%`);
     if (TYPE_COLOURS[type]) bar.style.setProperty("--bar", TYPE_COLOURS[type]);
-    const button = el("button", { title: `${TYPE_NOTES[type] || type} Click to see these events.`, attrs: { type: "button" } }, [
-      el("span", { text: type }), el("b", { text: count(n) }), bar,
+    const button = el("button", { title: `${TYPE_NOTES[type] || typeLabel(type)} Click to see these events.`, attrs: { type: "button" } }, [
+      el("span", { text: typeLabel(type) }), el("b", { text: count(n) }), bar,
     ]);
     button.addEventListener("click", () => openActivity({ type }));
     return el("li", {}, [button]);
@@ -708,14 +703,14 @@ function renderChartFacts(days, byType) {
 
 function renderOffline(reason) {
   $("top-status-dot").className = "dot bad";
-  $("top-status-text").textContent = "Unprotected";
+  $("top-status-text").textContent = "Not protected";
   $("service-dot").className = "dot";
-  $("service-text").textContent = "Daemon Offline";
+  $("service-text").textContent = "Not running";
   $("protection-dot").className = "dot bad";
-  $("protection-text").textContent = reason;
-  setRing(0, "bad");
-  $("protection-detail").textContent = "Without the background service nothing is being checked.";
-  replaceIfChanged($("score-items"), "offline", () => [el("li", { className: "no", text: "Background service unavailable" })]);
+  $("protection-text").textContent = "You're not protected";
+  $("hero").dataset.tone = "bad";
+  $("protection-detail").textContent = reason;
+  replaceIfChanged($("score-items"), "offline", () => []);
   $("service-state").className = "pill status red";
   $("service-state").textContent = "Unavailable";
   renderToggles(null, false);
@@ -781,8 +776,7 @@ function quarantineRows(q) {
       ])]),
     ]),
     el("td", { title: q.details }, [
-      el("span", { className: typeClass(q.threat_type), text: q.threat_type }),
-      el("span", { className: "cell-sub", text: q.details }),
+      el("span", { className: typeClass(q.threat_type), text: typeLabel(q.threat_type) }),
     ]),
     el("td", { text: formatBytes(q.size) }),
     el("td", { title: formatDateTime(q.quarantined_at) }, [
@@ -801,7 +795,7 @@ function quarantineRows(q) {
     ["Found at", q.original_path, q.original_path],
     ["Why", q.details],
     ["Size", `${formatBytes(q.size)} (${count(q.size)} bytes)`],
-    ["SHA-256", q.sha256, q.sha256],
+    ["Fingerprint (SHA-256)", q.sha256, q.sha256],
     ["Quarantined", `${formatDateTime(q.quarantined_at)} (${relativeTime(q.quarantined_at)})`],
     ["Stored as", q.quarantined_path],
     ["Quarantine ID", q.id],
@@ -826,7 +820,7 @@ function renderQuarantineFacts(all) {
     [count(all.length), `file${all.length === 1 ? "" : "s"} held`],
     [formatBytes(total), "total size"],
     [newest ? relativeTime(newest.quarantined_at) : "—", "last file stopped"],
-    [top ? top[0] : "—", top ? `most common (${top[1]})` : "most common threat"],
+    [top ? typeLabel(top[0]) : "—", top ? `most common (${top[1]})` : "most common threat"],
   ];
   replaceIfChanged($("quarantine-facts"), JSON.stringify(facts), () => facts.map(([value, label]) => el("div", {}, [
     el("b", { className: "mono", text: value }),
@@ -1029,9 +1023,9 @@ async function addNeverScan(event) {
   }
 }
 
-/** On the Settings page a drop fills the "Never scan" box; anywhere else it is a file check. */
+/** On the Exceptions page a drop fills the "Never scan" box; anywhere else it is a file check. */
 function takeDrop(paths) {
-  if (state.page !== "settings") return false;
+  if (state.page !== "exceptions") return false;
   if (paths.length > 1) {
     notice("Drop one folder or file at a time.", true);
     return true;
@@ -1122,7 +1116,7 @@ async function refresh(force) {
       if (!$(id).dataset.busy) $(id).disabled = false;
     }
     await loadEvents();
-    if (state.page === "overview") await loadChart(force);
+    if (state.page === "activity" && $("week").open) await loadChart(force);
     const quarantine = await call("list_quarantine").catch((error) => {
       if (state.page === "quarantine") notice(errorText(error), true);
       return state.quarantine;
@@ -1130,11 +1124,11 @@ async function refresh(force) {
     if (seq !== refreshSeq) return;
     state.quarantine = quarantine;
     renderQuarantine();
-    if (state.page === "settings") {
+    if (state.page === "exceptions") {
       await loadAllowed();
       await loadNeverScan();
-      await loadSchedule();
     }
+    if (state.page === "settings") await loadSchedule();
   } catch (error) {
     renderOffline(invoke ? `Unavailable — ${errorText(error)}` : "Open The Nex from its desktop app to manage protection.");
   } finally {
@@ -1276,7 +1270,7 @@ function showScanReport(report) {
       : `Scan found ${threats} threat${threats === 1 ? "" : "s"}`;
     setScanSheet("bad", report.cancelled ? `${title} before it was cancelled` : title, [notes, blockedNote].filter(Boolean).join(" · "));
     $("scan-findings").replaceChildren(...report.findings.slice(0, 5).map((f) => el("li", {}, [
-      el("span", { className: typeClass(f.threat_type), text: f.threat_type }),
+      el("span", { className: typeClass(f.threat_type), text: typeLabel(f.threat_type) }),
       el("span", { text: `${fileName(f.path)} · ${f.detail}`, title: f.path }),
     ])));
     $("scan-view").hidden = false;
@@ -1359,18 +1353,29 @@ async function resumeFullScan() {
 
 function showPage(page) {
   state.page = page;
+  const tab = tabOf(page);
   for (const item of document.querySelectorAll(".nav-item")) {
-    const active = item.dataset.page === page;
+    const active = item.dataset.page === tab;
     item.classList.toggle("active", active);
     if (active) item.setAttribute("aria-current", "page"); else item.removeAttribute("aria-current");
   }
+  const subpages = SUBPAGES[tab] || [];
+  const subnav = $("subnav");
+  subnav.hidden = !subpages.length;
+  subnav.setAttribute("aria-label", PAGE_TITLES[tab]);
+  subnav.replaceChildren(...subpages.map(([id, text]) => el("button", {
+    className: "seg-btn", text,
+    attrs: { type: "button", "data-goto": id, "aria-pressed": String(id === page) },
+  })));
   for (const section of document.querySelectorAll(".page")) section.classList.toggle("active", section.id === `page-${page}`);
-  $("page-title").textContent = PAGE_TITLES[page];
+  $("page-title").textContent = PAGE_TITLES[tab];
   $("page-sub").textContent = page === "overview" ? greeting() : PAGE_SUBS[page] || "";
   $("search-box").hidden = !SEARCH_PAGES.has(page);
+  $("top-status").hidden = page === "overview"; // Home says it large
   showAegis(page === "aegismesh");
-  $("drop-overlay").dataset.use = page === "settings" ? "skip" : "check";
-  call("drop_is_never_scan", { on: page === "settings" }).catch(() => {});
+  $("drop-overlay").dataset.use = page === "exceptions" ? "skip" : "check";
+  call("drop_is_never_scan", { on: page === "exceptions" }).catch(() => {});
+  if (page === "devices") document.dispatchEvent(new Event("nex-devices"));
   refresh(true);
 }
 
@@ -1523,8 +1528,9 @@ function wire() {
   $("verify-canaries").addEventListener("click", () => busy("verify-canaries", "Verifying…", async () => {
     const canaries = await call("verify_canaries");
     const intact = canaries.filter((c) => c.state === "Intact").length;
-    notice(`${intact} of ${canaries.length} canary files intact.`, intact !== canaries.length);
+    notice(`${intact} of ${canaries.length} decoy files in place.`, intact !== canaries.length);
   }));
+  $("week").addEventListener("toggle", () => refresh(true));
   wireScheduleAndReport();
   $("report-problem").addEventListener("click", () => {
     call("open_report_page", { kind: "bug" }).catch((error) => notice(errorText(error), true));
