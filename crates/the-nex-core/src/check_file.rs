@@ -337,7 +337,8 @@ mod tests {
         let mut stack = vec![dir.to_path_buf()];
         while let Some(next) = stack.pop() {
             for entry in fs::read_dir(&next).unwrap().flatten() {
-                let meta = entry.metadata().unwrap();
+                // Not entry.metadata(): Windows updates the copy kept in the folder listing late.
+                let meta = fs::symlink_metadata(entry.path()).unwrap();
                 out.insert(entry.path(), (meta.len(), meta.modified().unwrap()));
                 if meta.is_dir() {
                     stack.push(entry.path());
@@ -458,7 +459,20 @@ mod tests {
         assert_eq!(fine_result.verdict, Verdict::NothingFound);
         assert_eq!(fine_result.checks, ["list", "archive"]);
 
-        assert_eq!(snapshot(&dir), before, "a check must not touch any file");
+        let after = snapshot(&dir);
+        let changed: Vec<_> = after
+            .iter()
+            .filter(|(p, m)| before.get(*p) != Some(*m))
+            .collect();
+        assert!(
+            changed.is_empty(),
+            "a check must not touch any file: {changed:?}"
+        );
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "a check must not remove any file"
+        );
         assert_eq!(fs::read(&bomb).unwrap(), bytes);
         assert_eq!(fs::metadata(&cfg.events_log).unwrap().len(), 0, "no event");
         assert_eq!(fs::read_dir(&cfg.quarantine_dir).unwrap().count(), 0);

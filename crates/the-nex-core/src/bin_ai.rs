@@ -1177,8 +1177,10 @@ mod tests {
         let (_, profile, digest) = scanner.scan_with_profile(&file).unwrap();
         assert!(profile.is_some());
         assert_eq!(digest, Some(sha2::Sha256::digest(&bytes).into()));
-        // A cached answer has no bytes to hash.
-        assert_eq!(scanner.scan_with_profile(&file).unwrap().2, None);
+        // A cached answer has no bytes to hash. Without a file stamp (Windows) nothing is cached.
+        let again = scanner.scan_with_profile(&file).unwrap().2;
+        let cached = file_stamp(&fs::metadata(&file).unwrap()).is_some();
+        assert_eq!(again, if cached { None } else { digest });
         let _ = fs::remove_dir_all(&dir);
     }
 

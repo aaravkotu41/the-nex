@@ -52,14 +52,24 @@ ICON = ROOT / "crates" / "the-nex-gui" / "icons" / "icon.ico"
 ENV = {**os.environ, "THENEX_DATA_DIR": str(DATA)}
 
 
-def state_dir():
-    """Where the engine keeps its state. An administrator's engine ignores THENEX_DATA_DIR (as on
-    GitHub's Windows machines) and uses the real folder there."""
+def administrator():
     if WINDOWS:
         import ctypes
-        if ctypes.windll.shell32.IsUserAnAdmin():
-            return Path(os.environ["ProgramData"]) / "TheNex"
-    return DATA
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    return os.geteuid() == 0
+
+
+def refuse_real_data():
+    """An administrator's engine ignores THENEX_DATA_DIR and uses The Nex's real data folder, where
+    these checks change settings and delete state: only for CI's throwaway machines."""
+    if administrator() and os.environ.get("GITHUB_ACTIONS") != "true":
+        sys.exit("Refusing to run as an administrator: this would change The Nex's real settings on this "
+                 "computer. Run it as a normal user.")
+
+
+def state_dir():
+    """Where the engine keeps its state (see refuse_real_data)."""
+    return Path(os.environ["ProgramData"]) / "TheNex" if WINDOWS and administrator() else DATA
 
 
 CANARIES = (".thenex_canary_01.docx", ".thenex_canary_02.xlsx")
@@ -594,6 +604,7 @@ def main():
     parser.add_argument("--skip-build", action="store_true", help="fail instead of building missing binaries")
     parser.add_argument("--keep-sandbox", action="store_true", help="leave thenex_live_sandbox for inspection")
     args = parser.parse_args()
+    refuse_real_data()
 
     ensure_assets(args.skip_build)
     remove_sandbox()
