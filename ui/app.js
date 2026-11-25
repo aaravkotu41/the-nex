@@ -1721,6 +1721,7 @@ function startDashboard() {
   if (window.NexSync) window.NexSync.start(call);
   // Offline assistant (ui/bot.js): read-only, starts only after sign-in like everything else here.
   if (window.NexBot) window.NexBot.start({ call, showPage, openActivity });
+  if (window.NexFileCheck) window.NexFileCheck.start(copyButton); // drop a file on the window to check it
   $("page-sub").textContent = greeting();
   wireTheme();
   initAppearance().then(applyTheme);

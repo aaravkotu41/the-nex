@@ -142,6 +142,15 @@
           </div>
         </section>
         <div class="notice" id="notice" role="status" aria-live="polite" hidden></div>
+        <section class="panel check-panel" id="check-panel" aria-labelledby="check-title" hidden>
+          <div class="panel-head">
+            <h2 id="check-title">File check</h2>
+            <button class="btn btn-small" id="check-dismiss" type="button">Dismiss</button>
+          </div>
+          <p class="muted" id="check-status" role="status"></p>
+          <ul class="check-list" id="check-list"></ul>
+          <p class="muted small">Nothing was moved or sent. The files were only read.</p>
+        </section>
 
         <section class="page active" id="page-overview">
           <div class="overview-top">
@@ -483,9 +492,13 @@
   <script src="supabase-config.js"></script>
   <script src="auth.js"></script>
   <script src="sync.js"></script>
+  <div class="drop-overlay" id="drop-overlay" aria-hidden="true" hidden>
+    <div><b>Drop to check</b><span>Drop a file anywhere in this window. It is only read: nothing is moved, deleted or sent.</span></div>
+  </div>
   <div id="nexbot" hidden></div>
   <script src="bot.js"></script>
   <script src="report.js"></script>
+  <script src="filecheck.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

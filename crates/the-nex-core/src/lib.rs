@@ -1,6 +1,7 @@
 pub mod ai_policy;
 pub mod bin_ai;
 pub mod canary;
+pub mod check_file;
 pub mod config;
 pub mod engine;
 pub mod known_bad;

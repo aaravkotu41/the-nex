@@ -3,6 +3,7 @@
 mod appearance;
 #[cfg(target_os = "macos")]
 mod camera;
+mod filecheck;
 #[cfg(target_os = "macos")]
 mod menubar;
 #[cfg(target_os = "macos")]
@@ -677,11 +678,13 @@ async fn aegismesh(op: String, request: serde_json::Value) -> Result<serde_json:
 }
 
 fn main() {
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default().on_window_event(|_window, _event| {
+        #[cfg(target_os = "macos")]
+        menubar::on_window_event(_window, _event);
+        filecheck::on_window_event(_window, _event);
+    });
     #[cfg(target_os = "macos")]
-    let builder = builder
-        .setup(menubar::setup)
-        .on_window_event(menubar::on_window_event);
+    let builder = builder.setup(menubar::setup);
     let app = builder
         .register_uri_scheme_protocol(appearance::WALLPAPER_SCHEME, |ctx, request| {
             appearance::serve_wallpaper(ctx.app_handle(), &request)

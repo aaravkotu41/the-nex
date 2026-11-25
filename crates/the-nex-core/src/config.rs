@@ -42,6 +42,7 @@ Modes:
   --rearm-canaries          verify and recreate canary files, then exit
   --scan-file <PATH>        explain the binary AI verdict for PATH (a file, a folder or
                             @list.txt); prints JSON lines and never changes anything
+  --check-file <PATH>       check one file with every engine and print one JSON line; read-only
   --restore <ID>          restore a quarantined file by its quarantine ID
   --delete <ID>             permanently delete a quarantined file by its quarantine ID
   --set <ENGINE>=<on|off>   toggle known_bad, zip_bomb, bin_ai, process_guard, canary or
@@ -124,6 +125,7 @@ pub enum Mode {
     FullScan,
     RearmCanaries,
     ScanFile(PathBuf),
+    CheckFile(PathBuf),
     Restore(String),
     Delete(String),
     Set(Engine, bool),
@@ -182,6 +184,10 @@ where
                 &mut iter,
                 "--scan-file",
             )?))),
+            "--check-file" => Some(Mode::CheckFile(PathBuf::from(take_value(
+                &mut iter,
+                "--check-file",
+            )?))),
             "--set" => {
                 let value = take_value(&mut iter, "--set")?;
                 let (name, state) = value.split_once('=').ok_or("--set expects ENGINE=on|off")?;
@@ -236,8 +242,17 @@ where
     }
     // The installed service takes no arguments, so it can only ever load the list its build
     // was made with; a list named on a command line decides what gets quarantined.
-    if hash_list.is_some() && !matches!(mode, Mode::Console | Mode::QuickScan | Mode::FullScan) {
-        return Err("--hash-list is only valid with --console, --quick-scan or --full-scan".into());
+    // --check-file only reports, so a list named for it cannot steer anything being quarantined.
+    if hash_list.is_some()
+        && !matches!(
+            mode,
+            Mode::Console | Mode::QuickScan | Mode::FullScan | Mode::CheckFile(_)
+        )
+    {
+        return Err(
+            "--hash-list is only valid with --console, --quick-scan, --full-scan or --check-file"
+                .into(),
+        );
     }
     if path_overrides && matches!(mode, Mode::Install | Mode::Uninstall | Mode::Help) {
         return Err("--quarantine-dir and --log-file cannot be combined with that mode".into());
@@ -768,6 +783,13 @@ mod tests {
             args(&["--scan-file", "setup.exe"]).unwrap().mode,
             Mode::ScanFile(PathBuf::from("setup.exe"))
         );
+        assert_eq!(
+            args(&["--check-file", "/tmp/a.zip"]).unwrap().mode,
+            Mode::CheckFile(PathBuf::from("/tmp/a.zip"))
+        );
+        assert!(args(&["--check-file"]).is_err());
+        assert!(args(&["--check-file", "--dry-run"]).is_err());
+        assert!(args(&["--check-file", "a.zip", "--dry-run"]).is_err());
         assert!(args(&["--scan-file"]).is_err());
         assert!(args(&["--scan-file", "a.exe", "--dry-run"]).is_err());
     }
@@ -781,6 +803,7 @@ mod tests {
             Mode::Console
         );
         assert!(args(&["--quick-scan", "--hash-list", "test.bin"]).is_ok());
+        assert!(args(&["--check-file", "a.zip", "--hash-list", "test.bin"]).is_ok());
         for mode in ["--install", "--uninstall", "--notifier", "--tray"] {
             assert!(args(&[mode, "--hash-list", "test.bin"]).is_err(), "{mode}");
         }

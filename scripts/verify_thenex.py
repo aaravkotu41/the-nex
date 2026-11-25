@@ -6,7 +6,8 @@ Runs the real release binary against harmless decoys confined to ./thenex_live_s
   2 benign zip pass-through   6 known-malware list        10 --dry-run mode
   3 ratio zip bomb            7 LotL process kill
   4 nested zip bomb           8 canary trip & recovery
-Exit status is 0 only when all ten checks pass.
+  11 --check-file (read-only report on a bomb outside the watched folder)
+Exit status is 0 only when all eleven checks pass.
 
 Note: like the real product, the console engine watches every process on the machine while
 it runs; checks 7 and 8 rely on that and only target the decoy processes this script starts.
@@ -372,6 +373,57 @@ def remove_sandbox():
         shutil.rmtree(SANDBOX, onerror=make_writable)
 
 
+def run_check_file(target, data_dir):
+    result = subprocess.run(
+        [str(EXE), "--check-file", str(target), "--hash-list", str(HASH_LIST)],
+        cwd=ROOT, capture_output=True, text=True, timeout=60,
+        env={**os.environ, "THENEX_DATA_DIR": str(data_dir)},
+    )
+    return result.returncode, (json.loads(result.stdout.splitlines()[0]) if result.stdout.strip() else {})
+
+
+def tree(folder):
+    return sorted((str(p.relative_to(folder)), p.stat().st_size, p.stat().st_mtime_ns) for p in folder.rglob("*"))
+
+
+def check_file_report():
+    """--check-file reports a decoy bomb and a listed decoy, and changes and logs nothing."""
+    outside = SANDBOX / "dropped_by_user"
+    data_dir = SANDBOX / "check_data"
+    outside.mkdir(exist_ok=True)
+    data_dir.mkdir(exist_ok=True)
+    shutil.copy(MODEL, data_dir / MODEL.name)
+    bomb = outside / "dropped_bomb.zip"
+    bomb_bytes = ratio_bomb(50)
+    bomb.write_bytes(bomb_bytes)
+    listed = outside / DECOY_NAME
+    listed.write_bytes(DECOY)
+    note = outside / "notes.txt"
+    note.write_bytes(CONTROL)
+    before = (tree(SANDBOX), EVENTS.read_bytes() if EVENTS.exists() else b"")
+    code, bomb_json = run_check_file(bomb, data_dir)
+    _, listed_json = run_check_file(listed, data_dir)
+    _, note_json = run_check_file(note, data_dir)
+    _, folder_json = run_check_file(outside, data_dir)
+    after = (tree(SANDBOX), EVENTS.read_bytes() if EVENTS.exists() else b"")
+    problems = []
+    if code != 0 or bomb_json.get("verdict") != "suspicious" or "archive" not in bomb_json.get("checks", []):
+        problems.append(f"bomb not reported: {bomb_json}")
+    if listed_json.get("verdict") != "suspicious" or "known-malware list" not in " ".join(listed_json.get("reasons", [])):
+        problems.append(f"listed decoy not reported: {listed_json}")
+    if note_json.get("verdict") != "nothing_found" or note_json.get("checks") != ["list"]:
+        problems.append(f"control file wrongly reported: {note_json}")
+    if folder_json.get("verdict") != "refused":
+        problems.append(f"folder not refused: {folder_json}")
+    if set(bomb_json) != {"name", "verdict", "score", "threshold", "size", "sha256", "reasons", "checks"} or str(outside) in json.dumps(bomb_json):
+        problems.append("result has the wrong fields or leaks the path")
+    if not bomb.exists() or bomb.read_bytes() != bomb_bytes or quarantined("dropped_bomb.zip"):
+        problems.append("the decoy was moved or changed")
+    if before != after or find_event("ZIP_BOMB", "dropped_bomb.zip"):
+        problems.append("something on disk or in the event log changed")
+    return not problems, "bomb and listed decoy reported; nothing moved, nothing logged" if not problems else "; ".join(problems)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Live end-to-end verification of The Nex.")
     parser.add_argument("--skip-build", action="store_true", help="fail instead of building missing binaries")
@@ -398,6 +450,7 @@ def main():
         ("Live canary trip & recovery", lambda: check_canary(daemon)),
         ("Live restore CLI", lambda: check_restore(daemon, ratio_data)),
         ("Live dry-run mode", lambda: check_dry_run(daemon)),
+        ("Live file check (read-only)", check_file_report),
     ]
     results = []
     try:

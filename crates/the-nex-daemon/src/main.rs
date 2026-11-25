@@ -33,6 +33,7 @@ fn main() -> ExitCode {
         Mode::FullScan => scan(&args, engine::ScanKind::Full),
         Mode::RearmCanaries => rearm_canaries(&args),
         Mode::ScanFile(target) => scan_file(target, &args),
+        Mode::CheckFile(target) => check_file(target, &args),
         Mode::Notifier => {
             platform::detach_console();
             logger::init_without_file(false);
@@ -252,6 +253,20 @@ fn scan_file(target: &Path, args: &CliArgs) -> ExitCode {
         cfg.ai_threshold,
         scanner.engine_name()
     );
+    ExitCode::SUCCESS
+}
+
+/// Read-only: one JSON line for one file (see the_nex_core::check_file). Never logs an event.
+fn check_file(target: &Path, args: &CliArgs) -> ExitCode {
+    logger::init_without_file(false);
+    let mut cfg = AppConfig::from_cli(args);
+    if let Err(e) = cfg.load_known_bad() {
+        // The check still runs; it just has no list to compare against.
+        eprintln!("known-malware list not used: {e}");
+    }
+    let scanner = BinaryAiScanner::load(&cfg.model_path).with_max_scan_bytes(cfg.max_ai_scan_bytes);
+    let result = the_nex_core::check_file::check(&cfg, &scanner, target);
+    println!("{}", serde_json::to_string(&result).unwrap_or_default());
     ExitCode::SUCCESS
 }
 

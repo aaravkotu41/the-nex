@@ -633,3 +633,19 @@ a.btn { text-decoration: none; }
 .doc ul { padding-left: 20px; display: grid; gap: 8px; }
 .doc .facts { grid-template-columns: minmax(0, 220px) minmax(0, 1fr); }
 .doc .facts dd { word-break: normal; overflow-wrap: anywhere; }
+
+/* Drop a file to check it (filecheck.js) */
+.drop-overlay { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 28px; pointer-events: none; background: rgba(var(--scrim-rgb), 0.78); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+.drop-overlay > div { display: grid; gap: 6px; justify-items: center; width: min(520px, 100%); padding: 44px 28px; border: 2px dashed var(--ink); border-radius: var(--radius); background: rgb(var(--surface-rgb)); text-align: center; }
+.drop-overlay b { font-size: 20px; font-weight: 500; }
+.drop-overlay span { color: var(--muted); font-size: 14px; }
+.check-panel { margin-bottom: 14px; }
+.check-list { display: grid; gap: 12px; margin: 12px 0; padding: 0; list-style: none; }
+.check-list:empty { display: none; }
+.check-item { display: grid; gap: 6px; padding: 14px 16px; border-radius: 16px; box-shadow: inset 0 0 0 1px var(--line); min-width: 0; }
+.check-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
+.check-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; font-weight: 500; }
+.check-line { margin: 0; font-size: 13.5px; }
+.check-facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; margin: 4px 0 0; font-size: 13px; }
+.check-facts dt { color: var(--muted); }
+.check-facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
