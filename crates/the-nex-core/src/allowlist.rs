@@ -32,7 +32,7 @@ const MAX_LOG_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_LOG_LINE: u64 = 1024 * 1024;
 const PROMPT_NAME_CHARS: usize = 60;
 /// How long one change waits for another to finish.
-const LOCK_WAIT: Duration = Duration::from_secs(3);
+pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(3);
 /// Detections an entry can cover: whole files judged by an estimating engine. `MANUAL` is for
 /// an entry added by hand from the command line.
 pub const ALLOWABLE_TYPES: &[&str] = &["MALWARE_AI", "MALWARE_AI_PROCESS", "ZIP_BOMB", "MANUAL"];
@@ -45,7 +45,7 @@ pub struct AllowedFile {
     pub added_at: DateTime<Utc>,
 }
 
-fn invalid(message: impl Into<String>) -> io::Error {
+pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
@@ -212,15 +212,15 @@ impl From<LoadError> for String {
     }
 }
 
-/// Loads the list. A missing file is an empty list; a damaged or untrusted one is an error and
-/// is never partly used. shortcut: Windows relies on the ACL of ProgramData\TheNex; upgrade by
-/// checking the file's owner SID there as well.
-pub fn load(path: &Path, privileged: bool) -> Result<Vec<AllowedFile>, LoadError> {
+/// The bytes of a list only an administrator may change; None when there is no such file.
+/// shortcut: Windows relies on the ACL of ProgramData\TheNex; upgrade by checking the file's
+/// owner SID there as well.
+pub(crate) fn read_protected(path: &Path, privileged: bool) -> Result<Option<Vec<u8>>, LoadError> {
     let io_error =
         |e: io::Error| LoadError::Io(io::Error::new(e.kind(), format!("{}: {e}", path.display())));
     let file = match quarantine::open_nofollow(path) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
             return Err(LoadError::Refused(format!(
                 "{} is ignored: {e}",
@@ -252,6 +252,15 @@ pub fn load(path: &Path, privileged: bool) -> Result<Vec<AllowedFile>, LoadError
     file.take(MAX_FILE_BYTES)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
+    Ok(Some(bytes))
+}
+
+/// Loads the list. A missing file is an empty list; a damaged or untrusted one is an error and
+/// is never partly used.
+pub fn load(path: &Path, privileged: bool) -> Result<Vec<AllowedFile>, LoadError> {
+    let Some(bytes) = read_protected(path, privileged)? else {
+        return Ok(Vec::new());
+    };
     let entries: Vec<AllowedFile> =
         serde_json::from_slice(&bytes).map_err(|e| LoadError::Damaged(format!("damaged: {e}")))?;
     let mut seen = HashSet::new();
@@ -268,9 +277,30 @@ pub fn load(path: &Path, privileged: bool) -> Result<Vec<AllowedFile>, LoadError
     }
 }
 
+/// Changes whenever a list file's content, owner or permissions change.
+pub(crate) type ListStamp = (u128, u64, u128);
+
+pub(crate) fn list_stamp(path: &Path) -> ListStamp {
+    fs::metadata(path).map_or((0, 0, 0), |m| {
+        let modified = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok());
+        // ctime also moves on chmod/chown, which must make the trust check run again.
+        #[cfg(unix)]
+        let changed = {
+            use std::os::unix::fs::MetadataExt;
+            (m.ctime() as u128) << 32 | m.ctime_nsec() as u128
+        };
+        #[cfg(not(unix))]
+        let changed = 0;
+        (modified.map_or(0, |d| d.as_nanos()), m.len(), changed)
+    })
+}
+
 #[derive(Debug, Default)]
 struct Loaded {
-    stamp: Option<(u128, u64, u128)>,
+    stamp: Option<ListStamp>,
     hashes: HashSet<String>,
     error: Option<String>,
 }
@@ -299,21 +329,7 @@ impl LiveAllowed {
     }
 
     fn refresh_with(&self, load: impl FnOnce(&Path) -> Result<Vec<AllowedFile>, LoadError>) {
-        let stamp = fs::metadata(&self.path).map_or((0, 0, 0), |m| {
-            let modified = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok());
-            // ctime also moves on chmod/chown, which must make the trust check run again.
-            #[cfg(unix)]
-            let changed = {
-                use std::os::unix::fs::MetadataExt;
-                (m.ctime() as u128) << 32 | m.ctime_nsec() as u128
-            };
-            #[cfg(not(unix))]
-            let changed = 0;
-            (modified.map_or(0, |d| d.as_nanos()), m.len(), changed)
-        });
+        let stamp = list_stamp(&self.path);
         let mut state = lock_or_recover(&self.state);
         if state.stamp == Some(stamp) {
             return;
@@ -431,8 +447,8 @@ fn check_with(
 /// One change to the list at a time: the system's own lock on a file beside it, released when
 /// the returned file is dropped, also by a crash. Only its owner can open the file, so another
 /// user cannot hold the lock to block changes.
-fn lock(cfg: &AppConfig, wait: Duration) -> io::Result<fs::File> {
-    if let Some(parent) = cfg.allowed_file.parent() {
+pub(crate) fn lock(list: &Path, wait: Duration) -> io::Result<fs::File> {
+    if let Some(parent) = list.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut options = fs::OpenOptions::new();
@@ -442,7 +458,7 @@ fn lock(cfg: &AppConfig, wait: Duration) -> io::Result<fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options.open(cfg.allowed_file.with_extension("json.lock"))?;
+    let file = options.open(list.with_extension("json.lock"))?;
     let started = Instant::now();
     loop {
         match file.try_lock() {
@@ -453,7 +469,7 @@ fn lock(cfg: &AppConfig, wait: Duration) -> io::Result<fs::File> {
             Err(fs::TryLockError::WouldBlock) => {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "another change to the always-allowed list is in progress; try again",
+                    "another change to this list is in progress; try again",
                 ));
             }
             Err(fs::TryLockError::Error(e)) => return Err(e),
@@ -463,23 +479,27 @@ fn lock(cfg: &AppConfig, wait: Duration) -> io::Result<fs::File> {
 
 /// The list to change. A list that could not be read or was refused is an error, so a change
 /// never rewrites it and loses entries; only a damaged one is replaced, and a copy is kept.
-fn load_for_update(cfg: &AppConfig) -> io::Result<Vec<AllowedFile>> {
-    match load(&cfg.allowed_file, config::running_privileged()) {
+pub(crate) fn load_for_update<T>(
+    list: &Path,
+    load: fn(&Path, bool) -> Result<Vec<T>, LoadError>,
+) -> io::Result<Vec<T>> {
+    match load(list, config::running_privileged()) {
         Ok(entries) => Ok(entries),
         Err(LoadError::Io(e)) => Err(e),
         Err(LoadError::Refused(why)) => Err(io::Error::new(io::ErrorKind::InvalidData, why)),
         Err(LoadError::Damaged(why)) => {
             // An earlier copy is evidence too: a new one never replaces it.
-            let mut kept = cfg.allowed_file.with_extension("json.damaged");
+            let mut kept = list.with_extension("json.damaged");
             if kept.symlink_metadata().is_ok() {
-                kept = cfg.allowed_file.with_extension(format!(
+                kept = list.with_extension(format!(
                     "json.damaged-{}",
                     Utc::now().timestamp_nanos_opt().unwrap_or_default()
                 ));
             }
-            fs::rename(&cfg.allowed_file, &kept)?;
+            fs::rename(list, &kept)?;
             logger::warn(format!(
-                "always-allowed list replaced ({why}); the old file is kept as {}",
+                "{} replaced ({why}); the old file is kept as {}",
+                list.display(),
                 kept.display()
             ));
             Ok(Vec::new())
@@ -498,8 +518,8 @@ pub fn add(cfg: &AppConfig, entry: AllowedFile) -> io::Result<bool> {
             "it is on the known-malware list and can never be allowed",
         ));
     }
-    let _lock = lock(cfg, LOCK_WAIT)?;
-    let mut entries = load_for_update(cfg)?;
+    let _lock = lock(&cfg.allowed_file, LOCK_WAIT)?;
+    let mut entries = load_for_update(&cfg.allowed_file, load)?;
     if entries.iter().any(|e| e.sha256 == hash) {
         return Ok(false);
     }
@@ -528,10 +548,10 @@ fn digest_of(hex: &str) -> Digest32 {
 /// Removes one entry; false when it was not listed (a damaged list lists nothing).
 pub fn remove(cfg: &AppConfig, sha256: &str) -> io::Result<bool> {
     let hash = parse_sha256(sha256).map_err(invalid)?;
-    let _lock = lock(cfg, LOCK_WAIT)?;
+    let _lock = lock(&cfg.allowed_file, LOCK_WAIT)?;
     let mut entries = match load(&cfg.allowed_file, config::running_privileged()) {
         Err(LoadError::Damaged(_)) => return Ok(false),
-        _ => load_for_update(cfg)?,
+        _ => load_for_update(&cfg.allowed_file, load)?,
     };
     let before = entries.len();
     entries.retain(|e| e.sha256 != hash);
@@ -1124,14 +1144,16 @@ mod tests {
         assert_eq!(load(&cfg.allowed_file, false).unwrap().len(), 12);
 
         // A lock someone holds makes the change wait and then give up; a leftover file is no lock.
-        let held = lock(&cfg, Duration::from_millis(80)).unwrap();
+        let held = lock(&cfg.allowed_file, Duration::from_millis(80)).unwrap();
         let started = Instant::now();
-        let timeout = lock(&cfg, Duration::from_millis(80)).err().unwrap();
+        let timeout = lock(&cfg.allowed_file, Duration::from_millis(80))
+            .err()
+            .unwrap();
         assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2));
         drop(held);
         assert!(cfg.allowed_file.with_extension("json.lock").exists());
-        drop(lock(&cfg, Duration::from_millis(80)).unwrap());
+        drop(lock(&cfg.allowed_file, Duration::from_millis(80)).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -25,6 +25,7 @@ use the_nex_core::engine::{self, QuickScanReport, ScanKind};
 use the_nex_core::platform;
 use the_nex_core::quarantine::{self, QuarantineMeta, Severity, ThreatEvent};
 use the_nex_core::scan_jobs::{self, ScanProgress};
+use the_nex_core::skiplist::{self, SkippedPlace};
 use the_nex_core::status::{self, CanaryStatus, EngineStatus};
 
 const EVENT_TAIL_BYTES: u64 = 4 * 1024 * 1024;
@@ -147,6 +148,11 @@ fn prompt_text(args: &[&str], subject: &str) -> String {
         Some("--disallow") => {
             format!("start checking one always-allowed file again. It is {subject}")
         }
+        Some("--never-scan") => {
+            format!("never scan one folder again, or anything put in it later. It is {subject}")
+        }
+        Some("--never-scan-file") => format!("never scan one file again. It is {subject}"),
+        Some("--scan-again") => format!("start scanning one place again. It is {subject}"),
         Some("--delete") => "permanently delete a quarantined file".to_string(),
         Some("--rearm-canaries") => "re-create its ransomware decoy files".to_string(),
         _ => format!("run: the-nex {}", args.join(" ")),
@@ -337,6 +343,7 @@ fn get_dashboard_state() -> Result<DashboardState, String> {
         }
         _ => platform::discover_watched_dirs()
             .iter()
+            .filter(|d| !cfg.is_skipped(d))
             .map(|d| display(d))
             .collect(),
     };
@@ -821,6 +828,95 @@ async fn remove_allowed(sha256: String) -> Result<String, String> {
     .await
 }
 
+/// The places as the service sees them (see `list_allowed`).
+#[tauri::command]
+fn list_never_scan() -> Result<Vec<SkippedPlace>, String> {
+    Ok(skiplist::load(
+        &config().skipped_file,
+        config::running_privileged() || platform::service_installed(),
+    )?)
+}
+
+/// What a person types, pastes or drops: spaces around it, quotes and a leading `~/` are theirs.
+fn typed_path(text: &str, home: Option<&Path>) -> PathBuf {
+    let text = text.trim();
+    let text = ['"', '\'']
+        .iter()
+        .find_map(|q| text.strip_prefix(*q)?.strip_suffix(*q))
+        .unwrap_or(text);
+    match (text.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(text),
+    }
+}
+
+/// The place a path leads to, for the person to confirm before anything is listed.
+#[tauri::command]
+async fn find_never_scan(path: String) -> Result<SkippedPlace, String> {
+    blocking(move || {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        skiplist::resolve(&typed_path(&path, home.as_deref()))
+    })
+    .await
+}
+
+/// Listing a place takes an administrator, whose prompt names it. Never reachable from synced
+/// (remote) commands. shortcut: the path is on the engine's command line, so a folder named like
+/// a dangerous command ("base64 -d ...") could get the prompt stopped; pass it on stdin if that
+/// is ever reported.
+#[tauri::command]
+async fn add_never_scan(path: String, folder: bool) -> Result<String, String> {
+    blocking(move || {
+        let place = skiplist::resolve(Path::new(&path))?;
+        // Only the very place that was confirmed.
+        if place.path != path || place.folder != folder {
+            return Err("That place changed since you chose it. Choose it again.".to_string());
+        }
+        let mode = if folder {
+            "--never-scan"
+        } else {
+            "--never-scan-file"
+        };
+        change_never_scan(mode, &path, |cfg| {
+            skiplist::add(cfg, Path::new(&path), folder)
+        })?;
+        Ok("The Nex will never scan that place".to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn remove_never_scan(path: String) -> Result<String, String> {
+    blocking(move || {
+        change_never_scan("--scan-again", &path, |cfg| {
+            skiplist::remove(cfg, Path::new(&path))
+        })?;
+        Ok("The Nex will scan that place again".to_string())
+    })
+    .await
+}
+
+fn change_never_scan(
+    mode: &str,
+    path: &str,
+    direct: impl FnOnce(&AppConfig) -> io::Result<bool>,
+) -> Result<(), String> {
+    let cfg = config();
+    match direct(&cfg) {
+        Ok(_) => Ok(()),
+        Err(e) if is_permission_error(&e) => {
+            let installed = installed_engine().is_some();
+            let capable = fresh_status(&cfg).map(|s| s.can_never_scan);
+            let problem = match mode {
+                "--scan-again" => disallow_problem_for(installed, capable),
+                _ => allow_problem_for(installed, capable),
+            };
+            unless_problem(problem, || elevated_about(&[mode, path], path))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[tauri::command]
 async fn verify_canaries(remote: Option<bool>) -> Result<Vec<CanaryStatus>, String> {
     blocking(move || {
@@ -967,6 +1063,11 @@ fn main() {
             allow_quarantined,
             list_allowed,
             remove_allowed,
+            list_never_scan,
+            find_never_scan,
+            add_never_scan,
+            remove_never_scan,
+            filecheck::drop_is_never_scan,
             verify_canaries,
             install_service,
             uninstall_service,
@@ -1000,6 +1101,25 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pasted_path_loses_quotes_and_spaces_and_the_prompt_names_the_place() {
+        let home = Path::new("/Users/me");
+        for (text, want) in [
+            (" /Users/me/a b ", "/Users/me/a b"),
+            ("\"/Users/me/a b\"", "/Users/me/a b"),
+            ("'/Users/me/a'", "/Users/me/a"),
+            ("~/Tax", "/Users/me/Tax"),
+            ("\"/Users/me/a", "\"/Users/me/a"),
+            ("~other/x", "~other/x"),
+        ] {
+            assert_eq!(typed_path(text, Some(home)), Path::new(want), "{text}");
+        }
+        let prompt = prompt_text(&["--never-scan", "/Users/me/Tax"], "/Users/me/Tax");
+        assert!(prompt.contains("never scan") && prompt.contains("/Users/me/Tax"));
+        let prompt = prompt_text(&["--scan-again", "/Users/me/Tax"], "/Users/me/Tax");
+        assert!(prompt.contains("scanning one place again") && prompt.contains("/Users/me/Tax"));
+    }
 
     #[test]
     fn only_the_fixed_report_pages_can_be_opened() {

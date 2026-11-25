@@ -83,6 +83,23 @@ which events do not record.
   start of its hash. Files on the known-malware list, scripts and decoy alerts can never be
   allowed. Settings lists what is allowed, with Remove. Limits: an updated program has to be
   allowed again; files over 256 MB cannot be; an archive's hash is taken by reading it again.
+- **Never scan** (Settings; `--never-scan`, `--never-scan-file`, `--scan-again`,
+  `--list-never-scan`): folders and
+  files whose contents are not opened, moved or deleted by the live watch, any scan, the startup
+  list or the check of running programs, and where no decoys are put. A folder covers what is put
+  in it later. Every change needs an administrator, because malware must not be able to list
+  itself, and is logged; scans say how many listed places they left out. Refused: whole disks,
+  whole user folders, the system, the standard temporary folders, LaunchAgents and LaunchDaemons,
+  and the Windows Start Menu. Not refused: less usual places that start things (Office start-up
+  folders, shell profiles) and user or temporary folders moved to another drive.
+  Limits: malware in a listed place is not noticed. A moved or renamed folder is scanned again,
+  and so is another hard link to a listed file. Command lines are still judged, and when a decoy
+  is changed, a program from a listed place can still be picked as the writer: its signature is
+  read and it can be stopped. Events from before a place was listed stay in the log, and a file
+  already in quarantine stays there. Dropping a file on the window, or `--scan-file` and
+  `--check-file`, still checks it: that is a person asking. A damaged or tampered list is not used
+  and raises an event. The path is on the elevated engine's command line, so a folder named like a
+  dangerous command could get that prompt stopped.
 - **Check a file** by dropping it on the window (`the-nex --check-file`): AI score, archive check
   and known-malware list, read-only, in a separate process with limits. Nothing is moved, logged
   or sent. It says what it could not check (files inside archives, signed programs are trusted
@@ -133,8 +150,10 @@ does not score (perl, ruby, node and others have no command-line rules either); 
 queue of programs to check. For programs already running when protection starts the AI and the
 malware list only report, but the command-line rules still stop them.
 
-Checked on macOS only: 352 Rust tests, the Node tests and 14 live checks. Windows code is
-type-checked, never run. The administrator prompts, the real window and dropping a real file were
+Checked on macOS only: 362 Rust tests, the Node tests and 15 live checks. On
+Windows, GitHub's machines ran the state before never-scan: the live, installer and AI checks
+passed and two unit tests failed on assumptions of their own (corrected since, not rerun);
+never-scan is only type-checked there. The administrator prompts, the real window and dropping a real file were
 not exercised.
 
 ## Known-malware list

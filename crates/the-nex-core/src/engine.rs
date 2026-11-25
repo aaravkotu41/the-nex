@@ -8,6 +8,7 @@ use crate::process_guard;
 use crate::quarantine::{self, Severity, ThreatEvent};
 use crate::scan_jobs::{self, ScanJobs};
 use crate::schedule::{self, Scheduler};
+use crate::skiplist;
 use crate::status::{self, ResourceUsage, Telemetry};
 use crate::zip_bomb;
 use chrono::Utc;
@@ -107,11 +108,12 @@ pub fn classify_file(path: &Path) -> FileKind {
     FileKind::Other
 }
 
-/// The Nex's own data, quarantine and log folders are never scanned.
+/// The Nex's own data, quarantine and log folders are never scanned, nor what the owner listed.
 fn should_ignore(cfg: &AppConfig, path: &Path) -> bool {
     platform::path_is_within(path, &cfg.base_dir)
         || platform::path_is_within(path, &cfg.quarantine_dir)
         || is_engine_output(cfg, path)
+        || cfg.is_skipped(path)
         || zip_bomb::is_ignored_extension(path)
 }
 
@@ -176,6 +178,9 @@ pub struct QuickScanReport {
     /// iCloud / File Provider placeholders left alone: reading one would download it.
     #[serde(default)]
     pub cloud_skipped: u64,
+    /// Places on the never-scan list that were met and left alone (a folder counts once).
+    #[serde(default)]
+    pub never_scan: u64,
     /// RFC 3339; makes every report distinct so a waiting client can see a new one arrive.
     #[serde(default)]
     pub finished_at: String,
@@ -392,6 +397,12 @@ pub fn scan_tree(
             report.cancelled = true;
             break 'walk;
         }
+        // A long scan follows changes to the never-scan list as it goes.
+        cfg.skipped.refresh();
+        if cfg.is_skipped(&dir) {
+            report.never_scan += 1;
+            continue;
+        }
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) => {
@@ -415,7 +426,14 @@ pub fn scan_tree(
             let Ok(kind) = entry.file_type() else {
                 continue;
             };
-            if kind.is_symlink() || should_ignore(cfg, &path) {
+            if kind.is_symlink() {
+                continue;
+            }
+            if cfg.is_skipped(&path) {
+                report.never_scan += 1;
+                continue;
+            }
+            if should_ignore(cfg, &path) {
                 continue;
             }
             if is_cloud_placeholder(&entry) {
@@ -536,7 +554,7 @@ pub fn run_scan(
             },
             format!("{} threat(s) found", report.findings.len()),
             format!(
-                "{}examined={} scanned={} truncated={} cancelled={} unreadable_folders={} cloud_skipped={} duration_ms={}",
+                "{}examined={} scanned={} truncated={} cancelled={} unreadable_folders={} cloud_skipped={} never_scan={} duration_ms={}",
                 if kind == ScanKind::Scheduled {
                     "scheduled, report only; "
                 } else {
@@ -548,6 +566,7 @@ pub fn run_scan(
                 report.cancelled,
                 report.unreadable.len(),
                 report.cloud_skipped,
+                report.never_scan,
                 report.duration_ms
             ),
     );
@@ -619,7 +638,14 @@ pub fn quick_scan_roots(cfg: &AppConfig) -> Vec<PathBuf> {
     }
 }
 
+/// Never a folder on the never-scan list: no decoy is put there.
 pub fn canary_dirs(cfg: &AppConfig) -> Vec<PathBuf> {
+    let mut dirs = all_canary_dirs(cfg);
+    dirs.retain(|dir| !cfg.is_skipped(dir));
+    dirs
+}
+
+fn all_canary_dirs(cfg: &AppConfig) -> Vec<PathBuf> {
     match &cfg.watch_dir {
         Some(dir) => vec![dir.clone()],
         None => platform::discover_canary_dirs(),
@@ -633,9 +659,10 @@ fn watch_plan(cfg: &AppConfig) -> Vec<(PathBuf, bool)> {
     }
     let mut plan: Vec<(PathBuf, bool)> = platform::discover_watched_dirs()
         .into_iter()
+        .filter(|dir| !cfg.is_skipped(dir))
         .map(|dir| (dir, true))
         .collect();
-    for dir in platform::discover_canary_dirs() {
+    for dir in canary_dirs(cfg) {
         let covered = plan.iter().any(|(watched, recursive)| {
             platform::path_key(watched) == platform::path_key(&dir)
                 || (*recursive && platform::path_is_within(&dir, watched))
@@ -686,12 +713,14 @@ fn build_watcher(
 }
 
 fn refresh_watches(
+    cfg: &AppConfig,
     watcher: &mut RecommendedWatcher,
     watched: &mut HashMap<String, PathBuf>,
     plan: &[(PathBuf, bool)],
 ) {
     watched.retain(|_, dir| {
-        if dir.is_dir() {
+        // Gone, or put on the never-scan list.
+        if dir.is_dir() && !cfg.is_skipped(dir) {
             true
         } else {
             let _ = watcher.unwatch(dir);
@@ -803,6 +832,28 @@ fn report_allowed(cfg: &AppConfig, refusal: &Option<String>) {
     );
 }
 
+/// Logs a change in whether the never-scan list is being used.
+fn report_skipped(cfg: &AppConfig, refusal: &Option<String>) {
+    let Some(why) = refusal else {
+        logger::info(format!(
+            "never-scan places: {} listed",
+            cfg.skipped.places().len()
+        ));
+        return;
+    };
+    logger::error(format!("never-scan list refused: {why}"));
+    quarantine::record_event(
+        cfg,
+        ThreatEvent::new(
+            skiplist::EVENT,
+            Severity::Medium,
+            skiplist::FILE_NAME,
+            "LIST_REFUSED: the never-scan list cannot be used",
+            format!("the never-scan list was refused: {why}"),
+        ),
+    );
+}
+
 /// Runs every detector until `shutdown` is set. Used by both the service and `--console`.
 pub fn run(mut cfg: AppConfig, shutdown: Arc<AtomicBool>) {
     logger::init(&cfg.log_dir, cfg.interactive);
@@ -836,7 +887,7 @@ pub fn run(mut cfg: AppConfig, shutdown: Arc<AtomicBool>) {
         let cfg = Arc::clone(&cfg);
         let telemetry = Arc::clone(&telemetry);
         let shutdown = Arc::clone(&shutdown);
-        let dirs = canary_dirs(&cfg);
+        let dirs = all_canary_dirs(&cfg);
         spawn_worker(&mut workers, "nex-canary", move || {
             canary::run(cfg, dirs, canary_rx, telemetry, shutdown)
         });
@@ -863,7 +914,7 @@ pub fn run(mut cfg: AppConfig, shutdown: Arc<AtomicBool>) {
     let mut watcher = build_watcher(scan_tx.clone(), canary_tx.clone());
     let mut watched: HashMap<String, PathBuf> = HashMap::new();
     if let Some(w) = watcher.as_mut() {
-        refresh_watches(w, &mut watched, &watch_plan(&cfg));
+        refresh_watches(&cfg, w, &mut watched, &watch_plan(&cfg));
     }
     // On-demand scans requested by the desktop app (see scan_jobs).
     let jobs = Arc::new(ScanJobs::default());
@@ -872,9 +923,11 @@ pub fn run(mut cfg: AppConfig, shutdown: Arc<AtomicBool>) {
         logger::warn(format!("on-demand scans are unavailable: {e}"));
     }
     let mut last_requests = Instant::now();
-    let mut last_discovery = Instant::now();
+    let mut last_discovery = Some(Instant::now());
     let mut last_settings = Instant::now();
     let mut allowed_refusal: Option<String> = None;
+    let mut skipped_refusal: Option<String> = None;
+    let mut skipped_places = cfg.skipped.places();
     let mut last_status: Option<Instant> = None;
     let mut status_error_logged = false;
     let mut own_process = System::new();
@@ -899,6 +952,17 @@ pub fn run(mut cfg: AppConfig, shutdown: Arc<AtomicBool>) {
             if refusal != allowed_refusal {
                 report_allowed(&cfg, &refusal);
                 allowed_refusal = refusal;
+            }
+            cfg.skipped.refresh();
+            let refusal = cfg.skipped.error();
+            if refusal != skipped_refusal {
+                report_skipped(&cfg, &refusal);
+                skipped_refusal = refusal;
+            }
+            // A change takes effect on the watched folders and decoys now, not in a minute.
+            if cfg.skipped.places() != skipped_places {
+                skipped_places = cfg.skipped.places();
+                last_discovery = None;
             }
         }
         if last_status.is_none_or(|t| t.elapsed() >= STATUS_INTERVAL) {
@@ -926,18 +990,16 @@ pub fn run(mut cfg: AppConfig, shutdown: Arc<AtomicBool>) {
                 Err(_) => {}
             }
         }
-        if last_discovery.elapsed() >= REDISCOVER_INTERVAL {
-            last_discovery = Instant::now();
+        if last_discovery.is_none_or(|t| t.elapsed() >= REDISCOVER_INTERVAL) {
+            last_discovery = Some(Instant::now());
             if watcher.is_none() {
                 watcher = build_watcher(scan_tx.clone(), canary_tx.clone());
                 watched.clear();
             }
             if let Some(w) = watcher.as_mut() {
-                refresh_watches(w, &mut watched, &watch_plan(&cfg));
+                refresh_watches(&cfg, w, &mut watched, &watch_plan(&cfg));
             }
-            if cfg.watch_dir.is_none() {
-                let _ = canary_tx.send(CanaryMsg::SetDirs(platform::discover_canary_dirs()));
-            }
+            let _ = canary_tx.send(CanaryMsg::SetDirs(canary_dirs(&cfg)));
         }
         thread::sleep(MAIN_TICK);
     }
@@ -1368,6 +1430,98 @@ mod tests {
         }
         scan_path(&cfg, &scanner, &bomb, &telemetry);
         assert!(!bomb.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_never_scan_place_is_left_alone_by_every_scan_until_it_is_taken_off() {
+        let root = crate::skiplist::tests::listable("engine");
+        let watch = root.join("watch");
+        let (private, beside) = (watch.join("Private"), watch.join("Private2"));
+        for dir in [&private.join("deep"), &beside] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let hidden = [
+            private.join("decoy.exe"),
+            private.join("deep").join("decoy.zip"),
+            private.join("listed.docm"),
+            watch.join("one.exe"),
+        ];
+        let seen = [beside.join("decoy.exe"), watch.join("two.zip")];
+        for path in hidden.iter().chain(&seen) {
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("zip") => fs::write(path, decoy_bomb()).unwrap(),
+                Some("docm") => fs::write(path, b"a listed decoy").unwrap(),
+                _ => fs::write(path, decoy_program()).unwrap(),
+            }
+        }
+        let mut cfg = cfg_with_list(&root, std::slice::from_ref(&hidden[2]));
+        for (place, folder) in [(&private, true), (&hidden[3], false)] {
+            assert!(crate::skiplist::add(&cfg, place, folder).unwrap());
+        }
+        let scanner = BinaryAiScanner::with_fixed_score(0.99);
+        let telemetry = Telemetry::default();
+
+        // Live: not even counted as looked at. Detection for real (no dry run), every engine on.
+        for path in &hidden {
+            scan_path(&cfg, &scanner, path, &telemetry);
+        }
+        assert_eq!(telemetry.files_scanned.load(Ordering::Relaxed), 0);
+        // And a detector that was already at work cannot move one.
+        let refused = quarantine::quarantine_file(&hidden[0], &cfg, "MALWARE_AI", "test");
+        assert!(refused.unwrap_err().to_string().contains("never-scan"));
+
+        // Every kind of scan. Quick is the one that acts; the others only report.
+        cfg.watch_dir = Some(watch.clone());
+        for kind in [ScanKind::Scheduled, ScanKind::Full, ScanKind::Quick] {
+            let report = run_scan(&cfg, &scanner, &telemetry, kind, &mut |_, _| true);
+            let mut found: Vec<&Path> = report.findings.iter().map(|f| f.path.as_path()).collect();
+            found.sort();
+            assert_eq!(
+                found,
+                seen.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+                "{kind:?}"
+            );
+            assert_eq!(
+                (report.never_scan, report.files_examined),
+                (2, 2),
+                "{kind:?}"
+            );
+        }
+        assert!(hidden.iter().all(|p| p.exists()));
+        assert!(seen.iter().all(|p| !p.exists()), "quarantined");
+        let named = quarantine::read_recent_events(&cfg.events_log, 1 << 20).unwrap();
+        for event in named
+            .iter()
+            .filter(|e| e.threat_type != crate::skiplist::EVENT)
+        {
+            assert!(
+                hidden
+                    .iter()
+                    .all(|p| event.target != p.display().to_string()),
+                "{event:?}"
+            );
+        }
+
+        // A scan of the listed folder itself says it was left out, not that it is clean.
+        let report = quick_scan(&cfg, &scanner, std::slice::from_ref(&private), &telemetry);
+        assert_eq!((report.never_scan, report.files_examined), (1, 0));
+
+        // Not a place for decoys.
+        cfg.watch_dir = Some(private.clone());
+        assert!(canary_dirs(&cfg).is_empty());
+
+        // Taken off the list, the same files are dealt with; dry run and switches still count.
+        for place in [&private, &hidden[3]] {
+            assert!(crate::skiplist::remove(&cfg, place).unwrap());
+        }
+        set_engine(&cfg, Engine::DryRun, true);
+        let report = quick_scan(&cfg, &scanner, std::slice::from_ref(&watch), &telemetry);
+        assert_eq!((report.findings.len(), report.never_scan), (4, 0));
+        assert!(hidden.iter().all(|p| p.exists()), "dry run");
+        set_engine(&cfg, Engine::DryRun, false);
+        scan_path(&cfg, &scanner, &hidden[0], &telemetry);
+        assert!(!hidden[0].exists(), "quarantined");
         let _ = fs::remove_dir_all(&root);
     }
 

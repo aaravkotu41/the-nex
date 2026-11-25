@@ -508,6 +508,14 @@ pub fn quarantine_file(
         }
         _ => absolute,
     };
+    // Whatever the detector was given: a file in a never-scan place is never moved.
+    cfg.skipped.refresh();
+    if cfg.is_skipped(&original_path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is on the never-scan list", original_path.display()),
+        ));
+    }
     let id = new_id();
     let quarantined_path = cfg.quarantine_dir.join(format!(
         "{id}_{}{QUARANTINE_SUFFIX}",

@@ -135,7 +135,7 @@ pub fn send_desktop_notification_async(title: &str, body: &str) {
 }
 
 /// Moves what a data folder that was not ours (made by a standard user before the first
-/// install) may hold out of the way: the settings and always-allowed list, the schedule's state
+/// install) may hold out of the way: the settings, always-allowed and never-scan lists, the schedule's state
 /// and seen findings, the event logs and the quarantine folder with its metadata. Each goes
 /// to `<name>.planted-<n>` beside it, never deleted, so nothing of the user's is lost for good.
 /// The caller has already cut inheritance and set the grants, so nobody can put it back.
@@ -144,6 +144,7 @@ pub(crate) fn set_aside_planted(cfg: &crate::config::AppConfig) -> Vec<String> {
     let mut notes = Vec::new();
     for path in [
         &cfg.allowed_file,
+        &cfg.skipped_file,
         &cfg.settings_file,
         &cfg.base_dir.join(crate::schedule::STATE_FILE),
         &cfg.base_dir.join(crate::schedule::SEEN_FILE),
@@ -242,6 +243,7 @@ mod tests {
         std::fs::write(&kept, b"model").unwrap();
         let planted = [
             &cfg.allowed_file,
+            &cfg.skipped_file,
             &cfg.settings_file,
             &dir.join("scheduled_scan.json"),
             &dir.join("scheduled_seen.json"),
@@ -255,9 +257,14 @@ mod tests {
         // A leftover of an earlier move is not overwritten.
         std::fs::write(dir.join("allowed.json.planted-0"), b"older").unwrap();
         let notes = set_aside_planted(&cfg);
-        assert_eq!(notes.len(), 6, "{notes:?}");
+        assert_eq!(notes.len(), 7, "{notes:?}");
         assert!(kept.exists());
-        for file in [&cfg.allowed_file, &cfg.settings_file, &cfg.events_log] {
+        for file in [
+            &cfg.allowed_file,
+            &cfg.skipped_file,
+            &cfg.settings_file,
+            &cfg.events_log,
+        ] {
             assert!(!file.exists(), "{}", file.display());
         }
         assert_eq!(

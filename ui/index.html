@@ -480,6 +480,19 @@
             </div>
 
             <div class="panel">
+              <div class="panel-head"><h2>Never scan</h2></div>
+              <p class="muted">Folders and files The Nex does not open, move or delete, including anything put in them later. Malware in one of these places will not be noticed, so list only what you need to. Commands that look dangerous and ransomware decoys elsewhere are still watched.</p>
+              <label class="field-label" for="skip-path">Drop a folder or file on this page, or paste its full path</label>
+              <form class="input-row" id="skip-form">
+                <input class="text-input" id="skip-path" type="text" maxlength="1200" autocomplete="off" autocapitalize="off" spellcheck="false">
+                <button class="btn" id="skip-add" type="submit">Add</button>
+              </form>
+              <p class="muted small" id="skip-note" role="status"></p>
+              <ul class="paths" id="skip-list"></ul>
+              <p class="empty" id="skip-empty">Nothing is left out of scans.</p>
+            </div>
+
+            <div class="panel">
               <div class="panel-head"><h2>Watched Directories</h2></div>
               <ul class="paths" id="watched-dirs"></ul>
             </div>
@@ -568,7 +581,8 @@
   <script src="auth.js"></script>
   <script src="sync.js"></script>
   <div class="drop-overlay" id="drop-overlay" aria-hidden="true" hidden>
-    <div><b>Drop to check</b><span>Drop a file anywhere in this window. It is only read: nothing is moved, deleted or sent.</span></div>
+    <div class="drop-check"><b>Drop to check</b><span>Drop a file anywhere in this window. It is only read: nothing is moved, deleted or sent.</span></div>
+    <div class="drop-skip"><b>Drop to never scan</b><span>Drop a folder or file to leave it out of scans. It is not opened, and you confirm it first.</span></div>
   </div>
   <div id="nexbot" hidden></div>
   <script src="bot.js"></script>

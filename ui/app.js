@@ -949,6 +949,100 @@ async function loadAllowed() {
   }));
 }
 
+/** The "Never scan" panel in Settings. */
+async function loadNeverScan() {
+  let list = [];
+  let problem = "";
+  try {
+    list = await call("list_never_scan");
+  } catch (error) {
+    problem = errorText(error);
+  }
+  $("skip-empty").textContent = problem || "Nothing is left out of scans.";
+  $("skip-empty").hidden = list.length > 0;
+  const armed = (place) => confirming("remove_never_scan", place.path);
+  replaceIfChanged($("skip-list"), JSON.stringify([list, list.map(armed)]), () => list.map((place) => {
+    const remove = el("button", {
+      className: "btn btn-small",
+      text: armed(place) ? "Confirm: scan it again" : "Remove",
+      attrs: { type: "button", "aria-label": `Scan ${place.path} again` },
+    });
+    remove.addEventListener("click", async (event) => {
+      if (!armed(place)) {
+        state.confirm = { action: "remove_never_scan", id: place.path, at: Date.now(), until: Date.now() + CONFIRM_MS };
+        loadNeverScan();
+        setTimeout(loadNeverScan, CONFIRM_MS + 50);
+        return;
+      }
+      if (event.detail > 1 || Date.now() - state.confirm.at < 400) return; // a double-click must not confirm
+      state.confirm = null;
+      remove.disabled = true;
+      try {
+        notice(await call("remove_never_scan", { path: place.path }), false);
+      } catch (error) {
+        notice(errorText(error), true);
+      }
+      await loadNeverScan();
+    });
+    return el("li", { className: "allowed-item" }, [
+      el("span", {}, [
+        el("code", { text: place.path }),
+        el("span", { className: "cell-sub", text: `${place.folder ? "Folder" : "File"}, added ${formatDateTime(place.added_at)}` }),
+      ]),
+      remove,
+    ]);
+  }));
+}
+
+// Two steps: the first finds the place and shows its real path, the second lists that very place.
+let skipChosen = null;
+
+function showSkipChoice(place, note) {
+  skipChosen = place && { path: place.path, folder: place.folder, at: Date.now() };
+  $("skip-add").textContent = place ? "Confirm" : "Add";
+  $("skip-note").textContent = place
+    ? `About to never scan this ${place.folder ? "folder and everything in it, now and later" : "file"}: ${place.path}. Press Confirm, then approve it as an administrator.`
+    : note || "";
+}
+
+async function addNeverScan(event) {
+  event.preventDefault();
+  const path = $("skip-path").value;
+  if (!path.trim()) return showSkipChoice(null, "Drop a folder or file, or paste its full path first.");
+  if (skipChosen && Date.now() - skipChosen.at < 400) return; // a double-click must not confirm
+  const chosen = skipChosen;
+  $("skip-add").disabled = true;
+  try {
+    if (!chosen) {
+      const place = await call("find_never_scan", { path });
+      if ($("skip-path").value === path) showSkipChoice(place); // else it was edited meanwhile
+      return;
+    }
+    notice(await call("add_never_scan", { path: chosen.path, folder: chosen.folder }), false);
+    $("skip-path").value = "";
+    showSkipChoice(null);
+    await loadNeverScan();
+  } catch (error) {
+    showSkipChoice(null, errorText(error));
+  } finally {
+    $("skip-add").disabled = false;
+  }
+}
+
+/** On the Settings page a drop fills the "Never scan" box; anywhere else it is a file check. */
+function takeDrop(paths) {
+  if (state.page !== "settings") return false;
+  if (paths.length > 1) {
+    notice("Drop one folder or file at a time.", true);
+    return true;
+  }
+  $("skip-path").value = paths[0];
+  showSkipChoice(null);
+  $("skip-path").scrollIntoView({ block: "center" });
+  $("skip-form").requestSubmit();
+  return true;
+}
+
 /* ---- Scheduled scan and summary report (Settings) ------------------------------------------ */
 
 function renderSchedule(info) {
@@ -1038,6 +1132,7 @@ async function refresh(force) {
     renderQuarantine();
     if (state.page === "settings") {
       await loadAllowed();
+      await loadNeverScan();
       await loadSchedule();
     }
   } catch (error) {
@@ -1166,6 +1261,7 @@ function showScanReport(report) {
     `${count(report.files_scanned)} of ${count(report.files_examined)} files inspected in ${took} across ${folders} folder${folders === 1 ? "" : "s"}`,
     full ? "report only: nothing was moved" : report.dry_run ? "dry run: nothing was moved" : "",
     report.cloud_skipped ? `${count(report.cloud_skipped)} cloud-only items skipped (not downloaded)` : "",
+    report.never_scan ? `${count(report.never_scan)} never-scan place${report.never_scan === 1 ? "" : "s"} not checked` : "",
     report.truncated ? "stopped at the file limit" : "",
   ].filter(Boolean).join(" · ");
   // Folders macOS would not let the scanner open: never report those as clean.
@@ -1188,6 +1284,8 @@ function showScanReport(report) {
     setScanSheet("error", `${name} cancelled`, `${notes} · nothing flagged so far`);
   } else if (blocked.length) {
     setScanSheet("error", `${name} could not read ${blocked.length} folder${blocked.length === 1 ? "" : "s"}`, [blockedNote, full ? notes : ""].filter(Boolean).join(" "));
+  } else if (!report.files_examined && report.never_scan) {
+    setScanSheet("error", `${name} checked nothing: everything is on your never-scan list`, notes);
   } else {
     setScanSheet("ok", `${name} complete: no threats found`, notes);
     scanUi.hideTimer = setTimeout(hideScanSheet, 9000);
@@ -1271,6 +1369,8 @@ function showPage(page) {
   $("page-sub").textContent = page === "overview" ? greeting() : PAGE_SUBS[page] || "";
   $("search-box").hidden = !SEARCH_PAGES.has(page);
   showAegis(page === "aegismesh");
+  $("drop-overlay").dataset.use = page === "settings" ? "skip" : "check";
+  call("drop_is_never_scan", { on: page === "settings" }).catch(() => {});
   refresh(true);
 }
 
@@ -1429,6 +1529,8 @@ function wire() {
   $("report-problem").addEventListener("click", () => {
     call("open_report_page", { kind: "bug" }).catch((error) => notice(errorText(error), true));
   });
+  $("skip-form").addEventListener("submit", addNeverScan);
+  $("skip-path").addEventListener("input", () => showSkipChoice(null));
   $("install-service").addEventListener("click", () => busy("install-service", "Installing…", async () => {
     notice(await call("install_service"), false);
   }));
@@ -1891,9 +1993,10 @@ function openMenuPage(page) {
 function startDashboard() {
   wire();
   if (window.NexSync) window.NexSync.start(call);
+  call("drop_is_never_scan", { on: false }).catch(() => {}); // a reload starts on the first page
   // Offline assistant (ui/bot.js): read-only, starts only after sign-in like everything else here.
   if (window.NexBot) window.NexBot.start({ call, showPage, openActivity });
-  if (window.NexFileCheck) window.NexFileCheck.start(copyButton); // drop a file on the window to check it
+  if (window.NexFileCheck) window.NexFileCheck.start(copyButton, takeDrop); // drop a file on the window to check it
   if (window.NexStartup) window.NexStartup.start({ call, el, expandable, detailGrid, chevron, errorText });
   if (window.NexSetup) window.NexSetup.start({ copyButton, run: runSetupAction });
   $("page-sub").textContent = greeting();

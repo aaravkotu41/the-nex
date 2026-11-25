@@ -664,7 +664,10 @@ pub fn uninstall_service() -> Result<String, String> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => notes.push(format!("cannot remove {}: {e}", engine_dir.display())),
     }
-    let removed = canary::remove_canaries(&discover_canary_dirs());
+    let removed = canary::remove_canaries(
+        &AppConfig::for_base_dir(&config::default_base_dir()),
+        &discover_canary_dirs(),
+    );
     notes.push(format!("removed {removed} canary file(s)"));
     Ok(notes.join("\n"))
 }

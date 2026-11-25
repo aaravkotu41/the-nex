@@ -57,6 +57,9 @@ fn scan_text(report: Result<the_nex_core::engine::QuickScanReport, String>) -> S
             "Last scan: macOS blocked {} folder(s) · open The Nex",
             r.unreadable.len()
         ),
+        Ok(r) if r.findings.is_empty() && r.files_examined == 0 && r.never_scan > 0 => {
+            "Last scan: nothing checked (all on your never-scan list)".to_string()
+        }
         Ok(r) if r.findings.is_empty() => format!(
             "Last scan: no threats · {} files · {:.1} s",
             r.files_scanned,

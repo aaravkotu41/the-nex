@@ -8,6 +8,7 @@ use the_nex_core::bin_ai::BinaryAiScanner;
 use the_nex_core::config::{self, AppConfig, CliArgs, Mode, RuntimeToggles};
 use the_nex_core::engine;
 use the_nex_core::quarantine::{self, QuarantineMeta, Severity, ThreatEvent};
+use the_nex_core::skiplist;
 use the_nex_core::{canary, logger, notifier, platform};
 
 fn main() -> ExitCode {
@@ -34,6 +35,15 @@ fn main() -> ExitCode {
         Mode::Disallow(sha256) => disallow(sha256, &args),
         Mode::AllowQuarantined(id) => allow_quarantined(id, &args),
         Mode::ListAllowed => list_allowed(&args),
+        Mode::NeverScan(path, folder) => changed(
+            skiplist::add(&cli_config(&args), path, *folder),
+            ["Added", "Already listed"],
+        ),
+        Mode::ScanAgain(path) => changed(
+            skiplist::remove(&cli_config(&args), path),
+            ["Removed", "Not listed"],
+        ),
+        Mode::ListNeverScan => list_never_scan(&args),
         Mode::Set(engine, enabled) => update_settings(&args, |t| t.set(*engine, *enabled)),
         Mode::SetSchedule(schedule) => update_settings(&args, |t| t.scan_schedule = *schedule),
         Mode::QuickScan => scan(&args, engine::ScanKind::Quick),
@@ -227,6 +237,24 @@ fn list_allowed(args: &CliArgs) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Prints the first word when the never-scan list changed, the second when it did not have to.
+fn changed(result: std::io::Result<bool>, [done, already]: [&str; 2]) -> ExitCode {
+    report(
+        result
+            .map(|changed| if changed { done } else { already }.to_string())
+            .map_err(|e| e.to_string()),
+    )
+}
+
+fn list_never_scan(args: &CliArgs) -> ExitCode {
+    let cfg = AppConfig::from_cli(args);
+    report(
+        skiplist::load(&cfg.skipped_file, config::running_privileged())
+            .map(|places| serde_json::to_string_pretty(&places).unwrap_or_default())
+            .map_err(String::from),
+    )
 }
 
 fn delete(id: &str, args: &CliArgs) -> ExitCode {

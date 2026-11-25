@@ -446,8 +446,9 @@ impl ProcessGuard {
         };
         let vouched = platform::vouched_file(process);
         let protected_name = program_name(process, vouched.as_deref());
+        // A program in a never-scan place is not opened, so its signature cannot vouch for it.
         if is_protected(pid.as_u32(), &protected_name, vouched.as_deref(), |e| {
-            self.is_trusted(e)
+            !self.cfg.is_skipped(e) && self.is_trusted(e)
         }) {
             return true;
         }
@@ -497,6 +498,11 @@ impl ProcessGuard {
             return;
         };
         let exe = real_path(&reported, &self.cfg.base_dir);
+        // Either spelling: a program in a never-scan place is not opened or stopped for what its
+        // file is. Its command line was judged above, which reads no file.
+        if self.cfg.is_skipped(&exe) || self.cfg.is_skipped(&reported) {
+            return;
+        }
         if !crate::engine::is_regular_file(&exe) {
             return;
         }
@@ -1911,6 +1917,53 @@ mod tests {
         g.inspect_binary(pid, false);
         assert_eq!(events().len(), 1, "an allowed program raises nothing");
         assert!(child.try_wait().unwrap().is_none());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_in_a_never_scan_place_is_not_judged_by_its_file() {
+        let dir = crate::skiplist::tests::listable("process");
+        let private = dir.join("Private");
+        fs::create_dir(&private).unwrap();
+        let exe = private.join("napper");
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        // The worst case: on the known-malware list, scored as malware, and not a dry run.
+        let digest = known_bad::hash_file(&exe, u64::MAX).unwrap();
+        let mut cfg = AppConfig::for_base_dir(&dir.join("base"));
+        cfg.ensure_dirs().unwrap();
+        let list = dir.join("list.bin");
+        known_bad::write_list(&list, &[digest], 1).unwrap();
+        cfg.hash_list = Some(list);
+        cfg.load_known_bad().unwrap();
+        assert!(crate::skiplist::add(&cfg, &private, true).unwrap());
+        let cfg = Arc::new(cfg);
+        let mut child = spawn_napper(&exe);
+        let pid = Pid::from_u32(child.id());
+        let mut g = ProcessGuard::new(
+            Arc::clone(&cfg),
+            Arc::new(BinaryAiScanner::with_fixed_score(0.99)),
+            Arc::new(Telemetry::default()),
+        );
+        refresh_until_seen(&mut g, &[pid]);
+        g.inspect_binary(pid, false);
+        assert!(exe.exists() && child.try_wait().unwrap().is_none());
+        let seen = || quarantine::read_recent_events(&cfg.events_log, 1 << 20).unwrap();
+        assert!(seen()
+            .iter()
+            .all(|e| e.threat_type == crate::skiplist::EVENT));
+
+        // Off the list the same program is found (in dry run, so nothing is stopped here).
+        assert!(crate::skiplist::remove(&cfg, &private).unwrap());
+        let mut toggles = cfg.toggles.snapshot();
+        toggles.set(Engine::DryRun, true);
+        cfg.toggles.apply(toggles);
+        g.inspect_binary(pid, false);
+        assert!(seen()
+            .iter()
+            .any(|e| e.threat_type == known_bad::THREAT_TYPE));
         let _ = child.kill();
         let _ = child.wait();
         let _ = fs::remove_dir_all(&dir);

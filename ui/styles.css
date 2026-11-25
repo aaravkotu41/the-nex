@@ -654,6 +654,8 @@ a.btn { text-decoration: none; }
 /* Drop a file to check it (filecheck.js) */
 .drop-overlay { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 28px; pointer-events: none; background: rgba(var(--scrim-rgb), 0.78); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
 .drop-overlay > div { display: grid; gap: 6px; justify-items: center; width: min(520px, 100%); padding: 44px 28px; border: 2px dashed var(--ink); border-radius: var(--radius); background: rgb(var(--surface-rgb)); text-align: center; }
+/* Settings: a drop is for the never-scan list, not a check. */
+.drop-overlay[data-use="skip"] .drop-check, .drop-overlay:not([data-use="skip"]) .drop-skip { display: none; }
 .drop-overlay b { font-size: 20px; font-weight: 500; }
 .drop-overlay span { color: var(--muted); font-size: 14px; }
 .check-panel { margin-bottom: 14px; }

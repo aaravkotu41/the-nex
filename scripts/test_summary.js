@@ -44,6 +44,8 @@ const cloud = S.lastScanText({ last_scan: { ...scan, cloud_skipped: 3 } }, fmt);
 assert.ok(cloud.endsWith("nothing suspicious found; 3 cloud-only files skipped (reading them would download them)."), cloud);
 assert.ok(S.lastScanText({ last_scan: { ...scan, cloud_skipped: 1 } }, fmt).includes("1 cloud-only file skipped"));
 assert.ok(!S.lastScanText({ last_scan: { ...scan, cloud_skipped: 0 } }, fmt).includes("cloud"));
+assert.ok(S.lastScanText({ last_scan: { ...scan, never_scan: 2 } }, fmt).includes("2 never-scan places not checked"));
+assert.ok(!S.lastScanText({ last_scan: { ...scan, never_scan: 0 } }, fmt).includes("never-scan"));
 // Stopped or empty is never "nothing suspicious found".
 const stopped = S.lastScanText({ last_scan: { ...scan, files_examined: 0, cancelled: true } }, fmt);
 assert.ok(stopped.includes("0 files looked at, nothing found so far; stopped early") && !stopped.includes("suspicious"), stopped);

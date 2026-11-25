@@ -93,7 +93,7 @@ mod unix {
         // remove unlinks the link only
         fs::remove_file(&link).unwrap();
         symlink(&target, &link).unwrap();
-        canary::remove_canaries(std::slice::from_ref(&dir));
+        canary::remove_canaries(&AppConfig::for_base_dir(&dir), std::slice::from_ref(&dir));
         assert!(fs::symlink_metadata(&link).is_err());
         assert_untouched(&target);
         let _ = fs::remove_dir_all(&root);

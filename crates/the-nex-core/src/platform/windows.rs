@@ -940,7 +940,10 @@ pub fn uninstall_service() -> Result<String, String> {
     if stopped > 0 {
         notes.push(format!("stopped {stopped} notifier/tray process(es)"));
     }
-    let removed = canary::remove_canaries(&discover_canary_dirs());
+    let removed = canary::remove_canaries(
+        &AppConfig::for_base_dir(&config::default_base_dir()),
+        &discover_canary_dirs(),
+    );
     notes.push(format!("removed {removed} canary file(s)"));
     Ok(notes.join("\n"))
 }

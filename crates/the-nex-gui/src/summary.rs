@@ -30,6 +30,7 @@ pub struct LastScheduled {
     cancelled: bool,
     truncated: bool,
     cloud_skipped: u64,
+    never_scan: u64,
 }
 
 #[derive(Serialize)]
@@ -63,6 +64,7 @@ fn schedule_info(cfg: &AppConfig) -> Result<ScheduleInfo, String> {
             cancelled: r.cancelled,
             truncated: r.truncated,
             cloud_skipped: r.cloud_skipped,
+            never_scan: r.never_scan,
         }),
     })
 }
@@ -476,7 +478,7 @@ fn scan_section(
         .map(|t| when(t.with_timezone(&Utc)))
         .unwrap_or_else(|_| "an unknown time".to_string());
     let mut out = format!(
-        "<h3>{title}</h3><p>Finished {}. {} files looked at, {} flagged.{}{}{}{}</p>",
+        "<h3>{title}</h3><p>Finished {}. {} files looked at, {} flagged.{}{}{}{}{}</p>",
         esc(&finished),
         r.files_examined,
         r.findings.len(),
@@ -504,6 +506,14 @@ fn scan_section(
             format!(
                 " {} cloud-only file(s) (iCloud and similar) were skipped, because reading them would download them.",
                 r.cloud_skipped
+            )
+        },
+        if r.never_scan == 0 {
+            String::new()
+        } else {
+            format!(
+                " {} place(s) on the never-scan list were not checked.",
+                r.never_scan
             )
         },
     );
@@ -1173,6 +1183,7 @@ mod tests {
         let report = QuickScanReport {
             files_examined: 3,
             cloud_skipped: 4,
+            never_scan: 2,
             finished_at: Utc::now().to_rfc3339(),
             findings: vec![QuickScanFinding {
                 path: PathBuf::from("/Users/alex/x/a\u{202E}gnp.exe\u{200B}"),
@@ -1194,6 +1205,7 @@ mod tests {
         assert!(!page.contains("<b>on</b>"), "{page}");
         assert!(page.contains("not known") && page.contains("Dry run:</b> not known"));
         assert!(page.contains("4 cloud-only file(s)"));
+        assert!(page.contains("2 place(s) on the never-scan list were not checked"));
         assert!(
             page.contains("agnp.exe") && !page.contains('\u{202E}') && !page.contains('\u{200B}')
         );
