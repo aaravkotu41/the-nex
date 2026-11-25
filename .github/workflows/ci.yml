@@ -181,11 +181,11 @@ jobs:
           # The app asks the service for scans through this folder: any local user may add a file
           # to it and nothing more, and the service picks the request up and can be told to stop.
           $requests = Join-Path $dir 'requests'
-          $acl = (icacls $requests) -join "`n"
+          $acl = icacls $requests
           $acl
-          if ($acl -notmatch 'Users:\(WD\)') { throw 'local users cannot ask the service for a scan' }
-          if ($acl -match 'Users:[^
-]*\((F|M|AD|DC|D|WDAC|WO)\)') { throw 'local users may do more than add a request' }
+          $users = $acl | Where-Object { $_ -match '\\Users:' }
+          if (-not ($users -match 'Users:\(WD\)')) { throw 'local users cannot ask the service for a scan' }
+          if ($users -match '\((F|M|W|AD|DC|D|WDAC|WO)\)') { throw 'local users may do more than add a request' }
           $progress = Join-Path $dir 'logs\scan_progress.json'
           New-Item -ItemType File (Join-Path $requests 'full-scan') | Out-Null
           $deadline = (Get-Date).AddSeconds(30)
