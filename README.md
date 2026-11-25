@@ -210,14 +210,77 @@ most of them):
   program, and the 0.3.0 model "caught" part of it by flagging clean .NET applications (and
   lost all but 6% of its .NET detections to a few extra imports; this model keeps 76%).
 
-The malware figures come from synthetic profiles, so treat them as a regression benchmark, not
-a real-world detection rate. What still slips through: droppers that pad themselves to look
+The malware figures above come from synthetic profiles, so treat them as a regression benchmark,
+not a real-world detection rate; the real-data numbers are in the next section. What still slips
+through: droppers that pad themselves to look
 like installers (62% caught with all three disguises), unobfuscated .NET malware, and anything
 over 100 MB, which is not scored at all. Mac programs are the weakest spot (no real Mac
 training data yet): interpreters, VMs and browsers import the same "risky" functions as
 stealers, so on macOS the model leans on packing and code structure, and CI checks it against
 the runner's own OS and third-party programs on every push. The fallback used when the model
 file is missing is a fixed formula that still trusts signature blocks.
+
+**Measured on real malware data (EMBER2024).** EMBER2024 (Joyce et al., 2025, Apache-2.0,
+<https://huggingface.co/datasets/joyce8/EMBER2024>) is a research dataset of measurements of
+real Windows programs, malware included; it contains no program files. `scripts/ember_eval.py`
+turns each row into our 14 features and scores it with the shipped model through the engine's
+own code. Results for the 0.4.1 model on the whole test split: 538,877 programs from the last
+12 weeks of the data (weekly files dated 22 September to 14 December 2024), 269,072 of them
+malware. The model has never trained on any real malware, so these are its first figures on
+real malware data.
+
+| Programs | Malware caught, alert (0.65) | Malware caught, kill (0.9) | Clean flagged (0.65) | Clean flagged (0.9) |
+|---|---|---|---|---|
+| All (538,877) | 37.5% | 24.3% | 5.3% | 1.6% |
+| 32-bit (359,034) | 45.2% | 29.3% | 5.3% | 1.8% |
+| 64-bit (119,890) | 16.9% | 9.4% | 6.8% | 1.2% |
+| .NET (59,953) | 32.3% | 24.4% | 2.5% | 1.5% |
+
+- **Clean programs.** In the app, validly signed files never reach the model, and EMBER only
+  says whether a file carries a certificate, not whether it is valid. Of the 115,552 clean
+  programs with no certificate at all (which the model would certainly see), 3.1% are flagged
+  at 0.65 and 1.2% at 0.9. That is nearly seven times the 0.46% measured on our own clean
+  programs: our set is cleaner and less varied than the real world.
+- **Malware with no certificate** (239,227 programs, the ones the model would certainly
+  see): 38.9% caught at 0.65 and 25.3% at 0.9.
+- **By week:** 38% to 43% of malware caught in the first five weeks, 33% to 39% in the last
+  seven: a step down of about five points from late October 2024.
+- **By malware family** (labels with confidence 0.7 or more, 500 or more programs; caught at
+  0.65 / 0.9): aenjaris 99.6% / 98.2%, virlock 96.3% / 75.3%, sality 95.9% / 92.6%, virut
+  91.1% / 81.7%, cosmu 71.6% / 39.4%, neshta 59.9% / 1.4%, expiro 51.7% / 33.0%, berbew (the
+  largest, 37,306 programs) 42.7% / 28.2%, lummastealer 38.0% / 6.4%, emotet 34.3% / 13.6%,
+  upatre 33.7% / 14.1%, floxif 31.4% / 21.4%, njrat 13.5% / 8.6%, swisyn 13.3% / 12.7%,
+  triusor 6.7% / 0.0%. Good on old file infectors, weak on current stealers and loaders.
+- **Evasive malware:** on EMBER's challenge set (4,868 Windows programs that no antivirus
+  product detected when first seen) the model catches 3.6% at 0.65 and 2.1% at 0.9.
+- **At our intended false-alarm rate:** a threshold that flags only 0.5% of EMBER's
+  uncertified clean programs would be 0.956, and the model catches 14.1% of malware there.
+
+Limits of this measurement:
+- Windows only. EMBER has no Mac programs, and its non-Windows rows (PDF, APK, ELF) are left
+  out, as are 1,063 programs the dataset's parser could not read. The test files list every
+  program twice; each is counted once.
+- Seven features are computed exactly as the engine does. Section entropies, import count,
+  the entry-point checks and appended data are rebuilt from what EMBER recorded (it does not
+  store section addresses, and counts a certificate as appended data; both are corrected for).
+  Checked against the engine on 1,050 real clean files: all 13 comparable features agreed on
+  every file. That set is almost all .NET (seven native programs, nothing packed, no
+  writable+executable sections, hardly any imports), so the import, packer, W+X and
+  entry-point features are unverified on the kinds of files that matter most. For 16.8% of
+  rows the entry-point section could only be found from the rebuilt layout.
+- The signature input is 0 for every row, as in training. In the app a file whose certificate
+  fails verification reaches the model with that input set, but the model has no connection
+  to it, so the score is the same.
+- Nothing was retrained for this measurement.
+
+Reproduce (about 4 GB of downloads, checksummed and deleted after conversion; never in CI):
+`python scripts/ember_eval.py fetch`, `score`, `report`. `data/ember2024_sample.csv` is a fixed
+sample of 2,040 rows of derived features (170 per file type, label and odd or even week,
+with the first 16 characters of each file's SHA-256), redistributed under EMBER2024's
+Apache-2.0 licence. `python scripts/ember_eval.py check` scores it with the current model
+(0.4.1: 29.4% of malware caught, 3.7% of clean flagged at 0.65; the sample has equal numbers
+of each file type, so it differs from the table) and fails if a retrained model drops below
+20% or flags more than 8%.
 
 **Not scored: compiler object files.** On macOS a `.o` file (Mach-O type "object") is build
 output waiting to be linked. It cannot run, is never signed, and its one segment is always

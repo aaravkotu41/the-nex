@@ -652,3 +652,25 @@ fn bench_known_bad() {
         );
     }
 }
+
+/// Scores rows of features with the shipped model, for scripts/ember_eval.py:
+/// THENEX_FEATURES_IN holds rows of 14 little-endian f32, THENEX_SCORES_OUT receives one f32 each.
+#[test]
+#[ignore]
+fn score_feature_rows() {
+    let input = std::env::var_os("THENEX_FEATURES_IN").expect("set THENEX_FEATURES_IN");
+    let output = std::env::var_os("THENEX_SCORES_OUT").expect("set THENEX_SCORES_OUT");
+    let scanner = BinaryAiScanner::load(&model_path().expect("thenex_model.onnx"));
+    assert!(scanner.has_model(), "the ONNX model must load: no fallback");
+    let bytes = fs::read(input).unwrap();
+    assert_eq!(bytes.len() % (4 * bin_ai::FEATURE_COUNT), 0, "whole rows");
+    let mut scores = Vec::with_capacity(bytes.len() / bin_ai::FEATURE_COUNT);
+    for row in bytes.chunks_exact(4 * bin_ai::FEATURE_COUNT) {
+        let mut features = [0f32; bin_ai::FEATURE_COUNT];
+        for (value, raw) in features.iter_mut().zip(row.chunks_exact(4)) {
+            *value = f32::from_le_bytes(raw.try_into().unwrap());
+        }
+        scores.extend_from_slice(&scanner.score_features(&features).to_le_bytes());
+    }
+    fs::write(output, scores).unwrap();
+}

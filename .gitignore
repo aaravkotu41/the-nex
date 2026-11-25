@@ -3,6 +3,8 @@
 /thenex_live_sandbox/
 # Known-malware list: built by scripts/fetch_hash_list.py, never committed
 /known_bad.bin
+# EMBER2024 rows converted by scripts/ember_eval.py (large, local only)
+/ember_cache/
 __pycache__/
 *.pyc
 # On-device vision runtime, fetched and verified by scripts/fetch_vision_models.py
