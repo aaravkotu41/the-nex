@@ -670,7 +670,7 @@ a.btn { text-decoration: none; }
 /* Setup checklist (setup.js) */
 .setup-panel { grid-column: 1 / -1; }
 .setup-rows { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; }
-.setup-row { display: grid; grid-template-columns: 120px minmax(0, 1fr) auto; align-items: start; gap: 8px 16px; padding: 14px 4px; border-bottom: 1px solid var(--line); }
+.setup-row { display: grid; grid-template-columns: 140px minmax(0, 1fr) auto; align-items: start; gap: 8px 16px; padding: 14px 4px; border-bottom: 1px solid var(--line); }
 .setup-row:last-child { border-bottom: 0; }
 .setup-row .pill { justify-self: start; }
 .setup-row h3 { font-size: 15.5px; font-weight: 500; }
