@@ -73,6 +73,17 @@ pub(crate) fn file_identity(path: &std::path::Path) -> Option<(u64, u64)> {
     }
 }
 
+/// Windows answers `\\?\C:\x`; people and the event log know it as `C:\x`. A name that only the
+/// long form reaches (a trailing dot or space) keeps it.
+pub(crate) fn plain_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    match path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(plain) if plain.as_bytes().get(1) == Some(&b':') && !odd_spelling(plain, true) => {
+            PathBuf::from(plain)
+        }
+        _ => path,
+    }
+}
+
 /// True when a path contains `..`; containment checks reject such paths instead of resolving them.
 pub(crate) fn has_parent_dir(path: &std::path::Path) -> bool {
     path.components()

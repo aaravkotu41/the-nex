@@ -652,7 +652,7 @@ async fn restore_quarantine(id: String) -> Result<String, String> {
         let cfg = config();
         match quarantine::restore_file(&id, &cfg) {
             Ok(meta) => {
-                audit(&cfg, "QUARANTINE_RESTORE", "RESTORED", &meta);
+                quarantine::record_restore(&cfg, &meta, " via desktop app");
                 Ok(format!("Restored to {}", meta.original_path.display()))
             }
             Err(e) if is_permission_error(&e) => {
@@ -746,7 +746,7 @@ async fn allow_quarantined(id: String) -> Result<String, String> {
         };
         match direct {
             Ok(meta) => {
-                audit(&cfg, "QUARANTINE_RESTORE", "RESTORED", &meta);
+                quarantine::record_restore(&cfg, &meta, " via desktop app");
                 Ok(format!(
                     "Restored to {}; this exact file will not be flagged again",
                     meta.original_path.display()

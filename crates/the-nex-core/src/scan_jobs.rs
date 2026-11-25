@@ -371,7 +371,8 @@ pub fn request_cancel(cfg: &AppConfig) -> Result<(), String> {
     drop_request(cfg, CANCEL_REQUEST)
 }
 
-/// Asks the service for a scan and waits for its report.
+/// Asks the service for a scan and waits for its report: `timeout` without a sign of life, not in
+/// all. A full Downloads folder takes many minutes.
 pub fn request_and_wait(
     cfg: &AppConfig,
     kind: ScanKind,
@@ -379,9 +380,12 @@ pub fn request_and_wait(
 ) -> Result<QuickScanReport, String> {
     let before = engine::read_scan_report(cfg, kind);
     request(cfg, kind)?;
-    let deadline = Instant::now() + timeout;
+    let mut deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         thread::sleep(POLL_STEP);
+        if read_progress(cfg).is_some_and(|p| p.is_live()) {
+            deadline = Instant::now() + timeout;
+        }
         match engine::read_scan_report(cfg, kind) {
             Some(report) if Some(&report) != before.as_ref() => return Ok(report),
             _ => {}
@@ -431,6 +435,48 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         }
         panic!("scan job did not finish");
+    }
+
+    #[test]
+    fn a_long_scan_is_waited_for_while_it_moves() {
+        let (root, cfg) = sandbox("long");
+        let (client, step) = (cfg.clone(), Duration::from_millis(300));
+        let waiting = thread::spawn(move || request_and_wait(&client, ScanKind::Quick, step));
+        let asked = request_dir(&cfg).join(request_name(ScanKind::Quick));
+        while !asked.exists() {
+            thread::sleep(Duration::from_millis(5));
+        }
+        for _ in 0..5 {
+            write_progress(
+                &cfg,
+                &ScanProgress {
+                    kind: ScanKind::Quick,
+                    running: true,
+                    started_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    files_examined: 1,
+                    files_scanned: 1,
+                    findings: 0,
+                    current: String::new(),
+                    scheduled: false,
+                },
+            );
+            thread::sleep(step);
+        }
+        let report = QuickScanReport {
+            finished_at: Utc::now().to_rfc3339(),
+            ..QuickScanReport::default()
+        };
+        let path = cfg.log_dir.join(ScanKind::Quick.report_file());
+        fs::write(path, serde_json::to_vec(&report).unwrap()).unwrap();
+        assert!(
+            waiting.join().unwrap().is_ok(),
+            "five times the wait for an answer"
+        );
+
+        fs::remove_file(cfg.log_dir.join(SCAN_PROGRESS_FILE)).unwrap();
+        assert!(request_and_wait(&cfg, ScanKind::Quick, step).is_err());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -1362,6 +1362,76 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// From a real Windows log: a file restored from quarantine went straight back into it, three
+    /// times, because live protection saw it arrive.
+    #[test]
+    fn a_restored_file_stays_where_it_was_put() {
+        let root = temp_root("restored");
+        let watch = root.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        let cfg = AppConfig::for_base_dir(&root.join("base"));
+        cfg.ensure_dirs().unwrap();
+        let scanner = BinaryAiScanner::with_fixed_score(0.99);
+        let telemetry = Telemetry::default();
+        let (bomb, program) = (watch.join("decoy.zip"), watch.join("decoy.exe"));
+        fs::write(&bomb, decoy_bomb()).unwrap();
+        fs::write(&program, decoy_program()).unwrap();
+        for (kind, path) in [("ZIP_BOMB", &bomb), ("MALWARE_AI", &program)] {
+            scan_path(&cfg, &scanner, path, &telemetry);
+            let id = events_of(&cfg, kind)[0]
+                .quarantine_id()
+                .unwrap()
+                .to_string();
+            let meta = quarantine::restore_file(&id, &cfg).unwrap();
+            quarantine::record_restore(&cfg, &meta, "");
+            scan_path(&cfg, &scanner, path, &telemetry);
+            let seen = events_of(&cfg, kind);
+            assert!(path.exists(), "{kind}: {seen:?}");
+            assert!(
+                seen[1].action_taken.starts_with("ALERT_ONLY: you restored"),
+                "{seen:?}"
+            );
+            assert!(seen[1].quiet, "its owner has already decided");
+
+            // Another file under that name, and the same file elsewhere, are judged afresh.
+            let copy = path.with_file_name(format!(
+                "copy-{kind}.{}",
+                path.extension().unwrap().to_string_lossy()
+            ));
+            fs::copy(path, &copy).unwrap();
+            scan_path(&cfg, &scanner, &copy, &telemetry);
+            assert!(!copy.exists(), "{kind}");
+            let mut bytes = fs::read(path).unwrap();
+            bytes.push(0);
+            fs::write(path, bytes).unwrap();
+            scan_path(&cfg, &scanner, path, &telemetry);
+            assert!(!path.exists(), "{kind}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A match in the known-malware list is certain: restoring it changes nothing.
+    #[test]
+    fn a_restored_listed_file_is_quarantined_again() {
+        let root = temp_root("restored-known");
+        let watch = root.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        let listed = watch.join("payroll.docm");
+        fs::write(&listed, b"harmless decoy").unwrap();
+        let cfg = cfg_with_list(&root, std::slice::from_ref(&listed));
+        let scanner = BinaryAiScanner::heuristic_only();
+        scan_path(&cfg, &scanner, &listed, &Telemetry::default());
+        let id = events_of(&cfg, known_bad::THREAT_TYPE)[0]
+            .quarantine_id()
+            .unwrap()
+            .to_string();
+        let meta = quarantine::restore_file(&id, &cfg).unwrap();
+        quarantine::record_restore(&cfg, &meta, "");
+        scan_path(&cfg, &scanner, &listed, &Telemetry::default());
+        assert!(!listed.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A zip with one entry of 20 MiB of zeros: a harmless decoy that trips the ratio rule.
     fn decoy_bomb() -> Vec<u8> {
         use std::io::Write;

