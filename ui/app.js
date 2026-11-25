@@ -50,9 +50,13 @@ const GREEN_TYPES = new Set(["QUARANTINE_RESTORE"]);
 const ALLOWABLE_TYPES = new Set(["MALWARE_AI", "MALWARE_AI_PROCESS", "ZIP_BOMB"]);
 const ALLOW_NOTE = "Always allow: this exact file (matched by its SHA-256) will never be flagged again until its contents change. It needs your administrator approval.";
 // A file name for a confirm step: control, bidi and zero-width characters removed, clipped.
-const HIDDEN_CHARS = /[\p{Cc}\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\u061C\u180E\uFEFF]/gu;
+// Same list as the engine's check_file::is_invisible_format.
+const HIDDEN_CHARS = /[\p{Cc}\u00AD\u061C\u180E\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB\u{E0000}-\u{E007F}]/gu;
+function cleanName(name) {
+  return String(name || "").replace(HIDDEN_CHARS, "").trim() || "unnamed";
+}
 function shownName(name) {
-  const clean = String(name || "").replace(HIDDEN_CHARS, "").trim() || "unnamed";
+  const clean = cleanName(name);
   return clean.length > 60 ? `${clean.slice(0, 60)}...` : clean;
 }
 /** Why "Always allow" cannot be used right now (an older background service), else "". */
@@ -937,7 +941,7 @@ async function loadAllowed() {
     });
     return el("li", { className: "allowed-item" }, [
       el("span", {}, [
-        el("span", { className: "cell-main", text: entry.name, title: entry.name }),
+        el("span", { className: "cell-main", text: cleanName(entry.name), title: cleanName(entry.name) }),
         el("code", { className: "cell-sub", text: entry.sha256, title: `${entry.threat_type}, added ${formatDateTime(entry.added_at)}` }),
       ]),
       remove,

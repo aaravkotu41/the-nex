@@ -39,6 +39,11 @@ impl Drop for ClearBusy {
     }
 }
 
+/// The one running check, or None when another is still going.
+fn claim() -> Option<ClearBusy> {
+    (!BUSY.swap(true, Ordering::SeqCst)).then_some(ClearBusy)
+}
+
 #[derive(Serialize, Clone)]
 struct Outcome {
     results: Vec<FileCheck>,
@@ -70,6 +75,19 @@ pub enum Run {
     },
 }
 
+/// The engine as a child that reads the same data folder as the app: the app's own, never one
+/// named by a THENEX_DATA_DIR it happened to inherit (a planted model or allowed list).
+fn engine_command(engine: &Path, args: &[&std::ffi::OsStr], data_dir: &Path) -> Command {
+    let mut command = Command::new(engine);
+    command
+        .args(args)
+        .env(the_nex_core::config::DATA_DIR_ENV, data_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    command
+}
+
 /// Runs `engine args` as a child process with the user's own rights, no shell, no input, a time
 /// limit and bounded output (shared with the startup check).
 pub fn run_engine(
@@ -78,12 +96,7 @@ pub fn run_engine(
     limit: Duration,
     max_output: u64,
 ) -> Run {
-    let mut command = Command::new(engine);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    let mut command = engine_command(engine, args, &crate::config().base_dir);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -201,15 +214,15 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
     let paths = paths.clone();
     // Not on the event loop: a check can take seconds.
     std::thread::spawn(move || {
-        let outcome = if BUSY.swap(true, Ordering::SeqCst) {
-            Outcome {
+        let outcome = match claim() {
+            None => Outcome {
                 results: Vec::new(),
                 error: Some("Still checking the last files. Try again in a moment.".into()),
+            },
+            Some(_clear) => {
+                let engine = platform::sibling_executable(platform::DAEMON_EXE_STEM);
+                check_all(&engine, &paths, TIME_LIMIT, TOTAL_LIMIT)
             }
-        } else {
-            let _clear = ClearBusy; // also on a panic
-            let engine = platform::sibling_executable(platform::DAEMON_EXE_STEM);
-            check_all(&engine, &paths, TIME_LIMIT, TOTAL_LIMIT)
         };
         let _ = window.emit(RESULT_EVENT, outcome);
     });
@@ -352,7 +365,20 @@ mod tests {
     }
 
     #[test]
+    fn the_engine_child_is_pointed_at_the_apps_own_data_folder() {
+        let engine = fake_engine("env", "echo \"$THENEX_DATA_DIR\"");
+        let mut command = engine_command(&engine, &[], Path::new("/the/apps/own"));
+        let out = command.output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "/the/apps/own");
+    }
+
+    #[test]
     fn busy_is_cleared_even_when_the_check_panics() {
+        // One test, because BUSY is shared: a second drop is refused while the first runs.
+        let first = claim();
+        assert!(first.is_some() && claim().is_none());
+        drop(first);
+        assert!(claim().is_some() && !BUSY.load(Ordering::SeqCst));
         BUSY.store(true, Ordering::SeqCst);
         let result = std::panic::catch_unwind(|| {
             let _clear = ClearBusy;

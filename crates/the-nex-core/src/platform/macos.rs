@@ -707,8 +707,26 @@ fn elevate_command(prompt: &str, program: &Path, args: &[&str]) -> Command {
         .arg("-")
         .arg(program)
         .args(args)
+        .env_clear()
+        .envs(elevate_env(env::vars_os()))
         .env(PROMPT_ENV, prompt);
     command
+}
+
+/// What osascript (and the root shell behind its prompt) may inherit: not SHELLOPTS, PS4, ENV,
+/// BASH_ENV, DYLD_* or a made-up PATH. Kept: HOME (osascript's own caches), USER and LOGNAME
+/// (the login session's identity) and __CF_USER_TEXT_ENCODING (how text is read), as the
+/// session gave them; PATH is fixed. The dialog itself needs no variable (it goes through the
+/// login session's Mach services).
+fn elevate_env(
+    parent: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    const KEEP: [&str; 4] = ["HOME", "USER", "LOGNAME", "__CF_USER_TEXT_ENCODING"];
+    let mut kept: Vec<_> = parent
+        .filter(|(name, _)| KEEP.iter().any(|k| name == k))
+        .collect();
+    kept.push(("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()));
+    kept
 }
 
 /// Like `run_elevated`, but `prompt` (one sentence naming the action) is shown in the admin dialog.
@@ -845,10 +863,37 @@ mod tests {
             crate::process_guard::match_lotl_macos("osascript", &cmdline),
             None
         );
-        let env: Vec<_> = command.get_envs().collect();
-        assert_eq!(env.len(), 1);
-        assert_eq!(env[0].1.unwrap().to_string_lossy(), prompt);
+        let prompt_var = command.get_envs().find(|(k, _)| *k == PROMPT_ENV);
+        assert_eq!(prompt_var.unwrap().1.unwrap().to_string_lossy(), prompt);
         assert!(ELEVATE_SCRIPT.contains(PROMPT_ENV));
+    }
+
+    #[test]
+    fn the_elevated_shell_gets_a_small_fixed_environment() {
+        let hostile = [
+            ("SHELLOPTS", "xtrace"),
+            ("PS4", "$(touch /tmp/pwned)"),
+            ("BASH_ENV", "/tmp/evil"),
+            ("ENV", "/tmp/evil"),
+            ("DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib"),
+            ("PATH", "/tmp/evil"),
+            ("HOME", "/Users/alex"),
+            ("USER", "alex"),
+        ];
+        let kept = elevate_env(hostile.iter().map(|(k, v)| ((*k).into(), (*v).into())));
+        let kept: Vec<(String, String)> = kept
+            .into_iter()
+            .map(|(k, v)| (k.to_string_lossy().into(), v.to_string_lossy().into()))
+            .collect();
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            kept,
+            [
+                pair("HOME", "/Users/alex"),
+                pair("USER", "alex"),
+                pair("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            ]
+        );
     }
 
     #[test]

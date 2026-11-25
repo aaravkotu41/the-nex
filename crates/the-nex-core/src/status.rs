@@ -140,6 +140,10 @@ pub struct EngineStatus {
     /// this, so the service says it. None = unknown, not applicable, or an older service.
     #[serde(default)]
     pub full_disk_access: Option<bool>,
+    /// This engine understands `--allow-event` and `--allow-quarantined` (the app's "Always
+    /// allow"). A capability, not a version guess: an older service lacks the field, so false.
+    #[serde(default)]
+    pub can_allow: bool,
 }
 
 impl EngineStatus {
@@ -184,6 +188,7 @@ pub fn build_status(
         canaries: telemetry.canaries(),
         quarantine: quarantine::list_quarantined(cfg).unwrap_or_default(),
         full_disk_access: telemetry.full_disk_access(),
+        can_allow: true,
     }
 }
 
@@ -299,8 +304,10 @@ mod tests {
         let mut json = serde_json::to_value(&status).unwrap();
         // A status written by an older service has no such field.
         json.as_object_mut().unwrap().remove("full_disk_access");
+        json.as_object_mut().unwrap().remove("can_allow");
         let old: EngineStatus = serde_json::from_value(json).unwrap();
         assert_eq!(old.full_disk_access, None);
+        assert!(!old.can_allow && status.can_allow);
         for value in [Some(true), Some(false), None] {
             let mut next = status.clone();
             next.full_disk_access = value;

@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 pub const MAX_ZIP_RATIO: f64 = 100.0;
 pub const MAX_UNCOMPRESSED_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -450,23 +450,58 @@ impl RuntimeToggles {
     }
 }
 
+/// A staging file older than this was left by a crash (a write takes milliseconds).
+const STALE_STAGING: Duration = Duration::from_secs(60);
+
+fn staging_path(path: &Path, n: u64) -> PathBuf {
+    path.with_extension(format!("json.{}-{n}.tmp", std::process::id()))
+}
+
+/// Removes the staging files of earlier writes of `path` that a crash left behind.
+fn sweep_staging(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.", name.to_string_lossy());
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > STALE_STAGING));
+        if file.starts_with(&prefix) && file.ends_with(".tmp") && old {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+static STAGING: AtomicU64 = AtomicU64::new(0);
+
 /// Writes `body` to a staging file and renames it over `path`, so a reader never sees half of it.
 pub fn write_atomic(path: &Path, body: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // A name of its own, created exclusively: a leftover or planted file is never written through.
-    static STAGING: AtomicU64 = AtomicU64::new(0);
-    let staging = path.with_extension(format!(
-        "json.{}-{}.tmp",
-        std::process::id(),
-        STAGING.fetch_add(1, Ordering::Relaxed)
-    ));
+    sweep_staging(path);
+    // A name of its own, created exclusively: a leftover or planted file is never written
+    // through (a taken name is skipped).
+    let mut attempts = 0;
+    let (staging, mut file) = loop {
+        let staging = staging_path(path, STAGING.fetch_add(1, Ordering::Relaxed));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&staging) {
+            Ok(file) => break (staging, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempts < 16 => attempts += 1,
+            Err(e) => return Err(e),
+        }
+    };
     let written = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staging)?;
         io::Write::write_all(&mut file, body)?;
         // Whatever the umask: the allowed-files list is refused when others can write it.
         #[cfg(unix)]
@@ -474,6 +509,7 @@ pub fn write_atomic(path: &Path, body: &[u8]) -> io::Result<()> {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(fs::Permissions::from_mode(0o644))?;
         }
+        drop(file);
         fs::rename(&staging, path)
     })();
     if written.is_err() {
@@ -660,7 +696,17 @@ impl AppConfig {
     }
 
     pub fn from_cli(args: &CliArgs) -> Self {
-        let mut cfg = Self::system();
+        Self::from_cli_at(args, &data_dir())
+    }
+
+    /// For the notifier and tray, which run in the user's session: like `from_cli`, but
+    /// THENEX_DATA_DIR is ignored once the background service is installed (see `app_data_dir`).
+    pub fn from_cli_in_session(args: &CliArgs) -> Self {
+        Self::from_cli_at(args, &app_data_dir())
+    }
+
+    fn from_cli_at(args: &CliArgs, base_dir: &Path) -> Self {
+        let mut cfg = Self::for_base_dir(base_dir);
         cfg.dry_run = args.dry_run;
         cfg.watch_dir = args.watch_dir.as_deref().map(absolutize);
         cfg.interactive = args.mode == Mode::Console;
@@ -873,6 +919,16 @@ pub fn data_dir_for(
         .unwrap_or_else(default_base_dir)
 }
 
+/// The data folder for the app and its helpers in the user's session (window, notifier, tray):
+/// the environment override is ignored once the background service is installed.
+pub fn app_data_dir() -> PathBuf {
+    data_dir_for(
+        std::env::var_os(DATA_DIR_ENV),
+        running_privileged(),
+        crate::platform::service_installed(),
+    )
+}
+
 /// The engine's data folder: the environment override applies to unprivileged runs only.
 pub fn data_dir() -> PathBuf {
     data_dir_for(std::env::var_os(DATA_DIR_ENV), running_privileged(), false)
@@ -908,6 +964,41 @@ fn user_fallback_base_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn staging_files_are_never_written_through_and_crash_leftovers_are_swept() {
+        let dir = std::env::temp_dir().join(format!("thenex-atomic-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("allowed.json");
+        let victim = dir.join("victim");
+        fs::write(&victim, b"precious").unwrap();
+        // Planted at the names the next writes would use (other tests may take a few).
+        let next = STAGING.load(Ordering::Relaxed);
+        for n in next..next + 6 {
+            std::os::unix::fs::symlink(&victim, staging_path(&target, n)).unwrap();
+        }
+        write_atomic(&target, b"new").unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+
+        // Leftovers of a crashed write: an old one goes, a fresh one (maybe a live write) stays.
+        let old = dir.join("allowed.json.4242-7.tmp");
+        let fresh = dir.join("allowed.json.4242-8.tmp");
+        let other = dir.join("other.json.4242-7.tmp");
+        for f in [&old, &fresh, &other] {
+            fs::write(f, b"x").unwrap();
+        }
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - STALE_STAGING - Duration::from_secs(5))
+            .unwrap();
+        write_atomic(&target, b"newer").unwrap();
+        assert!(!old.exists() && fresh.exists() && other.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn parse(args: &[&str]) -> Result<super::CliArgs, String> {
         super::parse_args(args.iter().map(std::ffi::OsString::from))

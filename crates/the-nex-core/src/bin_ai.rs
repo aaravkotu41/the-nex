@@ -9,10 +9,12 @@
 use crate::ai_policy;
 use crate::allowlist;
 use crate::config::{AppConfig, MAX_AI_SCAN_BYTES};
+use crate::known_bad;
 use crate::logger::{self, lock_or_recover};
 use crate::platform;
 use crate::quarantine::{self, Severity, ThreatEvent};
 use serde::Serialize;
+use sha2::Digest;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Read;
@@ -389,12 +391,17 @@ impl BinaryAiScanner {
     /// Scores a file (cached by path, mtime and size); None when it is not a parseable
     /// executable, empty, or too large.
     pub fn scan_file(&self, path: &Path) -> Option<f32> {
-        self.scan_with_profile(path).map(|(score, _)| score)
+        self.scan_with_profile(path).map(|(score, ..)| score)
     }
 
     /// Like `scan_file`, and returns the parsed profile when the file was freshly read, so a
-    /// detection can be explained without reading and parsing the file a second time.
-    pub fn scan_with_profile(&self, path: &Path) -> Option<(f32, Option<BinaryProfile>)> {
+    /// detection can be explained without reading and parsing the file a second time, and the
+    /// SHA-256 of those very bytes (when small enough to be listed), so "Always allow" never
+    /// matches a different file than the one scored.
+    pub fn scan_with_profile(
+        &self,
+        path: &Path,
+    ) -> Option<(f32, Option<BinaryProfile>, Option<known_bad::Digest32>)> {
         let meta = fs::symlink_metadata(path).ok()?;
         if !meta.file_type().is_file() {
             return None;
@@ -403,13 +410,15 @@ impl BinaryAiScanner {
         if let Some(stamp) = stamp {
             if let Some(&(cached, score)) = lock_or_recover(&self.cache).get(path) {
                 if cached == stamp {
-                    return Some((score, None));
+                    return Some((score, None, None));
                 }
             }
         }
         let bytes = self.read_binary(path)?;
         let profile = extract_profile(&bytes)?;
         let score = self.score_features(&profile.features());
+        let digest = (bytes.len() as u64 <= known_bad::MAX_HASH_BYTES)
+            .then(|| sha2::Sha256::digest(&bytes).into());
         if let Some(stamp) = stamp {
             let mut cache = lock_or_recover(&self.cache);
             if cache.len() >= MAX_CACHE_ENTRIES {
@@ -417,7 +426,7 @@ impl BinaryAiScanner {
             }
             cache.insert(path.to_path_buf(), (stamp, score));
         }
-        Some((score, Some(profile)))
+        Some((score, Some(profile), digest))
     }
 
     /// Full, uncached assessment: score plus the facts behind it (detections, `--scan-file`).
@@ -805,7 +814,7 @@ pub fn scan_and_respond(
         return None;
     }
     let judged = allowlist::stamp_of(path);
-    let (score, profile) = scanner.scan_with_profile(path)?;
+    let (score, profile, scored) = scanner.scan_with_profile(path)?;
     let threshold = ai_policy::effective_threshold(cfg.ai_threshold);
     if score.is_nan() || score < threshold {
         return Some(AiOutcome {
@@ -813,7 +822,11 @@ pub fn scan_and_respond(
             detection: None,
         });
     }
-    let (digest, allowed) = allowlist::check(cfg, path, judged);
+    // The hash of the bytes that were scored when we hold them; otherwise the stamp check.
+    let (digest, allowed) = match scored {
+        Some(digest) => allowlist::check_scored(cfg, path, digest),
+        None => allowlist::check(cfg, path, judged),
+    };
     if allowed {
         return Some(AiOutcome {
             score,
@@ -1151,6 +1164,22 @@ mod tests {
             macho_header(X86_64, EXECUTABLE),
         ]);
         assert!(extract_profile(&mixed).is_some());
+    }
+
+    #[test]
+    fn a_fresh_scan_hands_back_the_hash_of_the_bytes_it_scored() {
+        let dir = std::env::temp_dir().join(format!("thenex-ai-hash-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tool");
+        let bytes = macho_header(0x0100_000C, 2);
+        fs::write(&file, &bytes).unwrap();
+        let scanner = BinaryAiScanner::build(None);
+        let (_, profile, digest) = scanner.scan_with_profile(&file).unwrap();
+        assert!(profile.is_some());
+        assert_eq!(digest, Some(sha2::Sha256::digest(&bytes).into()));
+        // A cached answer has no bytes to hash.
+        assert_eq!(scanner.scan_with_profile(&file).unwrap().2, None);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -109,6 +109,42 @@ pub fn send_desktop_notification_async(title: &str, body: &str) {
     }
 }
 
+/// Moves what a data folder that was not ours (made by a standard user before the first
+/// install) may hold out of the way: the settings and always-allowed list, the schedule's state
+/// and seen findings, the event logs and the quarantine folder with its metadata. Each goes
+/// to `<name>.planted-<n>` beside it, never deleted, so nothing of the user's is lost for good.
+/// The caller has already cut inheritance and set the grants, so nobody can put it back.
+#[cfg(any(windows, test))]
+pub(crate) fn set_aside_planted(cfg: &crate::config::AppConfig) -> Vec<String> {
+    let mut notes = Vec::new();
+    for path in [
+        &cfg.allowed_file,
+        &cfg.settings_file,
+        &cfg.base_dir.join(crate::schedule::STATE_FILE),
+        &cfg.base_dir.join(crate::schedule::SEEN_FILE),
+        &cfg.log_dir,
+        &cfg.quarantine_dir,
+    ] {
+        if std::fs::symlink_metadata(path).is_err() {
+            continue;
+        }
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let aside = (0u32..)
+            .map(|n| path.with_file_name(format!("{name}.planted-{n}")))
+            .find(|candidate| std::fs::symlink_metadata(candidate).is_err());
+        notes.push(match aside.map(|a| std::fs::rename(path, &a).map(|()| a)) {
+            Some(Ok(a)) => format!(
+                "moved {} to {}: it was in a data folder that existed before the first install",
+                path.display(),
+                a.display()
+            ),
+            Some(Err(e)) => format!("could not move {} aside: {e}", path.display()),
+            None => format!("could not move {} aside", path.display()),
+        });
+    }
+    notes
+}
+
 /// Path of a sibling binary installed next to the running executable (the-nex / the-nex-gui).
 pub fn sibling_executable(stem: &str) -> PathBuf {
     let file_name = format!("{stem}{}", std::env::consts::EXE_SUFFIX);
@@ -164,6 +200,53 @@ mod tests {
         for path in ["/usr//bin/a", "/usr/./a", "/usr/../a", "//usr/a"] {
             assert!(odd_spelling(path, false), "{path}");
         }
+    }
+
+    #[test]
+    fn a_folder_that_was_not_ours_is_moved_aside_never_deleted() {
+        use crate::config::AppConfig;
+        let dir = std::env::temp_dir().join(format!("thenex-planted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = AppConfig::for_base_dir(&dir);
+        cfg.ensure_dirs().unwrap();
+        let kept = dir.join("thenex_model.onnx");
+        std::fs::write(&kept, b"model").unwrap();
+        let planted = [
+            &cfg.allowed_file,
+            &cfg.settings_file,
+            &dir.join("scheduled_scan.json"),
+            &dir.join("scheduled_seen.json"),
+            &cfg.events_log,
+            &crate::quarantine::rotated_events_path(&cfg.events_log),
+            &cfg.quarantine_dir.join("id.meta.json"),
+        ];
+        for file in planted {
+            std::fs::write(file, file.display().to_string()).unwrap();
+        }
+        // A leftover of an earlier move is not overwritten.
+        std::fs::write(dir.join("allowed.json.planted-0"), b"older").unwrap();
+        let notes = set_aside_planted(&cfg);
+        assert_eq!(notes.len(), 6, "{notes:?}");
+        assert!(kept.exists());
+        for file in [&cfg.allowed_file, &cfg.settings_file, &cfg.events_log] {
+            assert!(!file.exists(), "{}", file.display());
+        }
+        assert_eq!(
+            std::fs::read(dir.join("allowed.json.planted-0")).unwrap(),
+            b"older"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("allowed.json.planted-1")).unwrap(),
+            planted[0].display().to_string().as_bytes()
+        );
+        assert!(dir
+            .join("Quarantine.planted-0")
+            .join("id.meta.json")
+            .exists());
+        assert!(dir.join("logs.planted-0").join("events.jsonl.1").exists());
+        // Nothing left to move the second time.
+        assert!(set_aside_planted(&cfg).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

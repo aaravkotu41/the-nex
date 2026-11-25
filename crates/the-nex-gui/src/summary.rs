@@ -189,9 +189,7 @@ impl Identity {
 
 /// Control, bidirectional and zero-width characters: they can hide or reorder text in a report.
 fn invisible(c: char) -> bool {
-    c.is_control()
-        || matches!(c, '\u{AD}' | '\u{61C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
-            | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+    c.is_control() || the_nex_core::check_file::is_invisible_format(c)
 }
 
 fn strip_invisible(text: &str) -> String {

@@ -8,6 +8,7 @@
 //! hash on the known-malware list is never allowed, whatever this list says, and scripts
 //! (LotL) and canaries have no file hash and so cannot be listed at all.
 
+use crate::check_file;
 use crate::config::{self, AppConfig};
 use crate::known_bad::{self, Digest32, Stamp};
 use crate::logger::{self, lock_or_recover};
@@ -18,6 +19,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -66,6 +68,7 @@ pub fn clean_name(name: &str) -> String {
     let cleaned: String = name
         .trim()
         .chars()
+        .filter(|c| !check_file::is_invisible_format(*c))
         .map(|c| if c.is_control() { ' ' } else { c })
         .take(MAX_NAME_CHARS)
         .collect();
@@ -92,11 +95,7 @@ pub fn check_name(name: &str) -> Result<(), String> {
 /// A file name for an administrator prompt or a confirm step: control, bidirectional and
 /// zero-width characters (which can reorder or hide text) are removed and the length is bounded.
 pub fn prompt_name(name: &str) -> String {
-    let hidden = |c: char| {
-        c.is_control()
-            || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}' | '\u{061C}' | '\u{180E}' | '\u{FEFF}')
-    };
+    let hidden = |c: char| c.is_control() || check_file::is_invisible_format(c);
     let cleaned: String = name.chars().filter(|c| !hidden(*c)).collect();
     let cleaned = cleaned.trim();
     match cleaned.char_indices().nth(PROMPT_NAME_CHARS) {
@@ -387,42 +386,118 @@ pub fn check(cfg: &AppConfig, path: &Path, judged: Option<Stamp>) -> (Option<Dig
     check_with(cfg, path, judged, known_bad::hash_file)
 }
 
+/// Like `check`, for a caller that scored a buffer it still holds: `scored` is the SHA-256 of
+/// exactly those bytes, so nothing about the file on disk (a held mapping can change it
+/// without a new stamp) can make another file match.
+pub fn check_scored(cfg: &AppConfig, path: &Path, scored: Digest32) -> (Option<Digest32>, bool) {
+    let allowed = cfg.is_allowed(&scored);
+    if allowed {
+        log_allowed(path);
+    }
+    (Some(scored), allowed)
+}
+
+fn log_allowed(path: &Path) {
+    logger::info(format!(
+        "{} matches an always-allowed SHA-256; not flagged",
+        path.display()
+    ));
+}
+
+/// Only the change time moved (an extended attribute or a Finder tag was set): same file,
+/// same inode, size and modified time.
+fn only_ctime_moved(before: Stamp, after: Stamp) -> bool {
+    match (before, after) {
+        (Stamp::Strong(a), Stamp::Strong(b)) => {
+            a.4 != b.4 && (a.0, a.1, a.2, a.3) == (b.0, b.1, b.2, b.3)
+        }
+        _ => false,
+    }
+}
+
 fn check_with(
     cfg: &AppConfig,
     path: &Path,
     judged: Option<Stamp>,
-    hash: impl FnOnce(&Path, u64) -> Option<Digest32>,
+    mut hash: impl FnMut(&Path, u64) -> Option<Digest32>,
 ) -> (Option<Digest32>, bool) {
     let digest = judged.and_then(|before| {
         let digest = hash(path, known_bad::MAX_HASH_BYTES)?;
-        (stamp_of(path) == Some(before)).then_some(digest)
+        let after = stamp_of(path)?;
+        if after == before {
+            return Some(digest);
+        }
+        // shortcut: a change-time-only difference (xattr, Finder tag) gets one more hash that
+        // must agree and see a steady stamp; a swap that also forged the modified time looks the
+        // same here. Upgrade by hashing the scored buffer (as `check_scored` does) everywhere.
+        if only_ctime_moved(before, after) {
+            let again = hash(path, known_bad::MAX_HASH_BYTES)?;
+            return (again == digest && stamp_of(path) == Some(after)).then_some(digest);
+        }
+        None
     });
     let allowed = digest.is_some_and(|d| cfg.is_allowed(&d));
     if allowed {
-        logger::info(format!(
-            "{} matches an always-allowed SHA-256; not flagged",
-            path.display()
-        ));
+        log_allowed(path);
     }
     (digest, allowed)
 }
 
-/// Holds the list's lock file; dropping it lets the next change go ahead.
-struct UpdateLock(PathBuf);
+/// Holds the list's lock file; dropping it lets the next change go ahead. The file holds this
+/// holder's own token, so a holder whose stale lock was taken over never removes the new one.
+struct UpdateLock {
+    path: PathBuf,
+    token: String,
+}
 
 impl Drop for UpdateLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        if fs::read_to_string(&self.path).is_ok_and(|t| t == self.token) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
+}
+
+/// Old enough to be a crash's leftover. A modified time in the future (a made-up or skewed one)
+/// counts as stale too, so such a lock cannot block changes forever.
+fn lock_is_stale(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| t.elapsed().map_or(true, |age| age > STALE_LOCK))
+}
+
+/// Clears a stale lock (a file, or a directory someone put there). It is moved aside first and
+/// looked at again: if another change took over in the meantime and what was moved is a fresh
+/// lock, it is put back instead of being deleted.
+fn clear_stale_lock(path: &Path) {
+    static ASIDE: AtomicU64 = AtomicU64::new(0);
+    let aside = path.with_extension(format!(
+        "lock.stale-{}-{}",
+        std::process::id(),
+        ASIDE.fetch_add(1, Ordering::Relaxed)
+    ));
+    if fs::rename(path, &aside).is_err() {
+        return; // someone else cleared it first
+    }
+    if !lock_is_stale(&aside) {
+        let _ = fs::hard_link(&aside, path); // fails when yet another lock exists: then it stays gone
+    }
+    let _ = fs::remove_file(&aside).or_else(|_| fs::remove_dir(&aside));
 }
 
 /// One change to the list at a time (an exclusive create of a lock file beside it). A lock a
 /// crash left behind goes stale after `STALE_LOCK`.
 fn lock(cfg: &AppConfig, wait: Duration) -> io::Result<UpdateLock> {
+    static TOKENS: AtomicU64 = AtomicU64::new(0);
     if let Some(parent) = cfg.allowed_file.parent() {
         fs::create_dir_all(parent)?;
     }
     let path = cfg.allowed_file.with_extension("json.lock");
+    let token = format!(
+        "{}-{}",
+        std::process::id(),
+        TOKENS.fetch_add(1, Ordering::Relaxed)
+    );
     let started = Instant::now();
     loop {
         match fs::OpenOptions::new()
@@ -430,14 +505,13 @@ fn lock(cfg: &AppConfig, wait: Duration) -> io::Result<UpdateLock> {
             .create_new(true)
             .open(&path)
         {
-            Ok(_) => return Ok(UpdateLock(path)),
+            Ok(mut file) => {
+                io::Write::write_all(&mut file, token.as_bytes())?;
+                return Ok(UpdateLock { path, token });
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                let age = fs::symlink_metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.elapsed().ok());
-                if age.is_some_and(|age| age > STALE_LOCK) {
-                    let _ = fs::remove_file(&path);
+                if lock_is_stale(&path) {
+                    clear_stale_lock(&path);
                 } else if started.elapsed() >= wait {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -460,7 +534,14 @@ fn load_for_update(cfg: &AppConfig) -> io::Result<Vec<AllowedFile>> {
         Err(LoadError::Io(e)) => Err(e),
         Err(LoadError::Refused(why)) => Err(io::Error::new(io::ErrorKind::InvalidData, why)),
         Err(LoadError::Damaged(why)) => {
-            let kept = cfg.allowed_file.with_extension("json.damaged");
+            // An earlier copy is evidence too: a new one never replaces it.
+            let mut kept = cfg.allowed_file.with_extension("json.damaged");
+            if kept.symlink_metadata().is_ok() {
+                kept = cfg.allowed_file.with_extension(format!(
+                    "json.damaged-{}",
+                    Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                ));
+            }
             fs::rename(&cfg.allowed_file, &kept)?;
             logger::warn(format!(
                 "always-allowed list replaced ({why}); the old file is kept as {}",
@@ -904,6 +985,11 @@ mod tests {
     fn prompt_names_lose_hidden_characters_and_are_short() {
         assert_eq!(prompt_name("a\u{202E}b\u{200B}c\nd\u{7}\u{2066}e"), "abcde");
         assert_eq!(prompt_name("\u{202E}\u{200B}  "), "unnamed");
+        assert_eq!(
+            prompt_name("a\u{2028}b\u{2029}c\u{AD}d\u{206A}e\u{FFF9}f\u{E0041}g"),
+            "abcdefg"
+        );
+        assert_eq!(clean_name("x\u{202E}fdp.exe\u{2028}"), "xfdp.exe");
         assert_eq!(prompt_name(&"é".repeat(100)).chars().count(), 63);
         assert_eq!(
             describe("x\u{202E}.exe", HASH),
@@ -946,6 +1032,42 @@ mod tests {
         };
         let judged = stamp_of(&file);
         assert_eq!(check_with(&cfg, &file, judged, late), (None, false));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_scored_bytes_decide_not_whatever_is_on_disk_now() {
+        let dir = temp("scored");
+        let cfg = AppConfig::for_base_dir(&dir);
+        cfg.ensure_dirs().unwrap();
+        let file = dir.join("tool.bin");
+        // On disk now: bytes that are always allowed. What was scored: different bytes.
+        fs::write(&file, b"allowed bytes").unwrap();
+        add(&cfg, entry(&quarantine::sha256_hex(b"allowed bytes"))).unwrap();
+        let scored = digest_of(&quarantine::sha256_hex(b"scored bytes"));
+        assert_eq!(check_scored(&cfg, &file, scored), (Some(scored), false));
+        let allowed = digest_of(&quarantine::sha256_hex(b"allowed bytes"));
+        assert_eq!(check_scored(&cfg, &file, allowed), (Some(allowed), true));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_change_time_bump_alone_does_not_make_an_allowed_file_flagged() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp("ctime");
+        let cfg = AppConfig::for_base_dir(&dir);
+        cfg.ensure_dirs().unwrap();
+        let file = dir.join("tool.bin");
+        fs::write(&file, b"same bytes").unwrap();
+        add(&cfg, entry(&quarantine::sha256_hex(b"same bytes"))).unwrap();
+        let judged = stamp_of(&file);
+        std::thread::sleep(Duration::from_millis(20));
+        // Like an extended attribute or a Finder tag: ctime moves, the content does not.
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_ne!(stamp_of(&file), judged);
+        let (digest, allowed) = check(&cfg, &file, judged);
+        assert!(digest.is_some() && allowed);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1010,6 +1132,73 @@ mod tests {
         assert!(add(&cfg, entry(HASH)).unwrap());
         assert_eq!(fs::read(&kept).unwrap(), b"not json");
         assert_eq!(load(&cfg.allowed_file, false).unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_earlier_damaged_copy_is_never_overwritten() {
+        let dir = temp("damaged2");
+        let cfg = AppConfig::for_base_dir(&dir);
+        cfg.ensure_dirs().unwrap();
+        fs::write(&cfg.allowed_file, b"first damage").unwrap();
+        assert!(add(&cfg, entry(HASH)).unwrap());
+        fs::write(&cfg.allowed_file, b"second damage").unwrap();
+        assert!(add(&cfg, entry(&hash_n(1))).unwrap());
+        let kept = cfg.allowed_file.with_extension("json.damaged");
+        assert_eq!(fs::read(&kept).unwrap(), b"first damage");
+        let copies: Vec<Vec<u8>> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".damaged-"))
+            .map(|e| fs::read(e.path()).unwrap())
+            .collect();
+        assert_eq!(copies, [b"second damage".to_vec()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lock_with_a_future_time_or_a_directory_does_not_block_changes_forever() {
+        let dir = temp("oddlock");
+        let cfg = AppConfig::for_base_dir(&dir);
+        cfg.ensure_dirs().unwrap();
+        let held = cfg.allowed_file.with_extension("json.lock");
+        fs::write(&held, b"x").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&held)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(86_400))
+            .unwrap();
+        drop(lock(&cfg, Duration::from_millis(80)).unwrap());
+        assert!(!held.exists());
+        // A directory in its place, left long ago.
+        #[cfg(unix)]
+        {
+            fs::create_dir(&held).unwrap();
+            fs::File::open(&held)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - STALE_LOCK - Duration::from_secs(5))
+                .unwrap();
+            drop(lock(&cfg, Duration::from_millis(80)).unwrap());
+            assert!(!held.exists());
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_holder_never_removes_a_lock_that_is_no_longer_its_own() {
+        let dir = temp("tokenlock");
+        let cfg = AppConfig::for_base_dir(&dir);
+        cfg.ensure_dirs().unwrap();
+        let held = cfg.allowed_file.with_extension("json.lock");
+        let mine = lock(&cfg, Duration::from_millis(80)).unwrap();
+        // Another change took over this one (it looked stale) and holds its own lock now.
+        fs::write(&held, b"someone-else").unwrap();
+        drop(mine);
+        assert_eq!(fs::read(&held).unwrap(), b"someone-else");
+        // A fresh lock is not cleared by a taker that looked a moment too late.
+        clear_stale_lock(&held);
+        assert_eq!(fs::read(&held).unwrap(), b"someone-else");
         let _ = fs::remove_dir_all(&dir);
     }
 

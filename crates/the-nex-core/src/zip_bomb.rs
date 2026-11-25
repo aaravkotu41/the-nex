@@ -194,6 +194,8 @@ struct Rec {
     extent: Option<(u64, u64)>,
     nested: bool,
     mismatch: Option<String>,
+    /// The entry needs a password: its content cannot be read.
+    encrypted: bool,
 }
 
 enum Raw {
@@ -268,6 +270,7 @@ fn parse_cdfh(cd: &[u8], pos: usize, index: usize) -> Option<(Pending, usize)> {
     if cd.get(pos..pos.checked_add(4)?) != Some(&CDFH_SIG[..]) {
         return None;
     }
+    let encrypted = u16_at(cd, pos + 8)? & 1 != 0;
     let method = u16_at(cd, pos + 10)?;
     let comp32 = u32_at(cd, pos + 20)?;
     let unc32 = u32_at(cd, pos + 24)?;
@@ -297,6 +300,7 @@ fn parse_cdfh(cd: &[u8], pos: usize, index: usize) -> Option<(Pending, usize)> {
         extent: None,
         nested: !name.ends_with(b"/") && is_nested_name(name),
         mismatch: None,
+        encrypted,
     };
     Some((
         Pending {
@@ -541,6 +545,7 @@ fn lfh_walk<R: Read + Seek>(
             extent: Some((pos, end)),
             nested: false,
             mismatch: None,
+            encrypted: flags & 1 != 0,
         });
         pos = end;
     }
@@ -570,6 +575,7 @@ fn crate_recs<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Vec<Rec> {
             )),
             nested: !entry.is_dir() && is_nested_name(entry.name_raw()),
             mismatch: None,
+            encrypted: entry.encrypted(),
         });
     }
     recs
@@ -764,12 +770,22 @@ fn inspect_level<R: Read + Seek>(
     }
 
     // Everything below decompresses, so it is bounded by byte and time budgets.
+    // Passwords and compression methods this check cannot read hide what is inside.
+    scan.incomplete |= recs
+        .iter()
+        .any(|r| r.encrypted || !matches!(r.method, 0 | 8));
     if !recs.iter().any(|r| r.nested || r.method == 8) {
         return None;
     }
     let mut archive = match archive {
         Some(a) => a,
-        None => ZipArchive::new(&mut reader).ok()?,
+        None => match ZipArchive::new(&mut reader) {
+            Ok(a) => a,
+            Err(_) => {
+                scan.incomplete = true;
+                return None;
+            }
+        },
     };
 
     // Actual decompressed bytes versus the declared size, smallest declarations first.
@@ -784,6 +800,7 @@ fn inspect_level<R: Read + Seek>(
             break;
         }
         let Ok(entry) = archive.by_index(r.cd_index) else {
+            scan.incomplete = true;
             continue;
         };
         let declared = entry.size();
@@ -812,6 +829,7 @@ fn inspect_level<R: Read + Seek>(
         let mut data = Vec::new();
         let declared = {
             let Ok(entry) = archive.by_index(r.cd_index) else {
+                scan.incomplete = true;
                 continue;
             };
             let declared = entry.size();
@@ -820,6 +838,7 @@ fn inspect_level<R: Read + Seek>(
                 .read_to_end(&mut data)
                 .is_err()
             {
+                scan.incomplete = true;
                 continue;
             }
             declared
@@ -877,8 +896,19 @@ fn inspect_level<R: Read + Seek>(
 }
 
 pub fn scan_and_respond(path: &Path, cfg: &AppConfig) -> Option<ZipThreat> {
+    scan_and_respond_with(path, cfg, inspect_zip_file)
+}
+
+// shortcut: the archive is streamed from disk, so no buffer of the judged bytes is held to hash;
+// the stamp taken BEFORE inspecting catches an ordinary swap, not a write through a mapping
+// someone else holds open. Upgrade by hashing while reading the archive.
+fn scan_and_respond_with(
+    path: &Path,
+    cfg: &AppConfig,
+    inspect: impl FnOnce(&Path, &AppConfig) -> Option<ZipThreat>,
+) -> Option<ZipThreat> {
     let judged = allowlist::stamp_of(path);
-    let threat = inspect_zip_file(path, cfg)?;
+    let threat = inspect(path, cfg)?;
     let (digest, allowed) = allowlist::check(cfg, path, judged);
     if allowed {
         return None;
@@ -1000,6 +1030,106 @@ mod tests {
             current = build_zip(&[(name.as_str(), current)]);
         }
         current
+    }
+
+    fn incomplete_for(bytes: &[u8]) -> (Option<ZipThreatKind>, bool) {
+        let (threat, incomplete) = inspect_root(
+            Cursor::new(bytes),
+            bytes.len() as u64,
+            &ZipLimits::default(),
+        );
+        (threat.map(|t| t.kind), incomplete)
+    }
+
+    /// Sets the general-purpose flags and compression method in every header of `bytes`.
+    fn patch_headers(bytes: &mut [u8], flags: u16, method: u16) {
+        for (sig, flag_at, method_at) in [(LFH_SIG, 6, 8), (CDFH_SIG, 8, 10)] {
+            let mut from = 0;
+            while let Some(i) = bytes[from..].windows(4).position(|w| w == sig) {
+                let at = from + i;
+                bytes[at + flag_at..at + flag_at + 2].copy_from_slice(&flags.to_le_bytes());
+                bytes[at + method_at..at + method_at + 2].copy_from_slice(&method.to_le_bytes());
+                from = at + 4;
+            }
+        }
+    }
+
+    #[test]
+    fn archives_that_cannot_be_looked_into_are_not_reported_as_complete() {
+        let plain = build_zip(&[("a.txt", b"hello hello hello".to_vec())]);
+        assert_eq!(incomplete_for(&plain), (None, false));
+        let mut password = plain.clone();
+        patch_headers(&mut password, 1, 8);
+        assert_eq!(incomplete_for(&password), (None, true), "password, deflate");
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut cursor);
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            writer.start_file("a.txt", stored).unwrap();
+            writer.write_all(b"hello").unwrap();
+            writer.finish().unwrap();
+        }
+        let mut stored_password = cursor.into_inner();
+        assert_eq!(incomplete_for(&stored_password), (None, false));
+        patch_headers(&mut stored_password, 1, 0);
+        assert_eq!(
+            incomplete_for(&stored_password),
+            (None, true),
+            "password, stored"
+        );
+        let mut lzma = plain;
+        patch_headers(&mut lzma, 0, 14);
+        assert_eq!(incomplete_for(&lzma), (None, true), "lzma");
+        // A nested archive that cannot be opened.
+        let mut nested = build_zip(&[("inner.zip", build_zip(&[("a", b"x".to_vec())]))]);
+        patch_headers(&mut nested, 1, 8);
+        assert_eq!(incomplete_for(&nested), (None, true), "password, nested");
+    }
+
+    #[test]
+    fn a_nested_archive_too_large_to_unpack_is_incomplete() {
+        let outer = build_zip(&[("big.zip", vec![0u8; 64 * 1024])]);
+        let limits = ZipLimits {
+            max_ratio: 1e12,
+            max_nested_mem_read: 1024,
+            ..ZipLimits::default()
+        };
+        let (threat, incomplete) =
+            inspect_root(Cursor::new(&outer[..]), outer.len() as u64, &limits);
+        assert_eq!((threat.map(|t| t.kind), incomplete), (None, true));
+    }
+
+    #[test]
+    fn a_file_swapped_while_it_was_inspected_is_not_allowed() {
+        use crate::allowlist::{self, AllowedFile};
+        let dir = std::env::temp_dir().join(format!("thenex-zip-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = AppConfig::for_base_dir(&dir);
+        cfg.ensure_dirs().unwrap();
+        cfg.dry_run = true;
+        let file = dir.join("a.zip");
+        std::fs::write(&file, b"judged bytes").unwrap();
+        let allowed = quarantine::sha256_hex(b"swapped bytes");
+        allowlist::add(
+            &cfg,
+            AllowedFile::new(&allowed, "a.zip", "ZIP_BOMB").unwrap(),
+        )
+        .unwrap();
+        let swap_then_flag = |path: &Path, _: &AppConfig| {
+            std::fs::remove_file(path).unwrap();
+            std::fs::write(path, b"swapped bytes").unwrap();
+            Some(ZipThreat {
+                kind: ZipThreatKind::Malformed,
+                depth: 1,
+                entries: 0,
+                total_compressed: 0,
+                total_uncompressed: 0,
+                detail: String::new(),
+            })
+        };
+        // The stamp was taken before the inspection, so the swapped-in bytes are not vouched for.
+        assert!(scan_and_respond_with(&file, &cfg, swap_then_flag).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

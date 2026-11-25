@@ -105,11 +105,7 @@ fn engine_copy_path() -> PathBuf {
 /// ignored once a background service is installed, so a made-up status, log or settings folder
 /// cannot be shown in place of the real one.
 fn config() -> AppConfig {
-    AppConfig::for_base_dir(&config::data_dir_for(
-        std::env::var_os(config::DATA_DIR_ENV),
-        config::running_privileged(),
-        platform::service_installed(),
-    ))
+    AppConfig::for_base_dir(&config::app_data_dir())
 }
 
 fn display(path: &Path) -> String {
@@ -189,50 +185,41 @@ fn elevated_about(args: &[&str], subject: &str) -> Result<(), String> {
     }
 }
 
-/// The last release whose engine has no `--allow-event` (nor `--allow`): 0.4.1. A newer
-/// engine, or one of the very build this app came in, can do it.
-const LAST_VERSION_WITHOUT_ALLOW: (u64, u64, u64) = (0, 4, 1);
-
-fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = version.split(['-', '+']).next()?.split('.');
-    let mut next = || parts.next()?.parse().ok();
-    Some((next()?, next()?, next()?))
-}
-
 /// Why "Always allow" cannot be used: an elevated run of an older engine would ask for a
-/// password and then fail with "unknown argument". `service_version` is what status.json says
-/// the installed service is; `runs_installed_copy` says that service's copy is what will run
-/// (otherwise the engine that ships with this app does, which is always this version).
-fn allow_problem_for(
-    runs_installed_copy: bool,
-    service_version: Option<&str>,
-    own_version: &str,
-) -> Option<String> {
+/// password and then fail with "unknown argument". `service_can_allow` is what the running
+/// service's status.json says (None: no fresh status, so it is stopped); `runs_installed_copy`
+/// says that service's copy is what will run (otherwise the engine that ships with this app
+/// does, which can always do it).
+fn allow_problem_for(runs_installed_copy: bool, service_can_allow: Option<bool>) -> Option<String> {
     if !runs_installed_copy {
         return None;
     }
-    match service_version {
+    match service_can_allow {
         None => Some(
-            "The background service is not running, so its version cannot be checked. Start it, then try again."
+            "The background service is not running, so it cannot be asked yet. Start it, then try again."
                 .to_string(),
         ),
-        Some(version)
-            if version == own_version
-                || parse_version(version).is_some_and(|v| v > LAST_VERSION_WITHOUT_ALLOW) =>
-        {
-            None
-        }
-        Some(version) => Some(format!(
-            "The installed background service (version {version}) is older than this app and cannot do this. Reinstall it from Settings first."
-        )),
+        Some(true) => None,
+        Some(false) => Some(
+            "The installed background service is older than this app and cannot do this. Reinstall it from Settings first."
+                .to_string(),
+        ),
     }
+}
+
+/// Taking a file off the list only ever makes things stricter, so a stopped service (nothing to
+/// ask about its version) does not stand in the way; one known to be too old still does.
+fn disallow_problem_for(
+    runs_installed_copy: bool,
+    service_can_allow: Option<bool>,
+) -> Option<String> {
+    service_can_allow.and_then(|can| allow_problem_for(runs_installed_copy, Some(can)))
 }
 
 fn allow_problem(cfg: &AppConfig) -> Option<String> {
     allow_problem_for(
         installed_engine().is_some(),
-        fresh_status(cfg).map(|s| s.version).as_deref(),
-        env!("CARGO_PKG_VERSION"),
+        fresh_status(cfg).map(|s| s.can_allow),
     )
 }
 
@@ -244,9 +231,17 @@ fn allow_args<'a>(mode: &'a str, id: &'a str, sha256: &'a str) -> [&'a str; 4] {
 
 /// An elevated run for the always-allowed list, only when the engine can do it.
 fn elevated_allow(cfg: &AppConfig, args: &[&str], subject: &str) -> Result<(), String> {
-    match allow_problem(cfg) {
+    unless_problem(allow_problem(cfg), || elevated_about(args, subject))
+}
+
+/// `run()`, unless there is a problem to show instead.
+fn unless_problem(
+    problem: Option<String>,
+    run: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    match problem {
         Some(problem) => Err(problem),
-        None => elevated_about(args, subject),
+        None => run(),
     }
 }
 
@@ -806,10 +801,17 @@ async fn remove_allowed(sha256: String) -> Result<String, String> {
                     .ok()
                     .and_then(|list| list.into_iter().find(|e| e.sha256 == sha256))
                     .map_or_else(String::new, |e| e.name);
-                elevated_allow(
-                    &cfg,
-                    &["--disallow", sha256.as_str()],
-                    &allowlist::describe(&name, &sha256),
+                unless_problem(
+                    disallow_problem_for(
+                        installed_engine().is_some(),
+                        fresh_status(&cfg).map(|s| s.can_allow),
+                    ),
+                    || {
+                        elevated_about(
+                            &["--disallow", sha256.as_str()],
+                            &allowlist::describe(&name, &sha256),
+                        )
+                    },
                 )?
             }
             Err(e) => return Err(e.to_string()),
@@ -1020,7 +1022,9 @@ mod tests {
     #[test]
     fn the_engine_copy_to_run_is_the_one_under_the_default_data_folder() {
         // Never under THENEX_DATA_DIR: whatever that points at would be run as root.
+        std::env::set_var(config::DATA_DIR_ENV, "/tmp/evil");
         let path = engine_copy_path();
+        std::env::remove_var(config::DATA_DIR_ENV);
         let default = config::default_base_dir().join("engine");
         assert_eq!(path.parent(), Some(default.as_path()));
         assert!(path
@@ -1074,24 +1078,30 @@ mod tests {
 
     #[test]
     fn an_older_service_is_not_asked_to_do_what_it_cannot() {
-        let own = "0.5.0";
-        // The app's own engine runs: same build, always fine.
-        assert_eq!(allow_problem_for(false, None, own), None);
-        assert_eq!(allow_problem_for(true, Some("0.5.0"), own), None);
-        assert_eq!(allow_problem_for(true, Some("0.4.2"), own), None);
-        assert_eq!(allow_problem_for(true, Some("1.0.0-beta"), own), None);
-        for old in ["0.4.1", "0.3.0", "0.4.0", "garbage", ""] {
-            let problem = allow_problem_for(true, Some(old), own).unwrap();
-            assert!(
-                problem.contains("older") && problem.contains("Reinstall"),
-                "{old}"
-            );
-        }
-        assert!(allow_problem_for(true, None, own)
-            .unwrap()
-            .contains("not running"));
-        assert_eq!(parse_version("0.4.1"), Some((0, 4, 1)));
-        assert_eq!(parse_version("0.5"), None);
+        // The app's own engine runs: it can always do it.
+        assert_eq!(allow_problem_for(false, None), None);
+        assert_eq!(allow_problem_for(false, Some(false)), None);
+        assert_eq!(allow_problem_for(true, Some(true)), None);
+        // 0.4.1 had no --allow-event and reported no capability: no guess from a version.
+        let old = allow_problem_for(true, Some(false)).unwrap();
+        assert!(old.contains("older") && old.contains("Reinstall"), "{old}");
+        let stopped = allow_problem_for(true, None).unwrap();
+        assert!(stopped.contains("not running"), "{stopped}");
+    }
+
+    #[test]
+    fn taking_a_file_off_the_list_works_while_the_service_is_stopped() {
+        assert!(allow_problem_for(true, None).is_some());
+        assert_eq!(disallow_problem_for(true, None), None);
+        assert_eq!(disallow_problem_for(true, Some(true)), None);
+        assert!(disallow_problem_for(true, Some(false)).is_some());
+    }
+
+    #[test]
+    fn a_problem_stops_the_administrator_prompt_before_it_is_shown() {
+        let refused = unless_problem(Some("why not".into()), || panic!("prompt shown"));
+        assert_eq!(refused, Err("why not".to_string()));
+        assert_eq!(unless_problem(None, || Ok(())), Ok(()));
     }
 
     fn event(kind: &str, severity: Severity, target: &str) -> ThreatEvent {

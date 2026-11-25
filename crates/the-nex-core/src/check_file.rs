@@ -46,9 +46,13 @@ pub struct FileCheck {
     pub checks: Vec<String>,
 }
 
-/// Bidi controls and zero-width characters: invisible, but they change how text reads.
+/// Bidi controls, zero-width, line/paragraph separators, soft hyphen, deprecated format and
+/// tag characters: invisible, but they change how text reads. The one list every shown name
+/// (prompt, report, startup page, allowed list) goes through.
 pub fn is_invisible_format(c: char) -> bool {
-    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{061C}' | '\u{FEFF}')
+    matches!(c, '\u{AD}' | '\u{61C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+        | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}')
 }
 
 /// A file name made safe to show: no bidi or zero-width characters (they can make `exe.txt`
@@ -583,6 +587,19 @@ mod tests {
     fn names_shown_to_people_lose_bidi_and_zero_width_characters() {
         let tricky = "invoice\u{202E}gpj.exe\u{200B}\u{FEFF}\u{2066}x\u{061C}\n.zip";
         assert_eq!(clean_display_name(tricky), "invoicegpj.exex .zip");
+        for c in [
+            '\u{2028}',
+            '\u{2029}',
+            '\u{AD}',
+            '\u{206A}',
+            '\u{206F}',
+            '\u{FFF9}',
+            '\u{FFFB}',
+            '\u{E0041}',
+        ] {
+            assert!(is_invisible_format(c), "{c:?}");
+        }
+        assert!(!is_invisible_format('a') && !is_invisible_format('\u{2027}'));
         assert_eq!(display_name(Path::new("/a/b\u{202E}c.txt")), "bc.txt");
     }
 }

@@ -45,14 +45,16 @@ fn main() -> ExitCode {
         Mode::Notifier => {
             platform::detach_console();
             logger::init_without_file(false);
-            let cfg = AppConfig::from_cli(&args);
+            let cfg = AppConfig::from_cli_in_session(&args);
             notifier::run_notifier(&cfg, shutdown);
             ExitCode::SUCCESS
         }
         Mode::Tray => {
             platform::detach_console();
             logger::init_without_file(false);
-            report(platform::run_tray(AppConfig::from_cli(&args)).map(|()| String::new()))
+            report(
+                platform::run_tray(AppConfig::from_cli_in_session(&args)).map(|()| String::new()),
+            )
         }
         Mode::Console => {
             platform::install_ctrlc_handler(Arc::clone(&shutdown));

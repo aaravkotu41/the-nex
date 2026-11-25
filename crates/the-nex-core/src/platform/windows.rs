@@ -24,11 +24,16 @@ use windows_service::service::{
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, ERROR_CANCELLED};
+use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::WinTrust::{
     WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
     WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOCATION_CHECK_NONE,
     WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+};
+use windows_sys::Win32::Security::{
+    IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID,
 };
 use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesW, SetFileAttributesW};
 use windows_sys::Win32::System::Console::{
@@ -676,14 +681,57 @@ fn restart_action(delay_secs: u64) -> ServiceAction {
 // aside (never reset in place) and recreate it. The installer (installer.nsi) is deliberately
 // unchanged until that can be tested on Windows.
 //
-// Planted settings: a folder that already existed before the FIRST install was not made by us, so
-// its allowed.json (files that are never flagged) and settings.json (engines switched off) are
-// deleted; deleting means defaults (everything on, nothing allowed), which is the safe state.
-// Not done when the service already existed: that folder was hardened by an earlier install, and
-// an update must keep the person's own list. Unverified on Windows (type-checked only).
-fn harden_data_dirs(cfg: &AppConfig, first_install: bool) -> Vec<String> {
-    let mut notes = Vec::new();
+// Planted files: a folder that already existed and was NOT owned by Administrators or SYSTEM
+// before we touched it was made by a standard user, so what it holds (allowed.json, settings.json,
+// the schedule's state, the logs, the quarantine folder) is not ours. After inheritance is cut and
+// the grants are set (so nobody can put it back) it is moved aside to ".planted-<n>", never
+// deleted; the engine then starts from defaults (everything on, nothing allowed). A folder an
+// earlier install hardened is owned by Administrators, so uninstalling and installing again keeps
+// the person's own settings and list. Unverified on Windows (type-checked only).
+fn harden_data_dirs(cfg: &AppConfig) -> Vec<String> {
     let pre_existing = cfg.base_dir.exists();
+    // Looked at before the ownership below is taken.
+    let ours = pre_existing && owned_by_admins(&cfg.base_dir);
+    let mut notes = restrict_data_dirs(cfg);
+    if pre_existing && !ours {
+        notes.extend(super::set_aside_planted(cfg));
+        // The moved folders are made again, and their grants set again.
+        notes.extend(restrict_data_dirs(cfg));
+    }
+    notes
+}
+
+/// True when the owner of `path` is Administrators or SYSTEM. False when it cannot be told.
+fn owned_by_admins(path: &Path) -> bool {
+    let wide = to_wide(path.as_os_str());
+    let mut owner: PSID = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated; on success `owner` points into `descriptor`, which is
+    // read before it is freed.
+    unsafe {
+        let status = GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        );
+        if status != 0 {
+            return false;
+        }
+        let admins = IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0
+            || IsWellKnownSid(owner, WinLocalSystemSid) != 0;
+        LocalFree(descriptor);
+        admins
+    }
+}
+
+/// Takes ownership, resets the ACLs, cuts inheritance and sets the grants.
+fn restrict_data_dirs(cfg: &AppConfig) -> Vec<String> {
+    let mut notes = Vec::new();
     if let Err(e) = cfg.ensure_dirs() {
         notes.push(e);
     }
@@ -691,18 +739,6 @@ fn harden_data_dirs(cfg: &AppConfig, first_install: bool) -> Vec<String> {
     for dir in [&cfg.base_dir, &cfg.quarantine_dir] {
         icacls(dir, &["/setowner", SID_ADMINISTRATORS, "/T", "/C"]);
         icacls(dir, &["/reset", "/T", "/C"]);
-    }
-    if first_install && pre_existing {
-        for planted in [&cfg.allowed_file, &cfg.settings_file] {
-            match fs::remove_file(planted) {
-                Ok(()) => notes.push(format!(
-                    "removed {}: it was in a data folder that existed before the first install",
-                    planted.display()
-                )),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => notes.push(format!("could not remove {}: {e}", planted.display())),
-            }
-        }
     }
     let system = format!("{SID_SYSTEM}:(OI)(CI)F");
     let admins = format!("{SID_ADMINISTRATORS}:(OI)(CI)F");
@@ -798,14 +834,12 @@ pub fn install_service() -> Result<String, String> {
     let info = service_info(exe.clone());
     let access = ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
     let mut notes = Vec::new();
-    let mut first_install = true;
     let service = match manager.create_service(&info, access) {
         Ok(service) => {
             notes.push(format!("service '{}' registered", config::SERVICE_NAME));
             service
         }
         Err(e) if win32_code(&e) == Some(ERROR_SERVICE_EXISTS) => {
-            first_install = false;
             let service = manager
                 .open_service(config::SERVICE_NAME, access)
                 .map_err(|e| service_error("cannot open existing service", e))?;
@@ -837,10 +871,9 @@ pub fn install_service() -> Result<String, String> {
         .set_failure_actions_on_non_crash_failures(true)
         .map_err(|e| service_error("cannot enable failure actions", e))?;
 
-    notes.extend(harden_data_dirs(
-        &AppConfig::for_base_dir(&config::default_base_dir()),
-        first_install,
-    ));
+    notes.extend(harden_data_dirs(&AppConfig::for_base_dir(
+        &config::default_base_dir(),
+    )));
     register_autostart(RUN_KEY, RUN_VALUE, &exe, NOTIFIER_ARG)
         .map_err(|e| format!("service installed but notifier autostart failed: {e}"))?;
     notes.push(format!(
