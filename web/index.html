@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
   <title>The Nex</title>
-  <meta name="description" content="Endpoint protection for Windows and Mac that runs detection on the device. Zip-bomb inspection, an on-device model for new executables, ransomware canaries and quarantine with restore.">
+  <meta name="description" content="Protection from harmful files for Windows and Mac. Everything is checked on your own computer, and nothing is uploaded.">
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="styles.css">
   <script src="app.js" defer></script>
@@ -37,42 +37,42 @@
     <section class="hero wrap" aria-labelledby="title">
       <div>
         <h1 id="title">Protection that runs on your computer</h1>
-        <p class="lead">The Nex watches downloads, archives, scripts and your files for signs of malware and ransomware. Detection happens on your computer. Nothing is scanned in the cloud and no file is uploaded.</p>
+        <p class="lead">The Nex looks for harmful files and programs and stops them. All the checking happens on your computer. Your files are never uploaded.</p>
         <p><a class="btn" href="#download">Get The Nex</a></p>
       </div>
       <dl class="facts">
         <div><dt>Runs on</dt><dd>Windows and macOS</dd></div>
-        <div><dt>Detection</dt><dd>On the device</dd></div>
+        <div><dt>Checks</dt><dd>On your computer</dd></div>
         <div><dt>Account</dt><dd>Optional, not needed for protection</dd></div>
-        <div><dt>Status</dt><dd>Hackathon project, no lab certification</dd></div>
+        <div><dt>Status</dt><dd>Hackathon project, not tested by a lab</dd></div>
       </dl>
     </section>
 
     <section class="wrap narrow" aria-labelledby="what">
       <h2 id="what">What it does</h2>
       <dl class="list">
-        <div><dt>Zip-bomb inspection</dt><dd>Archives are checked before they are extracted: overlapping entries, sizes that lie, nested archives and Zip64.</dd></div>
-        <div><dt>New executable scoring</dt><dd>An ONNX model on your device scores new unsigned executables. Every verdict shows the score, the threshold and the reasons in plain text.</dd></div>
-        <div><dt>Canary files</dt><dd>Decoy files sit in your folders. If something changes them the way ransomware does, The Nex alerts you.</dd></div>
-        <div><dt>Process guard</dt><dd>Watches for suspicious scripts being run.</dd></div>
-        <div><dt>Quarantine with restore</dt><dd>Flagged files are moved aside, never deleted on their own. Restore any of them in one click.</dd></div>
-        <div><dt>Menu bar and Quick Scan</dt><dd>On Mac it lives in the menu bar and runs a Quick Scan from there.</dd></div>
+        <div><dt>Trick zip files</dt><dd>Some zip files are built to fill up your computer when opened. The Nex spots them before you open them.</dd></div>
+        <div><dt>New programs</dt><dd>When a new program from an unknown maker shows up, The Nex gives it a risk score and tells you why.</dd></div>
+        <div><dt>Ransomware</dt><dd>Ransomware locks your files and asks for money. The Nex puts out decoy files and warns you if something tampers with them.</dd></div>
+        <div><dt>Dangerous commands</dt><dd>It watches for hidden commands that attacks often use.</dd></div>
+        <div><dt>Nothing is deleted without you</dt><dd>Suspicious files are moved somewhere safe. You can put any of them back with one click.</dd></div>
+        <div><dt>Quick check any time</dt><dd>Start a quick scan from the app, or from the menu bar on a Mac.</dd></div>
       </dl>
     </section>
 
     <section class="wrap band" aria-labelledby="diff">
       <h2 id="diff">How it is different</h2>
       <div class="cols">
-        <p>Most protection tools send files or hashes to a vendor for a verdict. The Nex does not. The model, the archive checks and the canaries all run locally, and protection keeps working with no account and no network.</p>
-        <p>Every detection explains itself. You see the score, the threshold it was compared with and the reasons, so you can judge a verdict instead of trusting it.</p>
-        <p>On applications the model never saw in training, 0.46% of clean programs were flagged. The malware side of the model was trained on synthetic profiles of documented malware traits, so that number says how often real software is wrongly flagged. It is not a detection rate, and there is no lab certification.</p>
-        <p>An optional account lets you see all your computers and run a Quick Scan on another one. The Nex also includes AegisMesh, a simulated SOS wearable demo. It is a simulation only.</p>
+        <p>Many protection tools send your files, or fingerprints of them, to a company to be judged. The Nex does not. It works without an account and without the internet.</p>
+        <p>It always explains itself. You see the risk score and the reasons, so you can decide for yourself.</p>
+        <p>It makes mistakes. In our tests it wrongly flagged about 1 in 200 safe programs. That is how often it is wrong about safe programs, not how much harmful software it catches. No independent lab has tested it.</p>
+        <p>With an optional account you can see all your computers in one place and start a scan on another one. The Nex also includes AegisMesh, a demo of a wearable that calls for help. It is only a simulation.</p>
       </div>
     </section>
 
     <section class="wrap narrow" aria-labelledby="priv">
       <h2 id="priv">Privacy</h2>
-      <p>This website sets no cookies, stores nothing in your browser, runs no analytics and makes no third-party requests unless you send a problem report. The app does not scan in the cloud and does not upload files. If you sign in, a small device summary is synced through Supabase. The full details are on the <a href="privacy.html">privacy page</a>.</p>
+      <p>This website does not track you: no cookies and no visitor statistics. The app never uploads your files. If you choose to sign in, a short summary of each computer is stored online so you can see it from the others. The <a href="privacy.html">privacy page</a> has every detail.</p>
     </section>
 
     <section class="wrap dl" id="download" aria-labelledby="dl-h">
@@ -84,7 +84,7 @@
         </div>
         <p class="dl-note">Windows 10/11, 64-bit, 22 MB. Mac: Apple Silicon, installer, 26 MB, or <a href="https://github.com/eeshanambati/the-nex/releases/download/v0.4.1/TheNex.dmg" rel="noopener noreferrer">the .dmg</a> (28 MB).</p>
         <p class="dl-note">Version 0.4.1. Built and tested automatically on Windows and macOS.</p>
-        <p class="dl-note">The installers are not code-signed yet, so the first run shows a warning. Windows: choose "More info", then "Run anyway". Mac: open System Settings, Privacy &amp; Security, and choose "Open Anyway".</p>
+        <p class="dl-note">The installers do not carry an approved developer signature yet, so your computer shows a warning the first time. Windows: choose "More info", then "Run anyway". Mac: open System Settings, Privacy &amp; Security, and choose "Open Anyway".</p>
       </div>
       <p class="mobile-note">The Nex runs on Mac and Windows computers. Open this page on your computer to download it.</p>
     </section>
