@@ -135,8 +135,8 @@ does not score (perl, ruby, node and others have no command-line rules either); 
 queue of programs to check. For programs already running when protection starts the AI and the
 malware list only report, but the command-line rules still stop them.
 
-Checked on macOS only: 352 Rust tests, the Node tests and 14 live checks. Windows code is
-type-checked, never run. The administrator prompts, the real window and dropping a real file were
+Checked on macOS: 352 Rust tests, the Node tests and 14 live checks. What was run on a real
+Windows PC is in [UPGRADE_LOG.md](../UPGRADE_LOG.md). The administrator prompts, the real window and dropping a real file were
 not exercised.
 
 ## Known-malware list
@@ -224,7 +224,7 @@ same Quick Scan took 28.4 s and a 100 MB file 290 ms.
   files.
 - The dashboard and menu bar report the engine as degraded ("no list installed") for as long as
   no list ships.
-- The Windows build is compiled and tested only in CI; the numbers above are macOS only.
+- The numbers above are macOS only.
 
 **Try it** (harmless: the list holds only the hash of a file you choose):
 

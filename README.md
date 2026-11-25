@@ -24,19 +24,20 @@ The Nex is an early project. It is **not** a replacement for Windows Defender or
 
 - **The known-threats list is not included yet.** The check is built and tested, but no real list ships with the app, so right now it catches nothing until one is added.
 - **It cannot update itself.** The background service has no internet access on purpose, so protection only changes when you install a new version.
-- **The AI is not perfect.** On a public set of real Windows malware it caught roughly two out of three, and it flags a small share of clean programs by mistake. Details are in the [technical reference](docs/TECHNICAL.md).
+- **The AI is not perfect.** On a public sample of real Windows malware it caught about six in ten (59%), and it flagged 3 in 100 clean programs by mistake. Details are in the [technical reference](docs/TECHNICAL.md).
 - **It does not watch the internet.** It has no web, phishing or network protection, and does not react when you plug in a USB drive.
 - **It does not look inside Office files, PDFs or script files** beyond comparing them with the (currently empty) list.
-- **No Linux support.** Windows support was only compiled in testing, not run on a real PC by the author.
-- **You cannot yet tell it to ignore a folder.** The only exception is "Always allow" for one exact file.
+- **No Linux support.** On a real Windows 11 PC the engine, the command line and the app window were run; the installed service and the installer are only tested on a build server. See [UPGRADE_LOG.md](UPGRADE_LOG.md).
+- **The app asks you to sign in** before it shows the dashboard. The background service protects you without it.
+- **You cannot yet tell it to ignore a folder.** The only exceptions are a file you restored from quarantine and "Always allow" for one exact file.
 
 ## Privacy in one paragraph
 
-Detecting threats happens on your device. You can sign in to see your devices in one place; if you do, a small summary (device name, platform, counts, on/off flags, no file paths) is sent to the sign-in service, which can see your IP address and when you were active. There are no ads and no analytics. The full list of what is stored and sent is on the Privacy page in the app (Settings, then Privacy).
+Detecting threats happens on your device. You sign in to open the dashboard and see your devices in one place; when you do, a small summary (device name, platform, counts, on/off flags, no file paths) is sent to the sign-in service, which can see your IP address and when you were active. There are no ads and no analytics. The full list of what is stored and sent is on the Privacy page in the app (Settings, then Privacy).
 
 ## For developers
 
 - Everything technical (how each check works, measurements, limits, scan behavior, account sync) is in [docs/TECHNICAL.md](docs/TECHNICAL.md).
 - Layout: `crates/the-nex-core` (checks, quarantine, OS layer), `crates/the-nex-daemon` (background service and command line), `crates/the-nex-gui` (desktop app, its pages are plain HTML, CSS and JavaScript in `ui/`), `crates/aegismesh-*` (a separate wearable-SOS simulation), `packaging/` (installers), `scripts/` (tests and tools).
-- Run the interface tests: `for t in scripts/test_*.js; do node $t; done`. Run the engine tests: `cargo test` (needs Windows or macOS).
+- Run the interface tests: `for t in scripts/test_*.js; do node $t; done`. Run the engine tests: `cargo test` (needs Windows or macOS, and Rust 1.96 or newer).
 - CI builds, tests and installs on Windows and macOS; pushing a `v*` tag publishes a release.
