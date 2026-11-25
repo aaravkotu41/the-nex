@@ -385,7 +385,7 @@ def check_always_allow(daemon):
 
 def check_scheduled_scan(daemon):
     """A due scheduled scan reports a decoy bomb and a listed decoy, moves nothing, logs one
-    summary and is not repeated. The sandbox state file (an old last run and a one-second quiet
+    summary and is not repeated; the state file records the attempt and the finished run. The sandbox state file (an old last run and a one-second quiet
     wait, which only --console honours) makes it due at once; the installed service waits ten
     minutes."""
     report_file = SANDBOX / "last_scheduled_scan.json"
@@ -412,7 +412,7 @@ def check_scheduled_scan(daemon):
     state_file.unlink(missing_ok=True)
     ok = (chosen.returncode == 0 and bool(ran) and {"scheduled_bomb.zip", "scheduled_decoy.docm"} <= found
           and untouched and len(summaries) == 1 and "scheduled" in summaries[0].get("details", "")
-          and state.get("last_run", "") > "2021")
+          and state.get("last_run", "") > "2021" and state.get("last_attempt", "") > "2021")
     return ok, "bomb and decoy reported, nothing moved, one summary" if ok else (
         f"set={chosen.returncode} ran={bool(ran)} found={sorted(found)} untouched={untouched} "
         f"summaries={len(summaries)} state={state}")

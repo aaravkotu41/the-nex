@@ -4,7 +4,8 @@
 //!
 //! A request is an empty file with a fixed name in `<data dir>/requests`, which any local user
 //! may create. Only the name is ever looked at, never the content. Any local user can therefore
-//! start or cancel a scan. A full scan only reports; a quick scan acts on what it finds in
+//! start a scan, or cancel one a user started. None of them can cancel the scheduled scan; a
+//! scan a user asks for stops it instead (it is retried later). A full scan only reports; a quick scan acts on what it finds in
 //! Downloads and Desktop exactly as live protection already does for new files there.
 //! shortcut: no per-user authorisation of requests, add it before a scan can do more than that.
 
@@ -20,8 +21,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const REQUEST_DIR_NAME: &str = "requests";
@@ -48,6 +49,8 @@ pub fn request_dir(cfg: &AppConfig) -> PathBuf {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanProgress {
+    /// A scheduled scan says `Quick` here and `scheduled: true` below: the previous release
+    /// cannot read any other name and would drop the whole file.
     pub kind: ScanKind,
     pub running: bool,
     pub started_at: DateTime<Utc>,
@@ -57,6 +60,9 @@ pub struct ScanProgress {
     pub findings: u64,
     /// Folder being read.
     pub current: String,
+    /// Started by the schedule (a user's scan may stop it); missing in older files.
+    #[serde(default)]
+    pub scheduled: bool,
 }
 
 impl ScanProgress {
@@ -135,11 +141,23 @@ fn remove_entry(path: &Path) -> bool {
 pub struct ScanJobs {
     running: AtomicBool,
     cancel: AtomicBool,
+    /// The running scan is the scheduled one.
+    scheduled: AtomicBool,
+    /// A user's scan that arrived during the scheduled one, started once that one has stopped.
+    waiting: Mutex<Option<ScanKind>>,
+    /// How the last scheduled scan ended (true = ran to the end), until the schedule reads it.
+    outcome: Mutex<Option<bool>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 impl ScanJobs {
     /// Called about once a second by the service: starts a requested scan (one at a time) and
-    /// passes on a cancel request.
+    /// passes on a cancel request. The scheduled scan ignores cancel requests, and a requested
+    /// scan stops it and runs in its place.
     pub fn poll(
         self: &Arc<Self>,
         cfg: &Arc<AppConfig>,
@@ -147,12 +165,23 @@ impl ScanJobs {
         telemetry: &Arc<Telemetry>,
     ) {
         let dir = request_dir(cfg);
-        if take_request(&dir, CANCEL_REQUEST) {
+        if take_request(&dir, CANCEL_REQUEST) && !self.scheduled.load(Ordering::SeqCst) {
             self.cancel.store(true, Ordering::SeqCst);
         }
         for kind in [ScanKind::Full, ScanKind::Quick] {
-            // A request that arrives during a scan is dropped, not queued.
             if take_request(&dir, request_name(kind)) {
+                if !self.is_running() {
+                    self.start(kind, cfg, scanner, telemetry);
+                } else if self.scheduled.load(Ordering::SeqCst) {
+                    *locked(&self.waiting) = Some(kind);
+                    self.cancel.store(true, Ordering::SeqCst);
+                }
+                // else: a request that arrives during a user's scan is dropped, not queued.
+            }
+        }
+        if !self.is_running() {
+            let waiting = locked(&self.waiting).take();
+            if let Some(kind) = waiting {
                 self.start(kind, cfg, scanner, telemetry);
             }
         }
@@ -170,6 +199,8 @@ impl ScanJobs {
             return false;
         }
         self.cancel.store(false, Ordering::SeqCst);
+        self.scheduled
+            .store(kind == ScanKind::Scheduled, Ordering::SeqCst);
         let (jobs, cfg, scanner, telemetry) = (
             Arc::clone(self),
             Arc::clone(cfg),
@@ -184,6 +215,7 @@ impl ScanJobs {
                 struct Idle(Arc<ScanJobs>);
                 impl Drop for Idle {
                     fn drop(&mut self) {
+                        self.0.scheduled.store(false, Ordering::SeqCst);
                         self.0.running.store(false, Ordering::SeqCst);
                     }
                 }
@@ -193,11 +225,36 @@ impl ScanJobs {
                 }
                 idle.0.run(kind, &cfg, &scanner, &telemetry);
             });
-        if let Err(e) = &spawned {
-            logger::warn(format!("cannot start the scan: {e}"));
-            self.running.store(false, Ordering::SeqCst);
+        match spawned {
+            Ok(handle) => {
+                *locked(&self.thread) = Some(handle);
+                true
+            }
+            Err(e) => {
+                logger::warn(format!("cannot start the scan: {e}"));
+                self.scheduled.store(false, Ordering::SeqCst);
+                self.running.store(false, Ordering::SeqCst);
+                false
+            }
         }
-        spawned.is_ok()
+    }
+
+    /// Waits for the scan thread (after `cancel`), so a service shutdown ends a scan cleanly.
+    pub fn join(&self) {
+        let handle = locked(&self.thread).take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_scheduled_outcome(&self, finished: bool) {
+        *locked(&self.outcome) = Some(finished);
+    }
+
+    /// Whether the last scheduled scan ran to the end; None if none ended since the last call.
+    pub fn take_scheduled_outcome(&self) -> Option<bool> {
+        locked(&self.outcome).take()
     }
 
     pub fn is_running(&self) -> bool {
@@ -219,7 +276,11 @@ impl ScanJobs {
         logger::info(format!("{kind:?} scan requested"));
         let started_at = Utc::now();
         let snapshot = |report: &QuickScanReport, dir: &Path, running: bool| ScanProgress {
-            kind,
+            kind: if kind == ScanKind::Scheduled {
+                ScanKind::Quick
+            } else {
+                kind
+            },
             running,
             started_at,
             updated_at: Utc::now(),
@@ -227,6 +288,7 @@ impl ScanJobs {
             files_scanned: report.files_scanned,
             findings: report.findings.len() as u64,
             current: dir.display().to_string(),
+            scheduled: kind == ScanKind::Scheduled,
         };
         let mut last_write: Option<Instant> = None;
         let report = engine::run_scan(cfg, scanner, telemetry, kind, &mut |report, dir| {
@@ -237,6 +299,9 @@ impl ScanJobs {
             !self.cancel.load(Ordering::SeqCst)
         });
         write_progress(cfg, &snapshot(&report, Path::new(""), false));
+        if kind == ScanKind::Scheduled {
+            *locked(&self.outcome) = Some(!report.cancelled);
+        }
     }
 }
 
@@ -265,7 +330,8 @@ fn drop_request(cfg: &AppConfig, name: &str) -> Result<(), String> {
 }
 
 pub fn request(cfg: &AppConfig, kind: ScanKind) -> Result<(), String> {
-    if read_progress(cfg).is_some_and(|p| p.is_live()) {
+    // A scheduled scan is not "busy": the service stops it for this request.
+    if read_progress(cfg).is_some_and(|p| p.is_live() && !p.scheduled) {
         return Err(BUSY.to_string());
     }
     drop_request(cfg, request_name(kind))
@@ -442,6 +508,7 @@ mod tests {
                 files_scanned: 1,
                 findings: 0,
                 current: "/Applications".to_string(),
+                scheduled: false,
             },
         );
         assert!(request(&cfg, ScanKind::Quick).is_err());
@@ -450,6 +517,123 @@ mod tests {
         stale.updated_at = Utc::now() - chrono::Duration::seconds(PROGRESS_STALE_SECS + 5);
         write_progress(&cfg, &stale);
         assert!(request(&cfg, ScanKind::Quick).is_ok());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_request_file_cannot_cancel_a_scheduled_scan_but_a_requested_scan_replaces_it() {
+        let (root, cfg) = sandbox("preempt");
+        let (jobs, shared, scanner, telemetry) = service(&cfg);
+        // As if the scheduled scan were running.
+        jobs.running.store(true, Ordering::SeqCst);
+        jobs.scheduled.store(true, Ordering::SeqCst);
+        request_cancel(&cfg).unwrap();
+        jobs.poll(&shared, &scanner, &telemetry);
+        assert!(
+            !jobs.cancel.load(Ordering::SeqCst),
+            "a cancel request is ignored"
+        );
+        assert!(
+            fs::read_dir(request_dir(&cfg)).unwrap().next().is_none(),
+            "and consumed"
+        );
+        // Not busy for the user: the request is accepted and stops the scheduled scan.
+        write_progress(
+            &cfg,
+            &ScanProgress {
+                kind: ScanKind::Quick,
+                running: true,
+                started_at: Utc::now(),
+                updated_at: Utc::now(),
+                files_examined: 1,
+                files_scanned: 0,
+                findings: 0,
+                current: String::new(),
+                scheduled: true,
+            },
+        );
+        request(&cfg, ScanKind::Full).unwrap();
+        jobs.poll(&shared, &scanner, &telemetry);
+        assert!(jobs.cancel.load(Ordering::SeqCst));
+        assert_eq!(*locked(&jobs.waiting), Some(ScanKind::Full));
+        // Once the scheduled scan has stopped, the user's scan runs.
+        jobs.running.store(false, Ordering::SeqCst);
+        jobs.scheduled.store(false, Ordering::SeqCst);
+        jobs.poll(&shared, &scanner, &telemetry);
+        wait_idle(&jobs);
+        let report = engine::read_scan_report(&cfg, ScanKind::Full).unwrap();
+        assert!(report.full && !report.cancelled);
+        // Between users' scans a cancel still works.
+        jobs.running.store(true, Ordering::SeqCst);
+        request_cancel(&cfg).unwrap();
+        jobs.poll(&shared, &scanner, &telemetry);
+        assert!(jobs.cancel.load(Ordering::SeqCst));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_previous_release_still_reads_the_progress_of_a_scheduled_scan() {
+        // The struct as shipped in v0.4.1 (`git show v0.4.1:crates/the-nex-core/src/scan_jobs.rs`).
+        #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldKind {
+            Quick,
+            Full,
+        }
+        #[allow(dead_code)]
+        #[derive(Debug, Deserialize)]
+        struct OldProgress {
+            kind: OldKind,
+            running: bool,
+            started_at: DateTime<Utc>,
+            updated_at: DateTime<Utc>,
+            files_examined: u64,
+            files_scanned: u64,
+            findings: u64,
+            current: String,
+        }
+        let (root, cfg) = sandbox("oldprogress");
+        let (jobs, _shared, scanner, telemetry) = service(&cfg);
+        let report = engine::run_scan(
+            &cfg,
+            &scanner,
+            &telemetry,
+            ScanKind::Scheduled,
+            &mut |r, d| {
+                write_progress(
+                    &cfg,
+                    &ScanProgress {
+                        kind: ScanKind::Quick,
+                        running: true,
+                        started_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        files_examined: r.files_examined,
+                        files_scanned: 0,
+                        findings: 0,
+                        current: d.display().to_string(),
+                        scheduled: true,
+                    },
+                );
+                true
+            },
+        );
+        assert_eq!(report.files_examined, 1);
+        // The real writer, through `run` itself.
+        jobs.run(ScanKind::Scheduled, &cfg, &scanner, &telemetry);
+        let json = fs::read(cfg.log_dir.join(SCAN_PROGRESS_FILE)).unwrap();
+        let old: OldProgress = serde_json::from_slice(&json).unwrap();
+        assert!(matches!(old.kind, OldKind::Quick) && !old.running);
+        assert!(read_progress(&cfg).unwrap().scheduled);
+        assert!(!matches!(old.kind, OldKind::Full));
+        // And a file from the previous release still reads here.
+        let mut value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        value.as_object_mut().unwrap().remove("scheduled");
+        assert!(
+            !serde_json::from_value::<ScanProgress>(value)
+                .unwrap()
+                .scheduled
+        );
+        assert_eq!(*locked(&jobs.outcome), Some(true));
         let _ = fs::remove_dir_all(&root);
     }
 }

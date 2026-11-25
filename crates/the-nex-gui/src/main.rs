@@ -466,7 +466,11 @@ fn count_threats(mut reader: impl BufRead, day_starts: &[i64]) -> io::Result<Thr
             continue;
         };
         let day = day_starts.partition_point(|&s| s <= event.timestamp.timestamp_millis());
-        if event.severity == Severity::Low || day == 0 {
+        // A scan's own summary is not a threat, and neither is a note (LOW).
+        if event.severity == Severity::Low
+            || day == 0
+            || summary::is_scan_summary(&event.threat_type)
+        {
             continue;
         }
         let counts = &mut chart.days[day - 1];
@@ -511,10 +515,8 @@ async fn toggle_engine(engine: String, enabled: bool) -> Result<RuntimeToggles, 
     blocking(move || {
         let engine = Engine::parse(&engine).ok_or_else(|| format!("unknown engine: {engine}"))?;
         let cfg = config();
-        let mut toggles = RuntimeToggles::load(&cfg.settings_file).map_err(|e| e.to_string())?;
-        toggles.set(engine, enabled);
-        match toggles.save(&cfg.settings_file) {
-            Ok(()) => Ok(toggles),
+        match RuntimeToggles::update(&cfg.settings_file, |t| t.set(engine, enabled)) {
+            Ok(toggles) => Ok(toggles),
             Err(e) if is_permission_error(&e) => {
                 let switch = format!("{}={}", engine.key(), if enabled { "on" } else { "off" });
                 elevated(&["--set", switch.as_str()])?;
@@ -1120,6 +1122,9 @@ mod tests {
             log += &line(starts[6] + 5, "KNOWN_MALWARE", Severity::Medium);
         }
         log += &line(starts[6] + 5, "KNOWN_MALWARE", Severity::Low);
+        // Scan summaries are not threats, even at High (a scan with findings).
+        log += &line(starts[6] + 6, "SCHEDULED_SCAN", Severity::High);
+        log += &line(starts[6] + 7, "FULL_SCAN", Severity::High);
         log += &line(starts[0] - 1, "ZIP_BOMB", Severity::High);
         log += &line(starts[0], "ZIP_BOMB", Severity::High);
         log += &line(starts[1] - 1, "ZIP_BOMB", Severity::Critical);

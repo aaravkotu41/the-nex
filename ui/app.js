@@ -961,7 +961,7 @@ async function loadSchedule() {
   try {
     renderSchedule(await call("get_scan_schedule"));
     const progress = await call("scan_progress").catch(() => null);
-    if (progress && progress.kind === "scheduled" && progress.running) {
+    if (progress && progress.scheduled && progress.running) {
       $("schedule-next").textContent = `A scheduled scan is running now: ${count(progress.files_examined)} files looked at so far.`;
     }
   } catch (error) {

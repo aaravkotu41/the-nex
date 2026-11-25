@@ -193,6 +193,13 @@ pub fn record_event(cfg: &AppConfig, event: ThreatEvent) {
         quiet: event.quiet || cfg.quiet_events,
         ..event
     };
+    if cfg.repeats.as_ref().is_some_and(|r| r.is_repeat(&event)) {
+        logger::info(format!(
+            "{} already reported by an earlier scheduled scan: {}",
+            event.threat_type, event.target
+        ));
+        return;
+    }
     let summary = format!(
         "{} [{}] target={} action={} details={}",
         event.threat_type,

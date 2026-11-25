@@ -39,6 +39,8 @@
       </array>
     </dict>
   </array>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>The Nex saves the summary report you ask for as a file in your Downloads folder. It does not read your other files there.</string>
   <key>NSHumanReadableCopyright</key>
   <string>The Nex endpoint protection</string>
 </dict>

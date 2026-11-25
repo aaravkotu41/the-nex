@@ -143,10 +143,16 @@ fn user_homes() -> Vec<PathBuf> {
 }
 
 fn home_folders(names: &[&str]) -> Vec<PathBuf> {
-    user_homes()
+    folders_in(&user_homes(), names)
+}
+
+/// Real folders only: a Downloads or Desktop that is a link (to anywhere, by anyone with write
+/// access to that home) is never scanned or watched, as root would follow it out of the home.
+fn folders_in(homes: &[PathBuf], names: &[&str]) -> Vec<PathBuf> {
+    homes
         .iter()
         .flat_map(|home| names.iter().map(move |name| home.join(name)))
-        .filter(|p| p.is_dir())
+        .filter(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
         .collect()
 }
 
@@ -729,6 +735,20 @@ pub fn run_elevated_with_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_linked_downloads_or_desktop_is_never_followed() {
+        let dir = env::temp_dir().join(format!("thenex-homes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let home = dir.join("alex");
+        let elsewhere = dir.join("elsewhere");
+        fs::create_dir_all(home.join("Desktop")).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join("Downloads")).unwrap();
+        let found = folders_in(&[home.clone()], &["Downloads", "Desktop"]);
+        assert_eq!(found, vec![home.join("Desktop")]);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn root_file_copy_is_fresh_and_has_no_acl() {

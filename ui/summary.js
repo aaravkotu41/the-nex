@@ -36,6 +36,7 @@
       scan.cancelled ? "stopped early" : "",
       scan.truncated ? "hit its file limit" : "",
       scan.unreadable ? `${scan.unreadable} folder${scan.unreadable === 1 ? "" : "s"} could not be opened` : "",
+      scan.cloud_skipped ? `${scan.cloud_skipped} cloud-only file${scan.cloud_skipped === 1 ? "" : "s"} skipped (reading them would download them)` : "",
     ].filter(Boolean);
     return `Last scheduled scan, ${when}: ${checked}, ${found}${notes.length ? `; ${notes.join("; ")}` : ""}.`;
   }

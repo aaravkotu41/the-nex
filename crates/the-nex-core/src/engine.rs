@@ -7,7 +7,7 @@ use crate::platform;
 use crate::process_guard;
 use crate::quarantine::{self, Severity, ThreatEvent};
 use crate::scan_jobs::{self, ScanJobs};
-use crate::schedule::Scheduler;
+use crate::schedule::{self, Scheduler};
 use crate::status::{self, ResourceUsage, Telemetry};
 use crate::zip_bomb;
 use chrono::Utc;
@@ -485,11 +485,16 @@ pub fn run_scan(
     // A full or scheduled scan only reports. The model wrongly flags about 1 clean program in 200, so moving
     // files across the whole disk on its word would break installed software. Its findings are
     // logged without a notification each; the summary event below is the one alert.
-    let report_only = AppConfig {
+    let mut report_only = AppConfig {
         dry_run: true,
         quiet_events: true,
         ..cfg.clone()
     };
+    let seen_file = cfg.base_dir.join(schedule::SEEN_FILE);
+    let seen = Arc::new(schedule::SeenFindings::load(&seen_file));
+    if kind == ScanKind::Scheduled {
+        report_only.repeats = Some(Arc::clone(&seen));
+    }
     let (scan_cfg, roots, limits, event) = match kind {
         ScanKind::Quick => (cfg, quick_scan_roots(cfg), &QUICK_LIMITS, "QUICK_SCAN"),
         ScanKind::Full => (
@@ -508,20 +513,27 @@ pub fn run_scan(
     let mut report = scan_tree(scan_cfg, scanner, &roots, telemetry, limits, on_dir);
     report.full = kind == ScanKind::Full;
     report.finished_at = Utc::now().to_rfc3339();
-    quarantine::record_event(
-        cfg,
-        ThreatEvent::new(
+    let scheduled = kind == ScanKind::Scheduled;
+    if scheduled {
+        seen.save(&seen_file, !report.cancelled);
+    }
+    let mut summary = ThreatEvent::new(
             event,
             if report.findings.is_empty() {
                 Severity::Low
             } else {
                 Severity::High
             },
-            roots
-                .iter()
-                .map(|r| r.display().to_string())
-                .collect::<Vec<_>>()
-                .join("; "),
+            // A scheduled scan's alert names no folder or file: it is shown on the lock screen.
+            if scheduled {
+                "Scheduled scan".to_string()
+            } else {
+                roots
+                    .iter()
+                    .map(|r| r.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            },
             format!("{} threat(s) found", report.findings.len()),
             format!(
                 "{}examined={} scanned={} truncated={} cancelled={} unreadable_folders={} cloud_skipped={} duration_ms={}",
@@ -538,8 +550,10 @@ pub fn run_scan(
                 report.cloud_skipped,
                 report.duration_ms
             ),
-        ),
     );
+    // A clean scheduled scan is recorded without a notification; with findings it is the one.
+    summary.quiet = scheduled && report.findings.is_empty();
+    quarantine::record_event(cfg, summary);
     if let Ok(json) = serde_json::to_vec_pretty(&report) {
         // Staged and renamed so a client polling for the report never reads half of it.
         let path = cfg.log_dir.join(kind.report_file());
@@ -923,7 +937,10 @@ pub fn run(mut cfg: AppConfig, shutdown: Arc<AtomicBool>) {
     }
 
     logger::info("The Nex stopping");
+    // A scan in progress stops at the next file and is waited for, so shutdown (or an update)
+    // never cuts one off mid-write; a scheduled one is simply retried later.
     jobs.cancel();
+    jobs.join();
     drop(watcher);
     drop(scan_tx);
     drop(canary_tx);

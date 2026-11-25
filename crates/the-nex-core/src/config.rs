@@ -68,7 +68,8 @@ Options:
   --quarantine-dir <PATH>   use PATH for quarantined files and their .meta.json records
   --log-file <PATH>         write threat events (JSON lines) to PATH
   --hash-list <PATH>        use PATH as the known-malware list (testing; only with --console,
-                            --quick-scan or --full-scan, never the installed service)
+                            --quick-scan, --full-scan, --check-file or --list-startup, never
+                            the installed service)
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -420,6 +421,18 @@ impl RuntimeToggles {
         let body = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
         write_atomic(path, &body)
     }
+
+    /// Load, change and save under one lock: the app's switches and the schedule are changed
+    /// by separate commands, and an unlocked read-modify-write would lose one of two changes
+    /// made at the same moment. (Within this process; the elevated `--set` is a one-off.)
+    pub fn update(path: &Path, change: impl FnOnce(&mut Self)) -> io::Result<Self> {
+        static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut toggles = Self::load(path)?;
+        change(&mut toggles);
+        toggles.save(path)?;
+        Ok(toggles)
+    }
 }
 
 /// Writes `body` to a staging file and renames it over `path`, so a reader never sees half of it.
@@ -592,6 +605,9 @@ pub struct AppConfig {
     pub hash_list: Option<PathBuf>,
     /// Empty until `load_known_bad` runs.
     pub known_bad: Arc<KnownBad>,
+    /// Set for a scheduled scan only: findings an earlier scheduled scan already reported (and
+    /// that are unchanged) are not logged again as new threat events.
+    pub repeats: Option<Arc<schedule::SeenFindings>>,
 }
 
 impl AppConfig {
@@ -619,6 +635,7 @@ impl AppConfig {
             max_ai_scan_bytes: MAX_AI_SCAN_BYTES,
             hash_list: None,
             known_bad: Arc::new(KnownBad::empty()),
+            repeats: None,
         }
     }
 
@@ -1176,6 +1193,47 @@ mod tests {
         fs::write(&path, b"{ not json").unwrap();
         assert!(RuntimeToggles::load(&path).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_updates_keep_every_change_and_the_help_names_every_mode() {
+        let dir = std::env::temp_dir().join(format!("thenex-upd-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        RuntimeToggles::update(&path, |t| {
+                            if i % 2 == 0 {
+                                t.scan_schedule = ScanSchedule::Weekly;
+                            } else {
+                                t.set(Engine::Canary, false);
+                            }
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let t = RuntimeToggles::load(&path).unwrap();
+        assert!(t.scan_schedule == ScanSchedule::Weekly && !t.canary_enabled);
+        let _ = fs::remove_dir_all(&dir);
+        // --hash-list is accepted with these modes (see the check in `parse`), so say so.
+        for mode in [
+            "--check-file",
+            "--list-startup",
+            "--full-scan",
+            "--quick-scan",
+        ] {
+            assert!(USAGE.contains(mode));
+        }
+        let line = USAGE.split("--hash-list").nth(1).unwrap();
+        assert!(line.contains("--check-file") && line.contains("--list-startup"));
     }
 
     #[test]

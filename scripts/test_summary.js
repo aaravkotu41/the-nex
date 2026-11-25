@@ -30,4 +30,8 @@ assert.strictEqual(S.lastScanText({ last_scan: scan }, fmt), "Last scheduled sca
 const worse = S.lastScanText({ last_scan: { ...scan, files_examined: 2500, findings: 2, unreadable: 1, cancelled: true } }, fmt);
 assert.ok(worse.includes("2500 files looked at, 2 flagged (nothing was moved or deleted); stopped early; 1 folder could not be opened."), worse);
 assert.ok(!/undefined|NaN|null/.test(worse));
+const cloud = S.lastScanText({ last_scan: { ...scan, cloud_skipped: 3 } }, fmt);
+assert.ok(cloud.endsWith("nothing suspicious found; 3 cloud-only files skipped (reading them would download them)."), cloud);
+assert.ok(S.lastScanText({ last_scan: { ...scan, cloud_skipped: 1 } }, fmt).includes("1 cloud-only file skipped"));
+assert.ok(!S.lastScanText({ last_scan: { ...scan, cloud_skipped: 0 } }, fmt).includes("cloud"));
 console.log("scheduled scan wording tests passed");
