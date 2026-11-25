@@ -69,3 +69,12 @@ a.btn:hover, button.btn:enabled:hover { background: var(--mint); color: #0E0F0E;
   .list div { grid-template-columns: 1fr; }
   .dl { padding: 28px 20px; border-radius: 20px; }
 }
+.field { margin-bottom: 20px; }
+.field label { display: block; font-weight: 600; margin-bottom: 6px; }
+.field input, .field select, .field textarea { width: 100%; min-height: 48px; padding: 10px 14px; border: 1px solid var(--muted); border-radius: 12px; background: var(--card); color: var(--ink); font: inherit; }
+.field textarea { resize: vertical; }
+.hint { margin: 6px 0 0; color: var(--muted); font-size: 0.9rem; }
+.trap { position: absolute; left: -9999px; }
+.form-status { min-height: 1.6em; font-weight: 600; }
+.form-status.bad { color: #B3261E; }
+@media (prefers-color-scheme: dark) { .form-status.bad { color: #FFB4AB; } }

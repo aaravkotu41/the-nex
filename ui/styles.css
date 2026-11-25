@@ -393,6 +393,7 @@ h1, h2, h3 { margin: 0; }
 .detail-grid { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 8px 16px; margin: 0; font-size: 13px; }
 .detail-grid dt { color: var(--muted); font-family: var(--sans); }
 .detail-grid dd { display: flex; align-items: center; gap: 10px; margin: 0; min-width: 0; word-break: break-all; }
+.detail-actions { grid-column: 1 / -1; }
 .detail-note { grid-column: 1 / -1; margin: 6px 0 0; padding: 10px 12px; border-radius: 10px; background: var(--surface); font-family: var(--sans); color: var(--muted); }
 .activity-table thead th:nth-child(1) { width: 13%; }
 .activity-table thead th:nth-child(2) { width: 17%; }

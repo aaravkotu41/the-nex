@@ -631,6 +631,44 @@ async fn open_camera_settings() -> Result<(), String> {
     Err("Open your system camera settings and allow The Nex.".to_string())
 }
 
+/// The website's report form for one kind of problem. Only these fixed addresses can be opened:
+/// the page never chooses the URL.
+fn report_url(kind: &str) -> Option<String> {
+    ["bug", "false_alarm", "missed", "other"]
+        .contains(&kind)
+        .then(|| {
+            format!(
+                "https://the-nex.vercel.app/report?kind={kind}&v={}",
+                env!("CARGO_PKG_VERSION")
+            )
+        })
+}
+
+/// Opens the report form in the default browser. The app itself sends nothing.
+#[tauri::command]
+async fn open_report_page(kind: String) -> Result<(), String> {
+    let url = report_url(&kind).ok_or("Unknown kind of report")?;
+    blocking(move || {
+        #[cfg(target_os = "macos")]
+        let mut command = std::process::Command::new("/usr/bin/open");
+        // By full path, so a rundll32.exe planted next to the app is never the one that runs.
+        #[cfg(not(target_os = "macos"))]
+        let mut command = {
+            let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+            let mut command =
+                std::process::Command::new(Path::new(&root).join("System32").join("rundll32.exe"));
+            command.arg("url.dll,FileProtocolHandler");
+            command
+        };
+        command
+            .arg(&url)
+            .status()
+            .map(|_| ())
+            .map_err(|e| format!("cannot open the browser: {e}"))
+    })
+    .await
+}
+
 /// The embedded AegisMesh console (ui/aegismesh) calls this through the parent window.
 /// Every operation is a local, in-memory simulation in aegismesh-core.
 #[tauri::command]
@@ -668,6 +706,7 @@ fn main() {
             aegismesh,
             camera_access,
             open_camera_settings,
+            open_report_page,
             start_full_scan,
             scan_progress,
             cancel_scan,
@@ -684,6 +723,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_fixed_report_pages_can_be_opened() {
+        let url = report_url("false_alarm").unwrap();
+        assert!(url.starts_with("https://the-nex.vercel.app/report?kind=false_alarm&v="));
+        for bad in ["", "bug&x=1", "https://evil.example", "../x", "BUG"] {
+            assert_eq!(report_url(bad), None, "{bad}");
+        }
+    }
 
     fn event(kind: &str, severity: Severity, target: &str) -> ThreatEvent {
         ThreatEvent::new(kind, severity, target, "QUARANTINED id=abc", "ratio 1028:1")

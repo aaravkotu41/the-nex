@@ -201,6 +201,29 @@ function copyButton(text, label = "Copy") {
   return button;
 }
 
+/** Copies an item's details (file name only, account name removed) and opens the website's
+ *  report form in the browser. The app itself sends nothing. */
+function reportButton(item) {
+  const button = el("button", {
+    className: "btn btn-small", text: "Report as safe",
+    title: "Copies these details, without the file's folder or your account name, and opens the report form in your browser",
+    attrs: { type: "button" },
+  });
+  button.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    const d = state.dashboard;
+    const text = NexReport.reportText(item, { version: d && d.daemon.version, platform: d && d.platform });
+    try {
+      await navigator.clipboard.writeText(text);
+      notice("Details copied. Paste them into the report form that is opening in your browser.", false);
+    } catch {
+      notice("The details could not be copied; the report form is still opening.", true);
+    }
+    call("open_report_page", { kind: "false_alarm" }).catch((error) => notice(errorText(error), true));
+  });
+  return el("div", { className: "detail-actions" }, [button]);
+}
+
 function detailGrid(entries, note) {
   const grid = el("dl", { className: "detail-grid" });
   for (const [term, value, copy] of entries) {
@@ -357,6 +380,7 @@ function activityRows(event) {
     ["Action taken", event.action_taken],
     ["Event ID", event.id, event.id],
   ], TYPE_NOTES[event.threat_type]);
+  detail.append(reportButton(event));
   return expandable(cells, detail, open, () => {
     state.openEvent = open ? null : event.id;
     loadEvents().catch(() => {});
@@ -741,6 +765,7 @@ function quarantineRows(q) {
     ["Stored as", q.quarantined_path],
     ["Quarantine ID", q.id],
   ], `${TYPE_NOTES[q.threat_type] ? `${TYPE_NOTES[q.threat_type]} ` : ""}The file is locked away and cannot run. Restore puts it back where it was found; Delete removes it for good.`);
+  detail.append(reportButton({ ...q, target: q.original_path, timestamp: q.quarantined_at }));
   return expandable(cells, detail, open, () => {
     state.openQuarantine = open ? null : q.id;
     renderQuarantine();
@@ -1229,6 +1254,9 @@ function wire() {
     const intact = canaries.filter((c) => c.state === "Intact").length;
     notice(`${intact} of ${canaries.length} canary files intact.`, intact !== canaries.length);
   }));
+  $("report-problem").addEventListener("click", () => {
+    call("open_report_page", { kind: "bug" }).catch((error) => notice(errorText(error), true));
+  });
   $("install-service").addEventListener("click", () => busy("install-service", "Installing…", async () => {
     notice(await call("install_service"), false);
   }));
