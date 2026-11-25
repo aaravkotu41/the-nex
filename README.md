@@ -69,8 +69,9 @@ Quarantine item also copies that item's details for pasting into the form: type,
 reasons, the file's name and hash, never the folder it was in, with the account name removed
 from any other path (`ui/report.js`, tested by `node scripts/test_report.js`). The form
 (`web/report.html`) stores what is typed in a Supabase table that anyone can add to and only
-the project owner can read (`scripts/supabase_reports.sql`), capped at 10 reports a day per
-address and 500 a day in total. Not included yet: the 14 feature numbers behind an AI verdict,
+the project owner can read (`scripts/supabase_reports.sql`), capped at 10 reports in 24 hours per
+address and 500 in total. The cap keeps a keyed code of the sender's address, apart from the
+reports, and an hourly job deletes codes older than 24 hours. Not included yet: the 14 feature numbers behind an AI verdict,
 which events do not record.
 
 ## Known-malware list

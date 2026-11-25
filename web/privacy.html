@@ -30,7 +30,7 @@
     <h2>This website</h2>
     <ul>
       <li>No cookies, no localStorage, no analytics, and no third-party requests, except when you send a problem report (below). Nothing is stored on your device, so there is no consent banner.</li>
-      <li>The <a href="report.html">report form</a> sends what you type to Supabase (a hosted service) when you press Send, and not before: the kind of problem, your description, any details you pasted, an email if you gave one, and the app version if the app opened the page. Supabase also sees your IP address. A one-way fingerprint of your IP address and the date is stored with the report to limit spam to 10 reports a day. Only the project owner can read reports.</li>
+      <li>The <a href="report.html">report form</a> sends what you type to Supabase (a hosted service) when you press Send, and not before: the kind of problem, your description, any details you pasted, an email if you gave one, and the app version if the app opened the page. Supabase also sees your IP address. To limit spam to 10 reports a day, a code made from your IP address with a secret key is kept apart from the report and deleted after about a day. Until then the project owner could link it to your address. Only the project owner can read reports, which stay stored until the owner deletes them.</li>
       <li>The site is hosted on Vercel. Vercel receives your IP address and standard request logs when you load a page.</li>
       <li>Email confirmation links put a token in the address after the # sign. The page reads it in your browser only to choose a message, then removes it from the address bar. It is never stored and never sent anywhere.</li>
     </ul>
