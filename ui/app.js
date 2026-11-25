@@ -449,16 +449,16 @@ function focusEngine(engine) {
 function buildEngineRows() {
   const rows = $("engine-rows");
   const engines = [
-    ["known_bad", "Known Malware List", "Matches files and programs against a list of known malware hashes."],
-    ["zip_bomb", "Zip Bomb Guard", "Central-directory inspection before extraction: ratio, size, overlap and nesting."],
-    ["bin_ai", "ONNX Binary AI", "Scores new PE and Mach-O files and processes with the local tract model."],
-    ["process_guard", "LotL Process Guard", "Terminates script hosts and shells launched with download or obfuscation patterns."],
-    ["canary", "Canary Honeypots", "Decoy documents that reveal ransomware the moment they change."],
+    ["known_bad", "Known threats check", "Checks each file against a list of programs already known to be malware. A match is certain, not a guess.", "Known-malware hash list (SHA-256)"],
+    ["zip_bomb", "Compressed file check", "Looks inside zip files before they open, to stop ones built to crash your computer or fill your disk.", "Zip bomb guard: ratio, size, overlap and nesting"],
+    ["bin_ai", "New program check (AI)", "A small AI on your device spots new programs that look like malware. It can be wrong, so it only stops a program when it is very sure.", "ONNX binary AI: scores new PE and Mach-O files"],
+    ["process_guard", "Sneaky command guard", "Stops attackers from using your computer's own tools (like PowerShell) to secretly download and run harmful things.", "LotL process guard: script hosts and shells with download or obfuscation patterns"],
+    ["canary", "Ransomware tripwire", "Hides decoy files. If something starts changing them, it is probably ransomware, and The Nex reacts.", "Canary honeypots: decoy documents"],
   ];
-  for (const [engine, title, description] of engines) {
+  for (const [engine, title, description, technical] of engines) {
     const thresholds = el("div", { className: "thresholds", attrs: { "data-thresholds": engine } });
     rows.append(el("div", { className: "row", attrs: { "data-engine-row": engine } }, [
-      el("div", {}, [el("h3", { text: title }), el("p", { className: "muted", text: description }), thresholds]),
+      el("div", {}, [el("h3", { text: title }), el("p", { className: "muted", text: description }), el("p", { className: "muted small", text: `Technical name: ${technical}` }), thresholds]),
       el("button", { className: "switch", attrs: { role: "switch", "aria-checked": "false", "data-engine": engine, "aria-label": title } }),
     ]));
   }
@@ -524,15 +524,15 @@ function renderDashboard(d) {
 
   const t = d.thresholds;
   const kb = d.known_bad || {};
-  $("card-known").textContent = kb.loaded ? `${count(kb.entries)} hashes · list of ${String(kb.created).slice(0, 10)}` : "no list installed";
-  $("card-zip").textContent = `Ratio >${t.max_ratio}:1 · Depth ≤${t.max_depth} · Pre-extraction`;
+  $("card-known").textContent = kb.loaded ? `${count(kb.entries)} known threats · list of ${String(kb.created).slice(0, 10)}` : "No threat list installed yet";
+  $("card-zip").textContent = "Checks zip files before they open";
   let model;
-  if (d.model_loaded) model = "thenex_model.onnx · Offline · Local tract";
-  else if (d.model_present) model = "thenex_model.onnx · Loads with the service";
-  else model = "Model missing · Heuristic fallback";
+  if (d.model_loaded) model = "Runs on your device, offline";
+  else if (d.model_present) model = "Starts with the background service";
+  else model = "AI file missing, using a simpler backup check";
   $("card-ai").textContent = model;
-  $("card-lotl").textContent = `${count(d.processes_watched)} processes watched · Shell & Script Shield`;
-  $("card-canary").textContent = `${d.canaries_intact} decoy file${d.canaries_intact === 1 ? "" : "s"} intact · Desktop & Docs`;
+  $("card-lotl").textContent = `${count(d.processes_watched)} program${d.processes_watched === 1 ? "" : "s"} being watched`;
+  $("card-canary").textContent = `${d.canaries_intact} decoy file${d.canaries_intact === 1 ? "" : "s"} in place`;
   renderToggles(d.toggles, true);
 
   fillThresholds("known_bad", kb.loaded ? [`${count(kb.entries)} hashes`, `list of ${String(kb.created).slice(0, 10)}`] : ["no list installed"]);

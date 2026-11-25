@@ -55,9 +55,9 @@ async function ask(q, over) {
 (async () => {
   console.log("intents");
   let r = await ask("Am I protected?");
-  check("protected: reads dashboard", r.call.calls.join() === "get_dashboard_state" && /Mostly/.test(text(r.reply)) && /Process guard/.test(text(r.reply)) && /3 of 3 intact/.test(text(r.reply)));
+  check("protected: reads dashboard", r.call.calls.join() === "get_dashboard_state" && /Mostly/.test(text(r.reply)) && /Sneaky command guard/.test(text(r.reply)) && /3 of 3 intact/.test(text(r.reply)));
   r = await ask("am i protected", { get_dashboard_state: { ...DASH, toggles: { ...DASH.toggles, known_bad_enabled: false } } });
-  check("protected: names the Known malware list when it is off", /Known malware list/.test(text(r.reply)) && /4 of 5 on|3 of 5 on/.test(text(r.reply)));
+  check("protected: names the Known threats check when it is off", /Known threats check/.test(text(r.reply)) && /4 of 5 on|3 of 5 on/.test(text(r.reply)));
   r = await ask("am i protected", { get_dashboard_state: { ...DASH, dry_run: true } });
   check("protected: dry run is called out", /Dry run/.test(text(r.reply)));
   r = await ask("is it safe?", { get_dashboard_state: { daemon: { online: false } } });

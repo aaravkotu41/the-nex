@@ -39,11 +39,11 @@
     [/ransomware/, ["RANSOMWARE_CANARY", "RANSOMWARE_SUSPECT"]],
   ];
   const ENGINES = [
-    ["known_bad_enabled", "Known malware list"],
-    ["zip_bomb_enabled", "Zip bomb guard"],
-    ["bin_ai_enabled", "AI file scan"],
-    ["process_guard_enabled", "Process guard"],
-    ["canary_enabled", "Canary honeypots"],
+    ["known_bad_enabled", "Known threats check"],
+    ["zip_bomb_enabled", "Compressed file check"],
+    ["bin_ai_enabled", "New program check (AI)"],
+    ["process_guard_enabled", "Sneaky command guard"],
+    ["canary_enabled", "Ransomware tripwire"],
   ];
 
   const CONTROL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/g;
