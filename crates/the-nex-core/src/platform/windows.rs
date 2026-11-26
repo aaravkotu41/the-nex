@@ -67,6 +67,7 @@ const CTRL_CLOSE_EVENT: u32 = 2;
 const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: i32 = 1063;
 const ERROR_SERVICE_EXISTS: i32 = 1073;
+const ERROR_SERVICE_ALREADY_RUNNING: i32 = 1056;
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
 const SID_SYSTEM: &str = "*S-1-5-18";
@@ -912,17 +913,99 @@ fn stop_session_processes(arg: &str) -> usize {
         .count()
 }
 
+/// Where the service's program must be: the data folder, which only administrators can change.
+/// None when `source` is already there (the installer runs it from there).
+fn engine_destination(source: &Path, base: &Path) -> Option<PathBuf> {
+    let folder = source.parent()?;
+    (path_key(folder) != path_key(base)).then(|| base.join(SELF_EXE_NAME))
+}
+
+/// The files that run beside the engine, copied from `from` into `to` when they are there.
+const ENGINE_COMPANIONS: &[&str] = &[
+    "the-nex-gui.exe",
+    config::MODEL_FILE_NAME,
+    crate::known_bad::FILE_NAME,
+    "icon.ico",
+];
+
+/// Copies this program (and what runs beside it) into the protected data folder and returns
+/// the copy, which is what the service then runs as SYSTEM. Run from anywhere else, such as a
+/// build folder, any program of the user's could replace the file and run as SYSTEM.
+fn place_engine(source: &Path, base: &Path, notes: &mut Vec<String>) -> Result<PathBuf, String> {
+    let Some(target) = engine_destination(source, base) else {
+        return Ok(source.to_path_buf());
+    };
+    // The tray and notifier run this program from there and would keep the file open.
+    stop_session_processes(NOTIFIER_ARG);
+    stop_session_processes(TRAY_ARG);
+    let copy = |from: &Path, to: &Path| {
+        if fs::symlink_metadata(to).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!(
+                "{} is a link; refusing to write through it",
+                to.display()
+            ));
+        }
+        fs::copy(from, to)
+            .map(|_| ())
+            .map_err(|e| format!("cannot copy {} to {}: {e}", from.display(), to.display()))
+    };
+    copy(source, &target)?;
+    let from = source.parent().unwrap_or(base);
+    for name in ENGINE_COMPANIONS {
+        if from.join(name).is_file() {
+            if let Err(e) = copy(&from.join(name), &base.join(name)) {
+                notes.push(e);
+            }
+        }
+    }
+    notes.push(format!("copied the engine to {}", target.display()));
+    Ok(target)
+}
+
+/// Asks a running service to stop and waits for it, up to `SERVICE_STOP_TIMEOUT`.
+fn stop_and_wait(service: &windows_service::service::Service) {
+    if service
+        .query_status()
+        .is_ok_and(|s| s.current_state == ServiceState::Stopped)
+    {
+        return;
+    }
+    let _ = service.stop();
+    let started = Instant::now();
+    while started.elapsed() < SERVICE_STOP_TIMEOUT {
+        match service.query_status() {
+            Ok(s) if s.current_state == ServiceState::Stopped => break,
+            Ok(_) => thread::sleep(Duration::from_millis(250)),
+            Err(_) => break,
+        }
+    }
+}
+
 pub fn install_service(fresh_data: bool) -> Result<String, String> {
-    let exe = env::current_exe().map_err(|e| format!("cannot resolve executable path: {e}"))?;
+    let source = env::current_exe().map_err(|e| format!("cannot resolve executable path: {e}"))?;
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )
     .map_err(|e| service_error("cannot open the Service Control Manager", e))?;
+    let mut notes = Vec::new();
+    // A running service holds its program open; it is started again below.
+    if let Ok(running) = manager.open_service(
+        config::SERVICE_NAME,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
+    ) {
+        stop_and_wait(&running);
+    }
+    // The folder is made safe first, so nothing can be planted between the copy and the start.
+    let base = config::default_base_dir();
+    notes.extend(harden_data_dirs(
+        &AppConfig::for_base_dir(&base),
+        fresh_data,
+    ));
+    let exe = place_engine(&source, &base, &mut notes)?;
 
     let info = service_info(exe.clone());
     let access = ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
-    let mut notes = Vec::new();
     let service = match manager.create_service(&info, access) {
         Ok(service) => {
             notes.push(format!("service '{}' registered", config::SERVICE_NAME));
@@ -960,10 +1043,17 @@ pub fn install_service(fresh_data: bool) -> Result<String, String> {
         .set_failure_actions_on_non_crash_failures(true)
         .map_err(|e| service_error("cannot enable failure actions", e))?;
 
-    notes.extend(harden_data_dirs(
-        &AppConfig::for_base_dir(&config::default_base_dir()),
-        fresh_data,
-    ));
+    // Registered is not running: without this the service waits for the next restart.
+    match service.start::<&OsStr>(&[]) {
+        Ok(()) => notes.push(format!("service '{}' started", config::SERVICE_NAME)),
+        Err(e) if win32_code(&e) == Some(ERROR_SERVICE_ALREADY_RUNNING) => {}
+        Err(e) => {
+            return Err(service_error(
+                "service installed but could not be started",
+                e,
+            ))
+        }
+    }
     register_autostart(RUN_KEY, RUN_VALUE, &exe, NOTIFIER_ARG)
         .map_err(|e| format!("service installed but notifier autostart failed: {e}"))?;
     notes.push(format!(
@@ -985,19 +1075,7 @@ pub fn uninstall_service() -> Result<String, String> {
     let access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
     match manager.open_service(config::SERVICE_NAME, access) {
         Ok(service) => {
-            if let Ok(status) = service.query_status() {
-                if status.current_state != ServiceState::Stopped {
-                    let _ = service.stop();
-                    let started = Instant::now();
-                    while started.elapsed() < SERVICE_STOP_TIMEOUT {
-                        match service.query_status() {
-                            Ok(s) if s.current_state == ServiceState::Stopped => break,
-                            Ok(_) => thread::sleep(Duration::from_millis(250)),
-                            Err(_) => break,
-                        }
-                    }
-                }
-            }
+            stop_and_wait(&service);
             service
                 .delete()
                 .map_err(|e| service_error("cannot delete service", e))?;
@@ -1642,6 +1720,19 @@ mod tests {
             "\"C:\\dir with space\\\\\""
         );
         assert_eq!(quote_arg(""), "\"\"");
+    }
+
+    #[test]
+    fn the_service_runs_a_copy_in_the_protected_folder() {
+        let base = Path::new(r"C:\ProgramData\TheNex");
+        let built = Path::new(r"C:\Users\kim\the-nex\target\release\the-nex.exe");
+        assert_eq!(
+            engine_destination(built, base),
+            Some(base.join("the-nex.exe"))
+        );
+        // The installer runs it from there already; the case of the letters does not matter.
+        let installed = Path::new(r"c:\programdata\thenex\the-nex.exe");
+        assert_eq!(engine_destination(installed, base), None);
     }
 
     #[test]

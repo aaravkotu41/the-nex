@@ -33,6 +33,8 @@ Before any change: 267 Rust tests passed, 0 failed, 4 ignored.
 | 12 | The scheduled scan's report was not recognised as the engine's own file | reading the code, then a failing test | added to the list | `every_report_the_engine_writes_is_its_own_output` |
 | 13 | The build needs Rust 1.96, which nothing said (25 dependency errors on 1.89) | the first build | `rust-version` in `Cargo.toml` | - |
 | 14 | Another file of the same size and modified time could take the place of a judged file, and an always-allowed decision then covered it (Windows CI failed on this already) | CI of the main branch, then a failing test | the stamp on Windows is the file's volume, index and change time | `a_same_size_file_with_a_forged_time_is_still_another_file` |
+| 15 | Install in the app registered the service but never started it ("installed but not responding", Windows exit code 1077) | this PC | install starts it | live, after approval |
+| 16 | Install in the app made the SYSTEM service run the program from wherever the app was, such as a build folder any program of the user's could change | this PC | install copies the program into the protected data folder and registers that copy | `the_service_runs_a_copy_in_the_protected_folder` |
 
 Decisions worth knowing:
 
