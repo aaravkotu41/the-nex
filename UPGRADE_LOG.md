@@ -42,6 +42,29 @@ Decisions worth knowing:
   `Invoke-Expression` no longer ends the process. The startup list still treats them as suspicious.
 - **1:** remembered through the event log, so until that rotates (50 MB).
 
+## Independent review
+
+One reviewer read the diff without being told the conclusions. Acted on:
+
+- **The relaxed command-line rules went too far.** A hidden window running a script from Temp,
+  Downloads, AppData, Desktop or Public, or `iex` on a file's content, is stopped again.
+- **A program can make its own cloud placeholders** (this pass did so as a standard user to test
+  bug 4). Scans now skip only placeholder files, never a folder, so a folder of them cannot hide
+  what is in it.
+- **`was_restored` parsed the whole log on every detection.** It now parses only lines that
+  mention a restore, and also reads the rotated log.
+- **Waiting for a scan was kept alive by any scan**, including the scheduled one. It now waits
+  only while the kind of scan asked for is running, and its test has a real margin.
+- **Paths of 248 characters or more** keep their `\\?\` form.
+
+Left as is, with the reason:
+
+- Any local user can keep a request file open, so others' requests are ignored until the service
+  restarts. This was already true on macOS, where scans already went through the request folder.
+  The design note at the top of `scan_jobs.rs` already says requests have no per-user checks.
+- `cargo clippy -D warnings` fails on one `chunks_exact` in `platform/windows.rs`. That code was
+  already there, and CI does not run clippy.
+
 ## Measured on this PC
 
 | What | Result |
