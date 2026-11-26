@@ -430,6 +430,56 @@ pub fn vouched_file(process: &sysinfo::Process) -> Option<PathBuf> {
     program_file(process)
 }
 
+/// (volume, file index, size, modified, changed) of the file at `path`, read without following a
+/// link. Another file under the name has another index, and rewriting this one moves its change
+/// time, which unlike the modified time is not set by ordinary tools.
+pub fn file_stamp(path: &Path) -> Option<crate::bin_ai::FileStamp> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let wide = to_wide(path.as_os_str());
+    // SAFETY: `wide` is NUL-terminated; both out structures are plain data of the size given,
+    // and the handle is closed exactly once.
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        let mut basic: FILE_BASIC_INFO = std::mem::zeroed();
+        let read = GetFileInformationByHandle(handle, &mut info) != 0
+            && GetFileInformationByHandleEx(
+                handle,
+                FileBasicInfo,
+                (&mut basic as *mut FILE_BASIC_INFO).cast(),
+                size_of::<FILE_BASIC_INFO>() as u32,
+            ) != 0;
+        CloseHandle(handle);
+        let join = |high: u32, low: u32| (u64::from(high) << 32) | u64::from(low);
+        read.then(|| {
+            (
+                u64::from(info.dwVolumeSerialNumber),
+                join(info.nFileIndexHigh, info.nFileIndexLow),
+                join(info.nFileSizeHigh, info.nFileSizeLow),
+                i128::from(basic.LastWriteTime),
+                i128::from(basic.ChangeTime),
+            )
+        })
+    }
+}
+
 /// shortcut: always false, so a Microsoft-signed file outside the Windows folders is not
 /// spared by a known-malware match (the Windows folders themselves are alert-only by path,
 /// see ai_policy). Upgrade by checking the signer's chain for the Microsoft root once a

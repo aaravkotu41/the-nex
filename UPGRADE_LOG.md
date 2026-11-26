@@ -32,6 +32,7 @@ Before any change: 267 Rust tests passed, 0 failed, 4 ignored.
 | 11 | A backtick (`` i`ex ``) hid a PowerShell pattern | writing the test for 5 | backticks are ignored like quotes and carets | `a_weak_sign_with_another_or_with_something_fetched_or_decoded_is_stopped` |
 | 12 | The scheduled scan's report was not recognised as the engine's own file | reading the code, then a failing test | added to the list | `every_report_the_engine_writes_is_its_own_output` |
 | 13 | The build needs Rust 1.96, which nothing said (25 dependency errors on 1.89) | the first build | `rust-version` in `Cargo.toml` | - |
+| 14 | Another file of the same size and modified time could take the place of a judged file, and an always-allowed decision then covered it (Windows CI failed on this already) | CI of the main branch, then a failing test | the stamp on Windows is the file's volume, index and change time | `a_same_size_file_with_a_forged_time_is_still_another_file` |
 
 Decisions worth knowing:
 
@@ -69,7 +70,7 @@ Left as is, with the reason:
 
 | What | Result |
 |---|---|
-| Rust tests | 279 passed, 0 failed, 4 ignored |
+| Rust tests | 280 passed, 0 failed, 4 ignored |
 | Node tests | 9 of 9 files |
 | Live checks (`scripts/verify_thenex.py`) | 13 of 13 run; check 7 (process kill) skipped, see below |
 | AegisMesh checks | 22 of 22 |
