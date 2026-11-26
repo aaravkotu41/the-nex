@@ -74,10 +74,14 @@ pub(crate) fn file_identity(path: &std::path::Path) -> Option<(u64, u64)> {
 }
 
 /// Windows answers `\\?\C:\x`; people and the event log know it as `C:\x`. A name that only the
-/// long form reaches (a trailing dot or space) keeps it.
+/// long form reaches (a trailing dot or space), or a path too long for older tools, keeps it.
 pub(crate) fn plain_path(path: std::path::PathBuf) -> std::path::PathBuf {
     match path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
-        Some(plain) if plain.as_bytes().get(1) == Some(&b':') && !odd_spelling(plain, true) => {
+        Some(plain)
+            if plain.as_bytes().get(1) == Some(&b':')
+                && plain.len() < 248
+                && !odd_spelling(plain, true) =>
+        {
             PathBuf::from(plain)
         }
         _ => path,

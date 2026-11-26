@@ -254,24 +254,35 @@ pub fn record_restore(cfg: &AppConfig, meta: &QuarantineMeta, how: &str) {
 /// The file at `path` is, byte for byte, one a person put back there. An estimate must not take
 /// it away again the moment it lands; a match in the known-malware list still may. The answer
 /// comes from the engine's own log, which other programs cannot write.
-/// shortcut: forgotten once the log rotates (50 MB), give it its own list if that ever matters.
+/// shortcut: forgotten once the log has rotated twice (2 x 50 MB); give it its own list then.
 pub fn was_restored(cfg: &AppConfig, path: &Path, digest: Option<Digest32>) -> bool {
-    let Ok(events) = read_recent_events(&cfg.events_log, MAX_EVENTS_BYTES) else {
-        return false;
-    };
     let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let keys = [platform::path_key(path), platform::path_key(&real)];
-    let hashes: Vec<&str> = events
-        .iter()
-        .filter(|e| e.threat_type == RESTORE_EVENT)
-        .filter(|e| keys.contains(&platform::path_key(Path::new(&e.target))))
-        .filter_map(|e| e.sha256.as_deref())
-        .collect();
+    let mut hashes: Vec<String> = Vec::new();
+    for log in [rotated_events_path(&cfg.events_log), cfg.events_log.clone()] {
+        let Ok(bytes) = fs::read(&log) else {
+            continue;
+        };
+        // Only the few lines that can be a restore are parsed.
+        let restores = bytes
+            .split(|b| *b == b'\n')
+            .filter(|line| {
+                line.windows(RESTORE_EVENT.len())
+                    .any(|w| w == RESTORE_EVENT.as_bytes())
+            })
+            .filter_map(|line| serde_json::from_slice::<ThreatEvent>(line).ok());
+        hashes.extend(
+            restores
+                .filter(|e| e.threat_type == RESTORE_EVENT)
+                .filter(|e| keys.contains(&platform::path_key(Path::new(&e.target))))
+                .filter_map(|e| e.sha256),
+        );
+    }
     if hashes.is_empty() {
         return false;
     }
     let found = digest.map_or_else(|| sha256_file(path).ok(), |d| Some(to_hex(&d)));
-    found.is_some_and(|found| hashes.contains(&found.as_str()))
+    found.is_some_and(|found| hashes.contains(&found))
 }
 
 /// Where the full log is moved to (`events.jsonl` becomes `events.jsonl.1`).

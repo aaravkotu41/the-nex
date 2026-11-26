@@ -445,7 +445,9 @@ pub fn scan_tree(
             if kind.is_symlink() || should_ignore(cfg, &path) {
                 continue;
             }
-            if entry.metadata().is_ok_and(|m| is_cloud_placeholder(&m)) {
+            // Files only: a program can make its own placeholders, and a folder of them would
+            // otherwise hide everything in it.
+            if kind.is_file() && entry.metadata().is_ok_and(|m| is_cloud_placeholder(&m)) {
                 report.cloud_skipped += 1;
                 continue;
             }

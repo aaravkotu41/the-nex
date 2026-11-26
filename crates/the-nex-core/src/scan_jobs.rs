@@ -89,8 +89,8 @@ pub fn read_progress(cfg: &AppConfig) -> Option<ScanProgress> {
 
 // ---- service side ------------------------------------------------------------------------
 
-/// Creates the request folder: anyone may add a file, nobody but the service may list or
-/// remove one. Also clears progress left behind by a previous run.
+/// Creates the request folder: anyone may add a file, nobody but the service may remove one
+/// (on Windows users can also list it). Also clears progress left behind by a previous run.
 pub fn prepare(cfg: &AppConfig) -> io::Result<()> {
     let _ = fs::remove_file(cfg.log_dir.join(SCAN_PROGRESS_FILE));
     let dir = request_dir(cfg);
@@ -383,7 +383,8 @@ pub fn request_and_wait(
     let mut deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         thread::sleep(POLL_STEP);
-        if read_progress(cfg).is_some_and(|p| p.is_live()) {
+        // Only the scan asked for: another one running says nothing about this request.
+        if read_progress(cfg).is_some_and(|p| p.is_live() && p.kind == kind && !p.scheduled) {
             deadline = Instant::now() + timeout;
         }
         match engine::read_scan_report(cfg, kind) {
@@ -441,12 +442,14 @@ mod tests {
     fn a_long_scan_is_waited_for_while_it_moves() {
         let (root, cfg) = sandbox("long");
         let (client, step) = (cfg.clone(), Duration::from_millis(300));
-        let waiting = thread::spawn(move || request_and_wait(&client, ScanKind::Quick, step));
+        let waiting = thread::spawn(move || {
+            request_and_wait(&client, ScanKind::Quick, Duration::from_secs(1))
+        });
         let asked = request_dir(&cfg).join(request_name(ScanKind::Quick));
         while !asked.exists() {
             thread::sleep(Duration::from_millis(5));
         }
-        for _ in 0..5 {
+        for _ in 0..8 {
             write_progress(
                 &cfg,
                 &ScanProgress {
@@ -471,7 +474,7 @@ mod tests {
         fs::write(path, serde_json::to_vec(&report).unwrap()).unwrap();
         assert!(
             waiting.join().unwrap().is_ok(),
-            "five times the wait for an answer"
+            "over twice the wait for an answer"
         );
 
         fs::remove_file(cfg.log_dir.join(SCAN_PROGRESS_FILE)).unwrap();
