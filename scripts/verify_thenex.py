@@ -432,6 +432,59 @@ def check_always_allow(daemon):
         f"disallow={removed.returncode} requarantined={bool(requarantined)} hash_in_event={recorded} {added.stderr.strip()[:120]}")
 
 
+def check_moved_folder(daemon):
+    """A folder with a decoy zip bomb deep inside is moved in whole; the bomb is found."""
+    daemon.start()
+    time.sleep(1.5)
+    folder = STAGING / "moved"
+    (folder / "deep").mkdir(parents=True)
+    (folder / "deep" / "moved_bomb.zip").write_bytes(ratio_bomb(50))
+    os.replace(folder, WATCH / "moved")
+    inside = WATCH / "moved" / "deep" / "moved_bomb.zip"
+    found = wait_until(lambda: not inside.exists() and find_event("ZIP_BOMB", "moved_bomb.zip", "QUARANTINED"), ACTION_TIMEOUT)
+    daemon.stop()
+    shutil.rmtree(WATCH / "moved", ignore_errors=True)
+    return bool(found), "the bomb inside was quarantined" if found else f"still there: {inside.exists()}"
+
+
+def check_never_scan(daemon):
+    """A decoy zip bomb and a listed decoy in a never-scan folder are left alone by the live watch
+    and a quick scan, the same decoys beside it are quarantined, and after --scan-again a new one
+    in that folder is quarantined too."""
+    bomb = ratio_bomb(50)
+    private = WATCH / "Private"
+    private.mkdir(exist_ok=True)
+    daemon.start()
+    time.sleep(1.5)
+    added = nex("--never-scan", str(private.resolve()))
+    listed = nex("--list-never-scan").stdout
+    time.sleep(1.5)  # the engine reads a changed list within a second
+    kept = [private / "kept_bomb.zip", private / "kept_decoy.docm"]
+    kept[0].write_bytes(bomb)
+    kept[1].write_bytes(DECOY)
+    beside = drop("beside_bomb.zip", bomb)
+    flagged = wait_until(lambda: not beside.exists() and find_event("ZIP_BOMB", "beside_bomb.zip", "QUARANTINED"), ACTION_TIMEOUT)
+    time.sleep(1.0)
+    scan = nex("--quick-scan", "--watch-dir", str(WATCH), "--hash-list", str(HASH_LIST))
+    left_alone = all(p.exists() for p in kept) and not any(
+        find_event(kind, p.name) for p in kept for kind in ("ZIP_BOMB", "KNOWN_MALWARE"))
+    removed = nex("--scan-again", str(private.resolve()))
+    time.sleep(1.5)
+    again = private / "again_bomb.zip"
+    again.write_bytes(bomb)
+    requarantined = wait_until(lambda: not again.exists() and find_event("ZIP_BOMB", "again_bomb.zip", "QUARANTINED"), ACTION_TIMEOUT)
+    whole = nex("--never-scan", str(Path(ROOT.anchor)))
+    daemon.stop()
+    shutil.rmtree(private, ignore_errors=True)
+    ok = (added.returncode == 0 and "Private" in listed and bool(flagged) and left_alone
+          and removed.returncode == 0 and bool(requarantined) and whole.returncode != 0
+          and nex("--list-never-scan").stdout.strip() == "[]")
+    return ok, "listed folder untouched, the same decoy beside it quarantined, checked again after --scan-again" if ok else (
+        f"add={added.returncode} listed={'Private' in listed} flagged_beside={bool(flagged)} left_alone={left_alone} "
+        f"scan={scan.returncode} again={removed.returncode} requarantined={bool(requarantined)} "
+        f"whole_disk={whole.returncode} {added.stderr.strip()[:160]}")
+
+
 def check_scheduled_scan(daemon):
     """A due scheduled scan reports a decoy bomb and a listed decoy, moves nothing, logs one
     summary and is not repeated; the state file records the attempt and the finished run. The sandbox state file (an old last run and a one-second quiet
@@ -630,6 +683,8 @@ def main():
         ("Live dry-run mode", lambda: check_dry_run(daemon)),
         ("Live file check (read-only)", check_file_report),
         ("Live always-allowed file", lambda: check_always_allow(daemon)),
+        ("Live moved-in folder", lambda: check_moved_folder(daemon)),
+        ("Live never-scan folder", lambda: check_never_scan(daemon)),
         ("Live scheduled scan (report only)", lambda: check_scheduled_scan(daemon)),
         ("Live startup listing (read-only)", startup_listing),
     ]

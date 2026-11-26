@@ -2,7 +2,7 @@ use crate::allowlist;
 use crate::config::{AppConfig, ZipLimits};
 use crate::quarantine::{self, Severity, ThreatEvent};
 use std::fs::{self, File};
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,6 +39,8 @@ const SAMPLE_BUDGET: u64 = 64 * 1024 * 1024;
 const NESTED_BUDGET: u64 = 256 * 1024 * 1024;
 /// Past this the optional decompression work stops and the scan fails open.
 const TIME_BUDGET: Duration = Duration::from_secs(10);
+/// For the zip library to find a directory our own parser could not.
+const OPEN_BUDGET: Duration = Duration::from_secs(2);
 const NESTED_EXTENSIONS: &[&str] = &["zip", "jar", "war", "apk", "xpi"];
 /// A Java program bundles its libraries as jars, which bundle theirs: that many levels more than
 /// the limit, as long as the deepest ones are jars. Size and ratio are checked all the way down.
@@ -105,13 +107,44 @@ fn open_regular(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
-/// True once the size is unchanged across two consecutive 150 ms checks and the file opens.
+/// Neither written nor changed for this long (a change time cannot be set back on Unix).
+fn quiet_for(meta: &fs::Metadata, time: Duration) -> bool {
+    let modified = meta.modified().ok();
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt;
+        let since_epoch = Duration::new(
+            u64::try_from(meta.ctime()).unwrap_or(0),
+            u32::try_from(meta.ctime_nsec()).unwrap_or(0),
+        );
+        Some(std::time::UNIX_EPOCH + since_epoch)
+    };
+    #[cfg(not(unix))]
+    let changed = modified;
+    [modified, changed]
+        .iter()
+        .all(|t| t.is_some_and(|t| t.elapsed().is_ok_and(|age| age >= time)))
+}
+
+/// True once the size is unchanged across two consecutive 150 ms checks and the file opens; at
+/// once for a file nobody has touched for that long.
 pub fn wait_for_file_ready(path: &Path) -> bool {
     if is_ignored_extension(path) {
         return false;
     }
     let mut previous = match fs::symlink_metadata(path) {
-        Ok(m) if m.is_file() => m.len(),
+        Ok(m) if m.is_file() => {
+            // Nothing wrote it lately: no need to hold up the files behind it. A later write
+            // queues it again.
+            // Not on Windows: there a file's times may lag until its writer closes it.
+            if cfg!(unix)
+                && quiet_for(&m, READY_POLL * READY_STABLE_CHECKS)
+                && open_regular(path).is_ok()
+            {
+                return true;
+            }
+            m.len()
+        }
         _ => return false,
     };
     let mut stable = 0;
@@ -606,6 +639,36 @@ fn read_up_to(mut reader: impl Read, cap: u64) -> u64 {
     total
 }
 
+/// Fails once the time is up. The zip library looks for a directory without any limit of its own:
+/// a small file of repeated end records keeps it busy for minutes.
+struct Timed<R> {
+    inner: R,
+    deadline: Instant,
+}
+
+impl<R> Timed<R> {
+    fn check(&self) -> io::Result<()> {
+        if Instant::now() > self.deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "out of time"));
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for Timed<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.check()?;
+        self.inner.read(buf)
+    }
+}
+
+impl<R: Seek> Seek for Timed<R> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        self.check()?;
+        self.inner.seek(to)
+    }
+}
+
 fn inspect_level<R: Read + Seek>(
     mut reader: R,
     depth: u32,
@@ -628,15 +691,28 @@ fn inspect_level<R: Read + Seek>(
             });
         }
         Raw::Recs(recs) => recs,
-        Raw::Unparsable { eocd } => match ZipArchive::new(&mut reader).is_ok() {
-            true => {
+        Raw::Unparsable { eocd } => {
+            let deadline = scan.deadline.min(Instant::now() + OPEN_BUDGET);
+            let opens = ZipArchive::new(Timed {
+                inner: &mut reader,
+                deadline,
+            })
+            .is_ok();
+            // Not found in time is not the same as not there.
+            let timed_out = !opens && Instant::now() > deadline;
+            scan.incomplete |= timed_out;
+            if opens {
                 // Reopened because the failure branch below needs `reader` back.
-                let mut a = ZipArchive::new(&mut reader).ok()?;
+                let mut a = ZipArchive::new(Timed {
+                    inner: &mut reader,
+                    deadline: scan.deadline,
+                })
+                .map_err(|_| scan.incomplete = true)
+                .ok()?;
                 let recs = crate_recs(&mut a);
                 archive = Some(a);
                 recs
-            }
-            false => {
+            } else {
                 // Streaming extractors ignore the directory, so judge what the headers say.
                 let (recs, truncated) = lfh_walk(&mut reader, len, scan.deadline, LFH_MAX_ENTRIES);
                 if truncated {
@@ -652,7 +728,7 @@ fn inspect_level<R: Read + Seek>(
                     });
                 }
                 if recs.is_empty() {
-                    return eocd.then(|| ZipThreat {
+                    return (eocd && !timed_out).then(|| ZipThreat {
                         kind: ZipThreatKind::Malformed,
                         depth,
                         entries: 0,
@@ -664,7 +740,7 @@ fn inspect_level<R: Read + Seek>(
                 }
                 recs
             }
-        },
+        }
     };
     let entries = recs.len();
     let max_depth = limits.max_depth + if jar { JAR_EXTRA_DEPTH } else { 0 };
@@ -789,7 +865,10 @@ fn inspect_level<R: Read + Seek>(
     }
     let mut archive = match archive {
         Some(a) => a,
-        None => match ZipArchive::new(&mut reader) {
+        None => match ZipArchive::new(Timed {
+            inner: &mut reader,
+            deadline: scan.deadline,
+        }) {
             Ok(a) => a,
             Err(_) => {
                 scan.incomplete = true;
@@ -1156,6 +1235,44 @@ mod tests {
             ),
         ]);
         assert_eq!(inspect_zip_bytes(&bytes, &ZipLimits::default()), None);
+    }
+
+    /// Found by an audit: the zip library searched this one for minutes.
+    #[test]
+    fn a_file_of_repeated_end_records_is_given_up_on_in_time() {
+        // One entry, no directory behind it: not a zip, again and again.
+        let mut end = b"PK\x05\x06".to_vec();
+        end.extend([0, 0, 0, 0, 1, 0, 1, 0, 46, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let bytes = end.repeat(4 * 1024 * 1024 / end.len());
+        let started = Instant::now();
+        let (threat, incomplete) = inspect_root(
+            Cursor::new(&bytes[..]),
+            bytes.len() as u64,
+            &ZipLimits::default(),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            threat.is_none() && incomplete,
+            "{threat:?} {incomplete} {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_file_nobody_touches_is_ready_at_once_and_a_fresh_one_is_waited_for() {
+        let path = std::env::temp_dir().join(format!("thenex-ready-{}.zip", std::process::id()));
+        fs::write(&path, b"PK").unwrap();
+        let started = Instant::now();
+        assert!(wait_for_file_ready(&path));
+        assert!(started.elapsed() >= READY_POLL * READY_STABLE_CHECKS);
+        let started = Instant::now();
+        assert!(wait_for_file_ready(&path));
+        assert!(!cfg!(unix) || started.elapsed() < READY_POLL);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

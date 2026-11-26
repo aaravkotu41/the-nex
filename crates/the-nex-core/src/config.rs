@@ -1,6 +1,7 @@
 use crate::allowlist::{self, LiveAllowed};
 use crate::known_bad::{self, Digest32, KnownBad};
 use crate::schedule::{self, ScanSchedule};
+use crate::skiplist::{self, LiveSkipped};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -62,6 +63,10 @@ Modes:
   --expect <SHA256>         with --allow-event or --allow-quarantined: refuse unless the recorded
                             SHA-256 is exactly this (the app passes the one it asked about)
   --list-allowed            print the always-allowed list as JSON
+  --never-scan <FOLDER>     never open, move or delete what is in this folder; give its full path
+                            (needs administrator rights); --never-scan-file <FILE> for one file
+  --scan-again <PATH>       take a folder or file off the never-scan list
+  --list-never-scan         print the never-scan list as JSON
   --help                    show this help
 
 Options:
@@ -152,6 +157,10 @@ pub enum Mode {
     Disallow(String),
     AllowQuarantined(String),
     ListAllowed,
+    /// The place, and whether it must be a folder.
+    NeverScan(PathBuf, bool),
+    ScanAgain(PathBuf),
+    ListNeverScan,
     Help,
 }
 
@@ -171,6 +180,8 @@ pub struct CliArgs {
     pub allow_type: Option<String>,
     /// `--allow-event` and `--allow-quarantined` only: how the recorded SHA-256 must start.
     pub expect: Option<String>,
+    /// `--install` only: the data folder was not ours before, whoever owns it now.
+    pub fresh_data: bool,
 }
 
 /// A path argument exactly as given: no trim and no lossy conversion, so a file whose name ends
@@ -208,6 +219,7 @@ where
     let mut allow_name: Option<String> = None;
     let mut allow_type: Option<String> = None;
     let mut expect: Option<String> = None;
+    let mut fresh_data = false;
     let mut iter = args.into_iter();
 
     while let Some(raw) = iter.next() {
@@ -250,6 +262,13 @@ where
                 "--allow-quarantined",
             )?)),
             "--list-allowed" => Some(Mode::ListAllowed),
+            "--never-scan" => Some(Mode::NeverScan(take_path(&mut iter, "--never-scan")?, true)),
+            "--never-scan-file" => Some(Mode::NeverScan(
+                take_path(&mut iter, "--never-scan-file")?,
+                false,
+            )),
+            "--scan-again" => Some(Mode::ScanAgain(take_path(&mut iter, "--scan-again")?)),
+            "--list-never-scan" => Some(Mode::ListNeverScan),
             "--allow-name" => {
                 let name = take_value(&mut iter, "--allow-name")?;
                 allowlist::check_name(&name)?;
@@ -282,6 +301,10 @@ where
                         .ok_or_else(|| format!("expected on or off, got {state}"))?;
                     Some(Mode::Set(engine, enabled))
                 }
+            }
+            "--fresh-data" => {
+                fresh_data = true;
+                None
             }
             "--dry-run" => {
                 dry_run = true;
@@ -353,6 +376,9 @@ where
     if expect.is_some() && !matches!(mode, Mode::AllowEvent(_) | Mode::AllowQuarantined(_)) {
         return Err("--expect is only valid with --allow-event or --allow-quarantined".into());
     }
+    if fresh_data && mode != Mode::Install {
+        return Err("--fresh-data is only valid with --install".into());
+    }
     if path_overrides && matches!(mode, Mode::Install | Mode::Uninstall | Mode::Help) {
         return Err("--quarantine-dir and --log-file cannot be combined with that mode".into());
     }
@@ -367,6 +393,7 @@ where
         allow_name,
         allow_type,
         expect,
+        fresh_data,
     })
 }
 
@@ -639,6 +666,9 @@ pub struct AppConfig {
     /// Files the AI and zip-bomb engines must leave alone (see `allowlist`).
     pub allowed_file: PathBuf,
     pub allowed: Arc<LiveAllowed>,
+    /// Folders and files that are never opened, moved or deleted (see `skiplist`).
+    pub skipped_file: PathBuf,
+    pub skipped: Arc<LiveSkipped>,
     pub status_file: PathBuf,
     pub model_path: PathBuf,
     /// Forced dry run from the command line (settings.json can also enable it).
@@ -666,6 +696,7 @@ impl AppConfig {
         let log_dir = base_dir.join(LOG_DIR_NAME);
         let settings_file = base_dir.join(SETTINGS_FILE_NAME);
         let allowed_file = base_dir.join(allowlist::FILE_NAME);
+        let skipped_file = base_dir.join(skiplist::FILE_NAME);
         Self {
             base_dir: base_dir.to_path_buf(),
             quarantine_dir: base_dir.join(QUARANTINE_DIR_NAME),
@@ -676,6 +707,8 @@ impl AppConfig {
             settings_file,
             allowed: Arc::new(LiveAllowed::new(allowed_file.clone())),
             allowed_file,
+            skipped: Arc::new(LiveSkipped::new(skipped_file.clone())),
+            skipped_file,
             model_path: resolve_model_path(base_dir),
             dry_run: false,
             watch_dir: None,
@@ -775,6 +808,11 @@ impl AppConfig {
         self.allowed.refresh();
         self.allowed.contains(&crate::quarantine::to_hex(digest))
             && !self.known_bad.contains(digest)
+    }
+
+    /// True when the owner said never to scan this path (see `skiplist`).
+    pub fn is_skipped(&self, path: &Path) -> bool {
+        self.skipped.covers(path)
     }
 
     /// True when files should be looked up in the known-malware list.
@@ -1032,6 +1070,22 @@ mod tests {
         );
         assert_eq!(parse(&["--list-allowed"]).unwrap().mode, Mode::ListAllowed);
         assert_eq!(
+            parse(&["--never-scan", "/Users/me/a b "]).unwrap().mode,
+            Mode::NeverScan("/Users/me/a b ".into(), true)
+        );
+        assert_eq!(
+            parse(&["--never-scan-file", "/Users/me/a"]).unwrap().mode,
+            Mode::NeverScan("/Users/me/a".into(), false)
+        );
+        assert_eq!(
+            parse(&["--scan-again", "/Users/me/x"]).unwrap().mode,
+            Mode::ScanAgain("/Users/me/x".into())
+        );
+        assert_eq!(
+            parse(&["--list-never-scan"]).unwrap().mode,
+            Mode::ListNeverScan
+        );
+        assert_eq!(
             parse(&["--allow-event", "20260101-1-0001"]).unwrap().mode,
             Mode::AllowEvent("20260101-1-0001".to_string())
         );
@@ -1054,6 +1108,11 @@ mod tests {
             vec!["--allow", &sha[1..]],
             vec!["--allow"],
             vec!["--disallow", "zz"],
+            vec!["--never-scan"],
+            vec!["--fresh-data"],
+            vec!["--console", "--fresh-data"],
+            vec!["--never-scan", "--dry-run"],
+            vec!["--never-scan", "/Users/me/x", "--scan-again", "/Users/me/x"],
             vec!["--allow", &sha, "--allow-type", "KNOWN_MALWARE"],
             vec!["--allow", &sha, "--allow-type", "LOTL_SCRIPT"],
             vec!["--allow", &sha, "--allow-name", "bad\u{7}name"],

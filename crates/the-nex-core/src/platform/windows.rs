@@ -129,6 +129,11 @@ pub fn path_key(path: &Path) -> String {
     key
 }
 
+/// Not told cheaply here: every process is read each time.
+pub fn process_versions() -> Option<std::collections::HashMap<u32, (u64, i32)>> {
+    None
+}
+
 pub fn path_is_within(path: &Path, root: &Path) -> bool {
     if super::has_parent_dir(path) {
         return false;
@@ -753,10 +758,11 @@ fn restart_action(delay_secs: u64) -> ServiceAction {
 // deleted; the engine then starts from defaults (everything on, nothing allowed). A folder an
 // earlier install hardened is owned by Administrators, so uninstalling and installing again keeps
 // the person's own settings and list. Unverified on Windows (type-checked only).
-fn harden_data_dirs(cfg: &AppConfig) -> Vec<String> {
+/// `fresh`: the installer, which takes the ownership first, found that it was not.
+fn harden_data_dirs(cfg: &AppConfig, fresh: bool) -> Vec<String> {
     let pre_existing = cfg.base_dir.exists();
     // Looked at before the ownership below is taken.
-    let ours = pre_existing && owned_by_admins(&cfg.base_dir);
+    let ours = pre_existing && !fresh && owned_by_admins(&cfg.base_dir);
     let mut notes = restrict_data_dirs(cfg);
     if pre_existing && !ours {
         notes.extend(super::set_aside_planted(cfg));
@@ -888,7 +894,7 @@ fn stop_session_processes(arg: &str) -> usize {
         .count()
 }
 
-pub fn install_service() -> Result<String, String> {
+pub fn install_service(fresh_data: bool) -> Result<String, String> {
     let exe = env::current_exe().map_err(|e| format!("cannot resolve executable path: {e}"))?;
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -936,9 +942,10 @@ pub fn install_service() -> Result<String, String> {
         .set_failure_actions_on_non_crash_failures(true)
         .map_err(|e| service_error("cannot enable failure actions", e))?;
 
-    notes.extend(harden_data_dirs(&AppConfig::for_base_dir(
-        &config::default_base_dir(),
-    )));
+    notes.extend(harden_data_dirs(
+        &AppConfig::for_base_dir(&config::default_base_dir()),
+        fresh_data,
+    ));
     register_autostart(RUN_KEY, RUN_VALUE, &exe, NOTIFIER_ARG)
         .map_err(|e| format!("service installed but notifier autostart failed: {e}"))?;
     notes.push(format!(
@@ -997,7 +1004,10 @@ pub fn uninstall_service() -> Result<String, String> {
     if stopped > 0 {
         notes.push(format!("stopped {stopped} notifier/tray process(es)"));
     }
-    let removed = canary::remove_canaries(&discover_canary_dirs());
+    let removed = canary::remove_canaries(
+        &AppConfig::for_base_dir(&config::default_base_dir()),
+        &discover_canary_dirs(),
+    );
     notes.push(format!("removed {removed} canary file(s)"));
     Ok(notes.join("\n"))
 }

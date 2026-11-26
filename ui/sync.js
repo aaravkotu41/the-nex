@@ -245,7 +245,7 @@
   // ---- DOM wiring (skipped in tests) ----
   if (typeof document === "undefined") return;
 
-  const COMMAND_LABEL = { quick_scan: "Quick scan", verify_canaries: "Canary check" };
+  const COMMAND_LABEL = { quick_scan: "Quick scan", verify_canaries: "Decoy check" };
   function el(tag, cls, text) {
     const n = document.createElement(tag);
     if (cls) n.className = cls;
@@ -406,8 +406,5 @@
     render(focusKey);
   }
   setInterval(() => refreshList(), POLL_MS);
-  document.addEventListener("click", (e) => {
-    const item = e.target.closest && e.target.closest('.nav-item[data-page="devices"]');
-    if (item) setTimeout(refreshList, 0);
-  });
+  document.addEventListener("nex-devices", () => refreshList()); // app.js shows the page
 })();

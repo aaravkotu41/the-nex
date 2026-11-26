@@ -103,6 +103,28 @@ Section "The Nex" SecMain
 
   ; A user may have pre-created %ProgramData%\TheNex: take ownership for Administrators and drop
   ; its ACLs before anything runs as SYSTEM from here (failures are ignored if it is absent).
+  ; Whose it was has to be asked first: a folder that was neither ours nor an administrator's may
+  ; hold made-up settings, which the engine then moves aside (--fresh-data). Not knowing counts as
+  ; not ours, except over an installed copy.
+  StrCpy $2 ""
+  ReadRegStr $1 HKLM "${UNINSTKEY}" "UninstallString"
+  ReadRegStr $3 HKLM "Software\TheNex" "FreshData"
+  ${If} $3 != ""
+    ; An earlier try found that out and did not finish: the folder is an administrator's by now.
+    StrCpy $2 " --fresh-data"
+  ${ElseIf} $1 == ""
+  ${AndIf} ${FileExists} "$INSTDIR"
+    nsExec::ExecToLog `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "if ([int][IO.File]::GetAttributes('$INSTDIR') -band 1024) { exit 8 }; if ([IO.Directory]::GetAccessControl('$INSTDIR').GetOwner([Security.Principal.SecurityIdentifier]).Value -in 'S-1-5-32-544','S-1-5-18') { exit 0 }; exit 7"`
+    Pop $0
+    ${If} $0 == 8
+      MessageBox MB_ICONSTOP "$INSTDIR leads to another folder, so nothing was installed. Remove it and try again." /SD IDOK
+      SetErrorLevel 2
+      Abort
+    ${ElseIf} $0 != 0
+      StrCpy $2 " --fresh-data"
+      WriteRegStr HKLM "Software\TheNex" "FreshData" "1"
+    ${EndIf}
+  ${EndIf}
   CreateDirectory "$INSTDIR"
   nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C'
   Pop $0
@@ -121,13 +143,15 @@ Section "The Nex" SecMain
   WriteUninstaller "$INSTDIR\${UNINSTALLER}"
 
   DetailPrint "Registering the background service..."
-  nsExec::ExecToLog '"$INSTDIR\the-nex.exe" --install'
+  nsExec::ExecToLog '"$INSTDIR\the-nex.exe" --install$2'
   Pop $0
   ${If} $0 != 0
     MessageBox MB_ICONSTOP "Registering The Nex service failed (exit code $0). See the details list for the reason." /SD IDOK
     SetErrorLevel 2
     Abort
   ${EndIf}
+  DeleteRegValue HKLM "Software\TheNex" "FreshData"
+  DeleteRegKey /ifempty HKLM "Software\TheNex"
 
   DetailPrint "Starting the background service..."
   nsExec::ExecToLog '"$SYSDIR\sc.exe" start ${SERVICE}'

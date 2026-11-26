@@ -29,6 +29,13 @@ const MAX_REASONS: usize = 8;
 const TOTAL_LIMIT: Duration = Duration::from_secs(120);
 
 static BUSY: AtomicBool = AtomicBool::new(false);
+/// On the Settings page a drop names a place never to scan: it must not be opened to check it.
+static NEVER_SCAN: AtomicBool = AtomicBool::new(false);
+
+#[tauri::command]
+pub fn drop_is_never_scan(on: bool) {
+    NEVER_SCAN.store(on, Ordering::SeqCst);
+}
 
 /// Clears [`BUSY`] when dropped, so a panic cannot leave every later drop refused.
 struct ClearBusy;
@@ -207,7 +214,7 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
     let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event else {
         return;
     };
-    if window.label() != "main" || paths.is_empty() {
+    if window.label() != "main" || paths.is_empty() || NEVER_SCAN.load(Ordering::SeqCst) {
         return;
     }
     let window = window.clone();

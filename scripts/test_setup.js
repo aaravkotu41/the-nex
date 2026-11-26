@@ -79,7 +79,7 @@ m = S.checklist({ ...good(), toggles: { ...good().toggles, known_bad_enabled: fa
 assert.strictEqual(m.allSet, true);
 m = S.checklist({ ...good(), known_bad: { loaded: true, entries: 5 }, toggles: { ...good().toggles, known_bad_enabled: false } });
 assert.strictEqual(m.allSet, false);
-assert.match(row(m, "protection").text, /Known threats check/);
+assert.match(row(m, "protection").text, /Known malware/);
 // Toggles not reported: cannot say protection is on.
 m = S.checklist({ ...good(), toggles: undefined });
 assert.strictEqual(row(m, "protection").state, "unknown");
@@ -100,7 +100,7 @@ m = S.checklist({ ...good(), model_loaded: undefined });
 assert.strictEqual(row(m, "protection").state, "unknown");
 assert.strictEqual(m.allSet, false);
 m = S.checklist({ ...good(), model_loaded: false, toggles: { ...good().toggles, bin_ai_enabled: false } });
-assert.match(row(m, "protection").text, /Switched off: New program check \(AI\)/);
+assert.match(row(m, "protection").text, /Switched off: New programs/);
 assert.match(row(S.checklist(good()), "protection").text, /every check that can run is on/);
 
 // Odd input does not throw.

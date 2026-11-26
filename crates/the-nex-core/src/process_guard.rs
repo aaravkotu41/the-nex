@@ -18,6 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+/// Where only changed processes are read, everything is read again this often all the same.
+const FULL_REFRESH: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
 const EXIT_WAIT_ROUNDS: u32 = 15;
 const EXIT_WAIT_STEP: Duration = Duration::from_millis(200);
@@ -250,7 +252,6 @@ fn refresh_kind() -> ProcessRefreshKind {
     ProcessRefreshKind::nothing()
         .with_cmd(UpdateKind::OnlyIfNotSet)
         .with_exe(UpdateKind::OnlyIfNotSet)
-        .with_disk_usage()
 }
 
 fn process_name(process: &Process) -> String {
@@ -346,6 +347,9 @@ pub struct ProcessGuard {
     /// The Nex itself and the chain that launched it (shell, terminal, service manager).
     ancestors: HashSet<Pid>,
     primed: bool,
+    /// What the kernel said of every process last time (see `platform::process_versions`).
+    versions: HashMap<u32, (u64, i32)>,
+    last_full: Option<Instant>,
 }
 
 impl ProcessGuard {
@@ -366,6 +370,8 @@ impl ProcessGuard {
             pending_ai: VecDeque::new(),
             ancestors: HashSet::new(),
             primed: false,
+            versions: HashMap::new(),
+            last_full: None,
         }
     }
 
@@ -379,6 +385,70 @@ impl ProcessGuard {
             current = self.sys.process(pid).and_then(|p| p.parent());
         }
         out
+    }
+
+    /// Reads what is running and returns the processes that are new or run another program now.
+    /// Only the ones the kernel says have changed are read again, and all of them now and then.
+    fn refresh(&mut self) -> Vec<Pid> {
+        let versions = platform::process_versions();
+        let full = self.last_full.is_none_or(|t| t.elapsed() >= FULL_REFRESH);
+        let mut fresh = Vec::new();
+        match versions {
+            Some(versions) if self.primed && !self.versions.is_empty() => {
+                fresh = self.refresh_changed(versions);
+                if !full {
+                    return fresh;
+                }
+            }
+            versions => self.versions = versions.unwrap_or_default(),
+        }
+        self.last_full = Some(Instant::now());
+        self.sys
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
+        fresh.extend(self.fresh_processes());
+        fresh
+    }
+
+    fn refresh_changed(&mut self, versions: HashMap<u32, (u64, i32)>) -> Vec<Pid> {
+        let changed: Vec<Pid> = versions
+            .iter()
+            .filter(|(pid, version)| self.versions.get(pid) != Some(version))
+            .map(|(pid, _)| Pid::from_u32(*pid))
+            .collect();
+        let ended = self
+            .versions
+            .keys()
+            .filter(|pid| !versions.contains_key(pid))
+            .map(|pid| Pid::from_u32(*pid));
+        let touched: Vec<Pid> = changed.iter().copied().chain(ended).collect();
+        self.versions = versions;
+        if touched.is_empty() {
+            return Vec::new();
+        }
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&touched),
+            true,
+            refresh_kind()
+                .with_cmd(UpdateKind::Always)
+                .with_exe(UpdateKind::Always),
+        );
+        // Also one that started the same program again with other instructions.
+        changed
+            .into_iter()
+            .filter(|pid| {
+                let Some(process) = self.sys.process(*pid) else {
+                    return false;
+                };
+                // Ended but not yet collected by its parent: the kernel tells nothing of it.
+                let told = self.versions.get(&pid.as_u32()) != Some(&(0, 0));
+                if !told && self.seen.contains_key(pid) {
+                    return false;
+                }
+                let now = (process.start_time(), Program::of(process));
+                self.seen.insert(*pid, now);
+                true
+            })
+            .collect()
     }
 
     /// Processes not seen before, or that became another program since.
@@ -418,14 +488,15 @@ impl ProcessGuard {
             self.seen.clear();
             self.pending_ai.clear();
             self.primed = false;
+            self.last_full = None;
+            // What was read about a program may not hold any more by then.
+            self.sys = System::new();
             self.baseline.clear();
             self.telemetry.processes_watched.store(0, Ordering::Relaxed);
             return;
         }
         let first_poll = !self.primed;
-        self.sys
-            .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
-        let fresh = self.fresh_processes();
+        let fresh = self.refresh();
         let live = self.sys.processes();
         self.seen.retain(|pid, _| live.contains_key(pid));
         self.telemetry
@@ -497,8 +568,9 @@ impl ProcessGuard {
         };
         let vouched = platform::vouched_file(process);
         let protected_name = program_name(process, vouched.as_deref());
+        // A program in a never-scan place is not opened, so its signature cannot vouch for it.
         if is_protected(pid.as_u32(), &protected_name, vouched.as_deref(), |e| {
-            self.is_trusted(e)
+            !self.cfg.is_skipped(e) && self.is_trusted(e)
         }) {
             return true;
         }
@@ -548,6 +620,11 @@ impl ProcessGuard {
             return;
         };
         let exe = real_path(&reported, &self.cfg.base_dir);
+        // Either spelling: a program in a never-scan place is not opened or stopped for what its
+        // file is. Its command line was judged above, which reads no file.
+        if self.cfg.is_skipped(&exe) || self.cfg.is_skipped(&reported) {
+            return;
+        }
         if !crate::engine::is_regular_file(&exe) {
             return;
         }
@@ -2016,6 +2093,143 @@ mod tests {
         g.inspect_binary(pid, false);
         assert_eq!(events().len(), 1, "an allowed program raises nothing");
         assert!(child.try_wait().unwrap().is_none());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Only what the kernel says has changed is read again; nothing that matters may be missed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_new_process_an_exec_of_the_same_program_and_an_ended_one_are_all_noticed() {
+        use std::process::{Command, Stdio};
+        let cfg = Arc::new(AppConfig::for_base_dir(
+            &std::env::temp_dir().join("thenex-none"),
+        ));
+        let mut g = ProcessGuard::new(
+            cfg,
+            Arc::new(BinaryAiScanner::heuristic_only()),
+            Arc::new(Telemetry::default()),
+        );
+        g.refresh();
+        g.primed = true;
+        let mut child = Command::new("/bin/bash")
+            .args(["-c", "read; exec /bin/bash -c 'read second; true'"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_u32(child.id());
+        let seen_after = |g: &mut ProcessGuard| {
+            (0..40).any(|_| {
+                thread::sleep(Duration::from_millis(50));
+                g.refresh().contains(&pid)
+            })
+        };
+        assert!(seen_after(&mut g), "new");
+        while seen_after(&mut g) {} // the shell starting up
+        assert!(command_line(g.sys.process(pid).unwrap()).contains("exec /bin/bash"));
+        use std::io::Write;
+        child.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+        assert!(seen_after(&mut g), "the same program, started again");
+        let now = command_line(g.sys.process(pid).unwrap());
+        assert!(
+            now.contains("read second") && !now.contains("exec"),
+            "{now}"
+        );
+        // Nothing was read in full meanwhile.
+        assert!(g.last_full.unwrap().elapsed() < FULL_REFRESH);
+        // Ended, and not collected yet: nothing new about it.
+        let _ = child.kill();
+        assert!(!seen_after(&mut g), "a zombie is not a new program");
+        let _ = child.wait();
+        for _ in 0..40 {
+            g.refresh();
+            if g.sys.process(pid).is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(g.sys.process(pid).is_none(), "ended");
+        assert!(g.sys.processes().len() > 50);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "timing, by hand"]
+    fn time_one_look_at_every_process() {
+        let cfg = Arc::new(AppConfig::for_base_dir(
+            &std::env::temp_dir().join("thenex-none"),
+        ));
+        let mut g = ProcessGuard::new(
+            cfg,
+            Arc::new(BinaryAiScanner::heuristic_only()),
+            Arc::new(Telemetry::default()),
+        );
+        let cpu = || unsafe {
+            let mut u: libc::rusage = std::mem::zeroed();
+            libc::getrusage(libc::RUSAGE_SELF, &mut u);
+            let ms = |t: libc::timeval| t.tv_sec as f64 * 1e3 + f64::from(t.tv_usec) / 1e3;
+            ms(u.ru_utime) + ms(u.ru_stime)
+        };
+        for (label, primed) in [("everything", false), ("changes only", true)] {
+            g.refresh();
+            g.primed = primed;
+            let mut used = 0.0;
+            for _ in 0..25 {
+                thread::sleep(POLL_INTERVAL);
+                if !primed {
+                    g.last_full = None;
+                }
+                let before = cpu();
+                g.refresh();
+                used += cpu() - before;
+            }
+            println!("{label}: {:.2} ms of CPU per look", used / 25.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_in_a_never_scan_place_is_not_judged_by_its_file() {
+        let dir = crate::skiplist::tests::listable("process");
+        let private = dir.join("Private");
+        fs::create_dir(&private).unwrap();
+        let exe = private.join("napper");
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        // The worst case: on the known-malware list, scored as malware, and not a dry run.
+        let digest = known_bad::hash_file(&exe, u64::MAX).unwrap();
+        let mut cfg = AppConfig::for_base_dir(&dir.join("base"));
+        cfg.ensure_dirs().unwrap();
+        let list = dir.join("list.bin");
+        known_bad::write_list(&list, &[digest], 1).unwrap();
+        cfg.hash_list = Some(list);
+        cfg.load_known_bad().unwrap();
+        assert!(crate::skiplist::add(&cfg, &private, true).unwrap());
+        let cfg = Arc::new(cfg);
+        let mut child = spawn_napper(&exe);
+        let pid = Pid::from_u32(child.id());
+        let mut g = ProcessGuard::new(
+            Arc::clone(&cfg),
+            Arc::new(BinaryAiScanner::with_fixed_score(0.99)),
+            Arc::new(Telemetry::default()),
+        );
+        refresh_until_seen(&mut g, &[pid]);
+        g.inspect_binary(pid, false);
+        assert!(exe.exists() && child.try_wait().unwrap().is_none());
+        let seen = || quarantine::read_recent_events(&cfg.events_log, 1 << 20).unwrap();
+        assert!(seen()
+            .iter()
+            .all(|e| e.threat_type == crate::skiplist::EVENT));
+
+        // Off the list the same program is found (in dry run, so nothing is stopped here).
+        assert!(crate::skiplist::remove(&cfg, &private).unwrap());
+        let mut toggles = cfg.toggles.snapshot();
+        toggles.set(Engine::DryRun, true);
+        cfg.toggles.apply(toggles);
+        g.inspect_binary(pid, false);
+        assert!(seen()
+            .iter()
+            .any(|e| e.threat_type == known_bad::THREAT_TYPE));
         let _ = child.kill();
         let _ = child.wait();
         let _ = fs::remove_dir_all(&dir);

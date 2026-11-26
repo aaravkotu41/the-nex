@@ -49,8 +49,9 @@
     return { name: String(r.name || "file"), tone, pill, lines, facts, sha256: typeof r.sha256 === "string" ? r.sha256 : "" };
   }
 
-  /** Wires the drop overlay and result panel. `copyButton(text, label)` is the app's own. */
-  function start(copyButton) {
+  /** Wires the drop overlay and result panel. `copyButton(text, label)` is the app's own;
+   *  `takeDrop(paths)` says whether the page wants a drop for something other than a check. */
+  function start(copyButton, takeDrop) {
     const events = window.__TAURI__ && window.__TAURI__.event;
     const $ = (id) => document.getElementById(id);
     const panel = $("check-panel");
@@ -119,7 +120,7 @@
     events.listen("tauri://drag-drop", (e) => {
       overlay.hidden = true;
       const n = e.payload && e.payload.paths ? e.payload.paths.length : 0;
-      if (!n) return;
+      if (!n || takeDrop(e.payload.paths)) return;
       list.replaceChildren();
       status.textContent = n === 1 ? "Checking 1 file…" : `Checking ${n} files…`;
       panel.hidden = false;

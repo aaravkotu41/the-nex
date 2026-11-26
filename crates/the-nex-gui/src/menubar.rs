@@ -16,7 +16,7 @@ use crate::quitguard::IN_MENU_BAR;
 const STATUS_REFRESH: Duration = Duration::from_secs(15);
 
 fn status_text() -> String {
-    let Ok(state) = crate::get_dashboard_state() else {
+    let Ok(state) = crate::dashboard_state() else {
         return "Engine service offline".into();
     };
     let t = &state.toggles;
@@ -57,6 +57,9 @@ fn scan_text(report: Result<the_nex_core::engine::QuickScanReport, String>) -> S
             "Last scan: macOS blocked {} folder(s) · open The Nex",
             r.unreadable.len()
         ),
+        Ok(r) if r.findings.is_empty() && r.files_examined == 0 && r.never_scan > 0 => {
+            "Last scan: nothing checked (all on your never-scan list)".to_string()
+        }
         Ok(r) if r.findings.is_empty() => format!(
             "Last scan: no threats · {} files · {:.1} s",
             r.files_scanned,

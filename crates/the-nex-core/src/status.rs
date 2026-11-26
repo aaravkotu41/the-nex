@@ -144,6 +144,9 @@ pub struct EngineStatus {
     /// allow"). A capability, not a version guess: an older service lacks the field, so false.
     #[serde(default)]
     pub can_allow: bool,
+    /// Likewise for `--never-scan` and `--scan-again`.
+    #[serde(default)]
+    pub can_never_scan: bool,
 }
 
 impl EngineStatus {
@@ -189,6 +192,7 @@ pub fn build_status(
         quarantine: quarantine::list_quarantined(cfg).unwrap_or_default(),
         full_disk_access: telemetry.full_disk_access(),
         can_allow: true,
+        can_never_scan: true,
     }
 }
 
@@ -305,9 +309,11 @@ mod tests {
         // A status written by an older service has no such field.
         json.as_object_mut().unwrap().remove("full_disk_access");
         json.as_object_mut().unwrap().remove("can_allow");
+        json.as_object_mut().unwrap().remove("can_never_scan");
         let old: EngineStatus = serde_json::from_value(json).unwrap();
         assert_eq!(old.full_disk_access, None);
         assert!(!old.can_allow && status.can_allow);
+        assert!(!old.can_never_scan && status.can_never_scan);
         for value in [Some(true), Some(false), None] {
             let mut next = status.clone();
             next.full_disk_access = value;

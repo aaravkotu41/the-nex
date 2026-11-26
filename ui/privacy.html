@@ -34,7 +34,18 @@
 
     <section class="panel">
       <h2>Stored in the app data folder (local only)</h2>
-      <p>Settings (<code>settings.json</code>), wallpaper images, the event log (<code>events.jsonl</code>, with file paths and hashes), quarantined files, and the last scan report. None of this is uploaded.</p>
+      <p>Settings (<code>settings.json</code>), wallpaper images, the event log (<code>events.jsonl</code>, with file paths and hashes), quarantined files, the always-allowed list, the never-scan list, and the last scan report. None of this is uploaded.</p>
+    </section>
+
+    <section class="panel">
+      <h2>What it looks at on this computer</h2>
+      <ul>
+        <li><b>All the time:</b> new and changed files in the Downloads and Desktop folders of every account and in temporary folders (on a Mac, only the shared /tmp), and the program file, path and command line of each running program. It puts hidden decoy files in Desktop and Documents.</li>
+        <li><b>Quick and scheduled scans:</b> everyone's Downloads and Desktop.</li>
+        <li><b>Full scan, which you start:</b> every account's files and the places software is installed; on Windows, the whole system drive.</li>
+        <li><b>Startup list, which you open:</b> what starts with the computer.</li>
+        <li><b>Never scan (Settings, Exceptions):</b> folders and files you list there are not opened, moved or deleted, and get no decoys. Changing the list needs an administrator and is written to the event log. A running program's path and command line are still looked at, and if the ransomware decoys point to a program in such a place, its signature is read and it can still be stopped. A file you drop on the window to check is checked wherever it is.</li>
+      </ul>
     </section>
 
     <section class="panel">

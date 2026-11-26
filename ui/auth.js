@@ -26,7 +26,9 @@
   function save(s) {
     try { localStorage.setItem(KEY, JSON.stringify(s)); } catch { /* session lasts until the window closes */ }
   }
+  let cleared = 0; // a reply that comes after a sign-out must not sign in again
   function clear() {
+    cleared += 1;
     session = null;
     if (timer) { clearTimeout(timer); timer = null; }
     try { localStorage.removeItem(KEY); } catch { /* nothing stored */ }
@@ -93,8 +95,10 @@
     const s = load() || session; // stored copy first: another refresh may have rotated the token
     if (!isConfigured()) return Promise.resolve({ ok: false, error: NOT_SET });
     if (!s) return Promise.resolve({ ok: false, error: "No session." });
+    const before = cleared;
     inflight = (async () => {
       const r = await post("auth/v1/token?grant_type=refresh_token", { refresh_token: s.refresh_token });
+      if (cleared !== before) return { ok: false, error: "Signed out." };
       if (r.offline) return { ok: false, offline: true, error: OFFLINE };
       const next = r.ok ? toSession(r.body) : null;
       // Only a definitive rejection ends the session; 429/5xx/odd replies keep it and retry later.

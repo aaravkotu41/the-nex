@@ -22,6 +22,7 @@ use crate::config::AppConfig;
 use crate::engine::{self, FileKind};
 use crate::platform;
 use crate::process_guard;
+use crate::skiplist::LiveSkipped;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -189,6 +190,9 @@ struct Found {
     max_items: usize,
     /// No definition is opened after this, so reading them cannot use up the time for judging.
     deadline: Instant,
+    /// Windows lists what starts from the registry and file names, and opens no definition.
+    #[cfg_attr(windows, allow(dead_code))]
+    skipped: Arc<LiveSkipped>,
 }
 
 impl Found {
@@ -1232,6 +1236,9 @@ impl Findings {
     }
 }
 
+const NEVER_SCANNED: &str =
+    "It is in a place you told The Nex never to scan, so it was not opened or checked.";
+
 /// What the check of one file found.
 struct Looked {
     /// A real result for a program: a trusted signature or a clean score.
@@ -1249,6 +1256,14 @@ fn look_at(
     script: bool,
     f: &mut Findings,
 ) -> Looked {
+    if cfg.is_skipped(file) {
+        f.unsure.push(NEVER_SCANNED.into());
+        return Looked {
+            clean: false,
+            allowed: false,
+            score: None,
+        };
+    }
     let r = check_file::check(cfg, scanner, file);
     let allowed = r
         .sha256
@@ -1288,11 +1303,12 @@ fn look_at(
 
 /// Whether an allowed program is what runs: the system hands a script to the program its first
 /// line names, so that has to be an understood one this computer trusts.
-fn runs_itself(scanner: &BinaryAiScanner, file: &Path) -> bool {
+fn runs_itself(cfg: &AppConfig, scanner: &BinaryAiScanner, file: &Path) -> bool {
     shebang(file).is_none_or(|(program, mut args)| {
         args.push(file.to_string_lossy().into_owned());
         resolve(&program, "").is_ok_and(|p| {
-            scanner.is_trusted(&p)
+            !cfg.is_skipped(&p)
+                && scanner.is_trusted(&p)
                 && script_of(&program_stem(&p.to_string_lossy()), &args).is_some()
         })
     })
@@ -1393,6 +1409,7 @@ const MAX_LOOKUPS: usize = 2000;
 /// What the arguments could make a program do. `os_tool`: the program is part of the system,
 /// which other programs use to run things.
 fn check_arguments(
+    cfg: &AppConfig,
     args: &[String],
     stem: &str,
     os_tool: bool,
@@ -1426,7 +1443,9 @@ fn check_arguments(
                     "a folder"
                 })
             } else {
-                (os_tool || (file.is_file() && is_runnable(file))).then_some("a file")
+                // What is in a never-scan place is not opened; taken to be one, so it is said.
+                let runnable = || cfg.is_skipped(file) || is_runnable(file);
+                (os_tool || (file.is_file() && runnable())).then_some("a file")
             }
         })?;
         Some((what, name))
@@ -1475,7 +1494,7 @@ fn judge_program(
     let os_copy = !os_tool
         && resolved
             .as_ref()
-            .is_ok_and(|p| platform::is_os_vendor_signed(p));
+            .is_ok_and(|p| !cfg.is_skipped(p) && platform::is_os_vendor_signed(p));
     let script = script_of(&stem, args).map(str::to_string);
     let indirect = script.is_none() && runs_others([&stem, &given], os_tool || resolved.is_err());
     check_program_command(c, program, &stem, indirect || os_copy, f);
@@ -1500,6 +1519,16 @@ fn judge_program(
         }
     };
     item.exists = Some(true);
+    if cfg.is_skipped(&path) {
+        look_around(program, &path, "program", c.as_root, f);
+        f.unsure.push(NEVER_SCANNED.into());
+        // The script it is given may be elsewhere.
+        if let Some(Ok(file)) = script.as_deref().map(|s| resolve(s, "script it runs")) {
+            item.allowed = look_at(cfg, scanner, &file, true, f).allowed;
+        }
+        item.script = script;
+        return false;
+    }
     item.trusted = scanner.is_trusted(&path);
     let engine = crate::config::default_base_dir()
         .join("engine")
@@ -1568,7 +1597,7 @@ fn judge_program(
     item.allowed = looked.allowed;
     let mut inspected = looked.clean;
     if looked.allowed && !inspected {
-        inspected = runs_itself(scanner, &path);
+        inspected = runs_itself(cfg, scanner, &path);
         if !inspected {
             f.info
                 .push("Its first line hands it to another program, which was not checked.".into());
@@ -1589,7 +1618,7 @@ fn judge_program(
             .flatten()
             .filter(|_| !os_tool)
             .collect();
-        check_arguments(rest, &stem, os_tool, &folders, f);
+        check_arguments(cfg, rest, &stem, os_tool, &folders, f);
     }
     if let Some(script) = script {
         if item.trusted {
@@ -1704,6 +1733,7 @@ pub fn list(
         truncated: false,
         max_items: limits.max_items,
         deadline: start + limits.total / 2,
+        skipped: Arc::clone(&cfg.skipped),
     };
     collect(&mut found, startup_dir);
     found.candidates.sort_by_key(|(rank, _)| *rank);
@@ -1826,7 +1856,7 @@ mod launchd {
 
     /// The bytes of a definition and whether other users can change it. Links are followed once
     /// to a real file and nothing else is opened: no pipe, device or folder, and no waiting.
-    fn read_definition(path: &Path) -> Result<(Vec<u8>, bool), Unread> {
+    fn read_definition(skipped: &LiveSkipped, path: &Path) -> Result<(Vec<u8>, bool), Unread> {
         let too_big = || {
             (
                 true,
@@ -1841,6 +1871,9 @@ mod launchd {
             };
             (false, why.to_string())
         })?;
+        if skipped.covers(&target) {
+            return Err((false, NEVER_SCANNED.to_string()));
+        }
         let file = crate::quarantine::open_nofollow(&target).map_err(|e| {
             if e.kind() == std::io::ErrorKind::InvalidInput {
                 (true, "It is not an ordinary file (it is a folder, pipe or device), so it was not opened.".to_string())
@@ -2036,7 +2069,7 @@ mod launchd {
                 push_unread(found, &path, kind, false, NO_TIME.into());
                 continue;
             }
-            let read = read_definition(&path)
+            let read = read_definition(&found.skipped, &path)
                 .and_then(|(bytes, loose)| definition(&bytes, &path, kind, loose));
             match read {
                 Ok(c) => found.push(c),
@@ -2725,6 +2758,7 @@ mod tests {
             truncated: false,
             max_items,
             deadline,
+            skipped: Arc::new(LiveSkipped::new(PathBuf::new())),
         }
     }
 
@@ -3894,9 +3928,10 @@ mod tests {
             let data = file("data.json", b"{}", 0o644);
             let folder = dir.join("addon").display().to_string();
             fs::create_dir(&folder).unwrap();
+            let cfg = AppConfig::for_base_dir(&dir.join("TheNex"));
             let check = |args: &[&str]| {
                 let mut f = Findings::default();
-                check_arguments(&self::args(args), "app", false, &[&dir], &mut f);
+                check_arguments(&cfg, &self::args(args), "app", false, &[&dir], &mut f);
                 assert!(f.strong.is_empty() && f.info.is_empty());
                 (f.soft.len(), f.unsure.len())
             };
@@ -4023,6 +4058,40 @@ mod tests {
         }
 
         #[test]
+        fn what_starts_from_a_never_scan_place_is_listed_but_not_opened() {
+            let dir = crate::skiplist::tests::listable("startup");
+            let private = dir.join("Private");
+            fs::create_dir_all(dir.join("launch")).unwrap();
+            fs::create_dir(&private).unwrap();
+            let program = private.join("helper");
+            fs::write(&program, "#!/bin/sh\n").unwrap();
+            fs::write(
+                dir.join("launch").join("a.plist"),
+                plist("com.example.helper", program.to_str().unwrap(), &[], ""),
+            )
+            .unwrap();
+            let cfg = AppConfig::for_base_dir(&dir.join("TheNex"));
+            assert!(crate::skiplist::add(&cfg, &private, true).unwrap());
+            let report = run_in(&dir, Limits::default());
+            let found = item(&report, "com.example.helper");
+            assert_eq!(found.verdict, Verdict::NotChecked, "{found:?}");
+            assert!(found.reasons.iter().any(|r| r == NEVER_SCANNED));
+            assert!(!found.trusted && found.score.is_none() && found.exists == Some(true));
+            // A link to a definition kept in a listed folder is not followed.
+            fs::rename(dir.join("launch").join("a.plist"), private.join("a.plist")).unwrap();
+            std::os::unix::fs::symlink(private.join("a.plist"), dir.join("launch").join("a.plist"))
+                .unwrap();
+            let linked = run_in(&dir, Limits::default());
+            assert!(format!("{linked:?}").contains(NEVER_SCANNED), "{linked:?}");
+            assert!(!linked.items.iter().any(|i| i.name == "com.example.helper"));
+            let scanner = BinaryAiScanner::heuristic_only();
+            let mut f = Findings::default();
+            let looked = look_at(&cfg, &scanner, &program, true, &mut f);
+            assert!(!looked.clean && !looked.allowed && f.unsure == [NEVER_SCANNED]);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
         fn an_always_allowed_file_counts_only_for_what_really_runs() {
             let dir = scratch("allowed");
             let cfg = AppConfig::for_base_dir(&dir.join("TheNex"));
@@ -4050,7 +4119,7 @@ mod tests {
                 crate::allowlist::add(&cfg, entry).unwrap();
                 let looked = look_at(&cfg, &scanner, &file, true, &mut f);
                 assert!(looked.allowed && !looked.clean, "{name}");
-                assert_eq!(runs_itself(&scanner, &file), direct, "{name}");
+                assert_eq!(runs_itself(&cfg, &scanner, &file), direct, "{name}");
             }
             let _ = fs::remove_dir_all(&dir);
         }

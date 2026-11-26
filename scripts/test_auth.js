@@ -100,6 +100,15 @@ const tokens = (extra) => ({ access_token: "A", refresh_token: "R", expires_in: 
   await e.auth.refresh();
   check("rejected refresh after restore clears the session and signs out", s && !e.store.has("thenex.session") && e.auth.getSession() === null && signedOut === 1 && e.calls.length === 1);
 
+  // A reply that arrives after a sign-out does not sign in again.
+  e = env(CFG, [{ status: 200, body: tokens({ access_token: "LATE" }) }, { status: 204, body: {} }]);
+  e.store.set("thenex.session", JSON.stringify(old));
+  await e.auth.restore();
+  const late = e.auth.refresh();
+  await e.auth.signOut();
+  r = await late;
+  check("a late refresh does not undo a sign-out", !r.ok && e.auth.getSession() === null && !e.store.has("thenex.session"));
+
   // refresh: only 400/401 end the session; 429/5xx keep it and report offline
   for (const status of [429, 500, 503]) {
     e = env(CFG, [{ status, body: { msg: "busy" } }]);

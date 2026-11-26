@@ -25,9 +25,11 @@ use the_nex_core::engine::{self, QuickScanReport, ScanKind};
 use the_nex_core::platform;
 use the_nex_core::quarantine::{self, QuarantineMeta, Severity, ThreatEvent};
 use the_nex_core::scan_jobs::{self, ScanProgress};
+use the_nex_core::skiplist::{self, SkippedPlace};
 use the_nex_core::status::{self, CanaryStatus, EngineStatus};
 
 const EVENT_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+const FEW_EVENTS_TAIL_BYTES: u64 = 256 * 1024;
 const DEFAULT_EVENT_LIMIT: usize = 200;
 const MAX_EVENT_LIMIT: usize = 5000;
 
@@ -147,6 +149,11 @@ fn prompt_text(args: &[&str], subject: &str) -> String {
         Some("--disallow") => {
             format!("start checking one always-allowed file again. It is {subject}")
         }
+        Some("--never-scan") => {
+            format!("never scan one folder again, or anything put in it later. It is {subject}")
+        }
+        Some("--never-scan-file") => format!("never scan one file again. It is {subject}"),
+        Some("--scan-again") => format!("start scanning one place again. It is {subject}"),
         Some("--delete") => "permanently delete a quarantined file".to_string(),
         Some("--rearm-canaries") => "re-create its ransomware decoy files".to_string(),
         _ => format!("run: the-nex {}", args.join(" ")),
@@ -303,25 +310,29 @@ fn merged_canaries(cfg: &AppConfig, status: Option<&EngineStatus>) -> Vec<Canary
     if local.is_empty() {
         return status.canaries.clone();
     }
-    local
-        .into_iter()
-        .map(|entry| {
-            if entry.state == "Unreadable" {
-                status
-                    .canaries
-                    .iter()
-                    .find(|c| c.path == entry.path)
-                    .cloned()
-                    .unwrap_or(entry)
-            } else {
-                entry
-            }
-        })
-        .collect()
+    let mut merged = local;
+    take_service_view(&mut merged, Some(status));
+    merged
+}
+
+fn take_service_view(canaries: &mut [CanaryStatus], status: Option<&EngineStatus>) {
+    let Some(status) = status else {
+        return;
+    };
+    for entry in canaries.iter_mut().filter(|c| c.state == "Unreadable") {
+        if let Some(seen) = status.canaries.iter().find(|c| c.path == entry.path) {
+            *entry = seen.clone();
+        }
+    }
 }
 
 #[tauri::command]
-fn get_dashboard_state() -> Result<DashboardState, String> {
+async fn get_dashboard_state() -> Result<DashboardState, String> {
+    // Off the main thread: an unreadable file or a slow disk must not freeze the window.
+    blocking(dashboard_state).await
+}
+
+fn dashboard_state() -> Result<DashboardState, String> {
     let cfg = config();
     let status = fresh_status(&cfg);
     let toggles = RuntimeToggles::load(&cfg.settings_file).map_err(|e| e.to_string())?;
@@ -337,6 +348,7 @@ fn get_dashboard_state() -> Result<DashboardState, String> {
         }
         _ => platform::discover_watched_dirs()
             .iter()
+            .filter(|d| !cfg.is_skipped(d))
             .map(|d| display(d))
             .collect(),
     };
@@ -406,13 +418,28 @@ fn event_matches(event: &ThreatEvent, query: &str, severity: Option<Severity>) -
 }
 
 #[tauri::command]
-fn get_events(
+async fn get_events(
+    limit: Option<usize>,
+    query: Option<String>,
+    severity: Option<String>,
+) -> Result<Vec<ThreatEvent>, String> {
+    blocking(move || recent_events(limit, query, severity)).await
+}
+
+fn recent_events(
     limit: Option<usize>,
     query: Option<String>,
     severity: Option<String>,
 ) -> Result<Vec<ThreatEvent>, String> {
     let cfg = config();
-    let events = match quarantine::read_recent_events(&cfg.events_log, EVENT_TAIL_BYTES) {
+    // The few newest, for the Home page, need no more than the end of the log.
+    let few = limit.is_some_and(|n| n <= 20) && query.as_deref().is_none_or(str::is_empty);
+    let tail = if few {
+        FEW_EVENTS_TAIL_BYTES
+    } else {
+        EVENT_TAIL_BYTES
+    };
+    let events = match quarantine::read_recent_events(&cfg.events_log, tail) {
         Ok(events) => events,
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(format!("{}: {e}", cfg.events_log.display())),
@@ -624,10 +651,13 @@ async fn run_quick_scan(remote: Option<bool>) -> Result<QuickScanReport, String>
 }
 
 #[tauri::command]
-fn list_quarantine() -> Result<Vec<QuarantineMeta>, String> {
-    let cfg = config();
-    let status = fresh_status(&cfg);
-    quarantine_records(&cfg, status.as_ref())
+async fn list_quarantine() -> Result<Vec<QuarantineMeta>, String> {
+    blocking(|| {
+        let cfg = config();
+        let status = fresh_status(&cfg);
+        quarantine_records(&cfg, status.as_ref())
+    })
+    .await
 }
 
 fn audit(cfg: &AppConfig, threat_type: &str, action: &str, meta: &QuarantineMeta) {
@@ -643,6 +673,8 @@ fn audit(cfg: &AppConfig, threat_type: &str, action: &str, meta: &QuarantineMeta
     );
 }
 
+const CAUGHT_AGAIN: &str = "It stays there unless it is on the known-malware list. A copy somewhere else can be caught again; to allow it anywhere, use Restore and always allow instead.";
+
 #[tauri::command]
 async fn restore_quarantine(id: String) -> Result<String, String> {
     blocking(move || {
@@ -653,11 +685,14 @@ async fn restore_quarantine(id: String) -> Result<String, String> {
         match quarantine::restore_file(&id, &cfg) {
             Ok(meta) => {
                 quarantine::record_restore(&cfg, &meta, " via desktop app");
-                Ok(format!("Restored to {}", meta.original_path.display()))
+                Ok(format!(
+                    "Restored to {}. {CAUGHT_AGAIN}",
+                    meta.original_path.display()
+                ))
             }
             Err(e) if is_permission_error(&e) => {
                 elevated(&["--restore", id.as_str()])?;
-                Ok(format!("Restored {id}"))
+                Ok(format!("Restored. {CAUGHT_AGAIN}"))
             }
             Err(e) => Err(e.to_string()),
         }
@@ -821,6 +856,95 @@ async fn remove_allowed(sha256: String) -> Result<String, String> {
     .await
 }
 
+/// The places as the service sees them (see `list_allowed`).
+#[tauri::command]
+fn list_never_scan() -> Result<Vec<SkippedPlace>, String> {
+    Ok(skiplist::load(
+        &config().skipped_file,
+        config::running_privileged() || platform::service_installed(),
+    )?)
+}
+
+/// What a person types, pastes or drops: spaces around it, quotes and a leading `~/` are theirs.
+fn typed_path(text: &str, home: Option<&Path>) -> PathBuf {
+    let text = text.trim();
+    let text = ['"', '\'']
+        .iter()
+        .find_map(|q| text.strip_prefix(*q)?.strip_suffix(*q))
+        .unwrap_or(text);
+    match (text.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(text),
+    }
+}
+
+/// The place a path leads to, for the person to confirm before anything is listed.
+#[tauri::command]
+async fn find_never_scan(path: String) -> Result<SkippedPlace, String> {
+    blocking(move || {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        skiplist::resolve(&typed_path(&path, home.as_deref()))
+    })
+    .await
+}
+
+/// Listing a place takes an administrator, whose prompt names it. Never reachable from synced
+/// (remote) commands. shortcut: the path is on the engine's command line, so a folder named like
+/// a dangerous command ("base64 -d ...") could get the prompt stopped; pass it on stdin if that
+/// is ever reported.
+#[tauri::command]
+async fn add_never_scan(path: String, folder: bool) -> Result<String, String> {
+    blocking(move || {
+        let place = skiplist::resolve(Path::new(&path))?;
+        // Only the very place that was confirmed.
+        if place.path != path || place.folder != folder {
+            return Err("That place changed since you chose it. Choose it again.".to_string());
+        }
+        let mode = if folder {
+            "--never-scan"
+        } else {
+            "--never-scan-file"
+        };
+        change_never_scan(mode, &path, |cfg| {
+            skiplist::add(cfg, Path::new(&path), folder)
+        })?;
+        Ok("The Nex will never scan that place".to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn remove_never_scan(path: String) -> Result<String, String> {
+    blocking(move || {
+        change_never_scan("--scan-again", &path, |cfg| {
+            skiplist::remove(cfg, Path::new(&path))
+        })?;
+        Ok("The Nex will scan that place again".to_string())
+    })
+    .await
+}
+
+fn change_never_scan(
+    mode: &str,
+    path: &str,
+    direct: impl FnOnce(&AppConfig) -> io::Result<bool>,
+) -> Result<(), String> {
+    let cfg = config();
+    match direct(&cfg) {
+        Ok(_) => Ok(()),
+        Err(e) if is_permission_error(&e) => {
+            let installed = installed_engine().is_some();
+            let capable = fresh_status(&cfg).map(|s| s.can_never_scan);
+            let problem = match mode {
+                "--scan-again" => disallow_problem_for(installed, capable),
+                _ => allow_problem_for(installed, capable),
+            };
+            unless_problem(problem, || elevated_about(&[mode, path], path))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[tauri::command]
 async fn verify_canaries(remote: Option<bool>) -> Result<Vec<CanaryStatus>, String> {
     blocking(move || {
@@ -829,7 +953,14 @@ async fn verify_canaries(remote: Option<bool>) -> Result<Vec<CanaryStatus>, Stri
         if dirs.is_empty() {
             return Ok(Vec::new());
         }
-        let report = canary::rearm_canaries(&dirs);
+        if !cfg.engine_enabled(Engine::Canary) {
+            return Err(
+                "Ransomware decoys is switched off. Turn it on in Protection first.".into(),
+            );
+        }
+        let mut report = canary::rearm_canaries(&dirs);
+        // Other people's decoys cannot be read from here; the service's word on them counts.
+        take_service_view(&mut report, fresh_status(&cfg).as_ref());
         if !report.iter().all(CanaryStatus::is_intact) {
             if remote == Some(true) {
                 return Err(NEEDS_LOCAL.to_string());
@@ -967,6 +1098,11 @@ fn main() {
             allow_quarantined,
             list_allowed,
             remove_allowed,
+            list_never_scan,
+            find_never_scan,
+            add_never_scan,
+            remove_never_scan,
+            filecheck::drop_is_never_scan,
             verify_canaries,
             install_service,
             uninstall_service,
@@ -1000,6 +1136,25 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pasted_path_loses_quotes_and_spaces_and_the_prompt_names_the_place() {
+        let home = Path::new("/Users/me");
+        for (text, want) in [
+            (" /Users/me/a b ", "/Users/me/a b"),
+            ("\"/Users/me/a b\"", "/Users/me/a b"),
+            ("'/Users/me/a'", "/Users/me/a"),
+            ("~/Tax", "/Users/me/Tax"),
+            ("\"/Users/me/a", "\"/Users/me/a"),
+            ("~other/x", "~other/x"),
+        ] {
+            assert_eq!(typed_path(text, Some(home)), Path::new(want), "{text}");
+        }
+        let prompt = prompt_text(&["--never-scan", "/Users/me/Tax"], "/Users/me/Tax");
+        assert!(prompt.contains("never scan") && prompt.contains("/Users/me/Tax"));
+        let prompt = prompt_text(&["--scan-again", "/Users/me/Tax"], "/Users/me/Tax");
+        assert!(prompt.contains("scanning one place again") && prompt.contains("/Users/me/Tax"));
+    }
 
     #[test]
     fn only_the_fixed_report_pages_can_be_opened() {

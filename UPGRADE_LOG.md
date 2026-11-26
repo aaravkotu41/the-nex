@@ -43,6 +43,14 @@ Decisions worth knowing:
   `Invoke-Expression` no longer ends the process. The startup list still treats them as suspicious.
 - **1:** remembered through the event log, so until that rotates (50 MB).
 
+## Merged with main
+
+`main` moved on while this branch was made (never-scan list, a new app layout, plain words of
+its own, fixes from two reviews). In the merge, the app's pages, their tests and the README
+are main's: its own plain-language redesign replaces the patch's, and the patch's copy of the
+old README (`docs/TECHNICAL.md`) is gone. Main had fixed the scan wait the same way (bug 8); its
+version is kept. Its restore message now says what is true after bug 1.
+
 ## Independent review
 
 One reviewer read the diff without being told the conclusions. Acted on:

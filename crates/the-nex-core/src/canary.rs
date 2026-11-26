@@ -161,6 +161,10 @@ pub fn check_canary(path: &Path, index: usize) -> CanaryState {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return CanaryState::Missing,
             // A FIFO/device/directory where the canary was: tampering, not a transient error.
             Err(e) if e.kind() == io::ErrorKind::InvalidInput => return CanaryState::Modified,
+            // Another person's folder stays unreadable however long one waits.
+            Err(e) if cfg!(unix) && e.kind() == io::ErrorKind::PermissionDenied => {
+                return CanaryState::Unreadable
+            }
             Err(_) if attempt + 1 < READ_RETRIES => thread::sleep(READ_RETRY_DELAY),
             Err(_) => return CanaryState::Unreadable,
         }
@@ -195,11 +199,15 @@ pub fn replace_canary(path: &Path, content: &[u8]) -> io::Result<()> {
     io::Write::write_all(&mut file, content)
 }
 
-pub fn remove_canaries(dirs: &[PathBuf]) -> usize {
+/// In a never-scan folder only our own unchanged decoys: anything else there is not ours to touch.
+pub fn remove_canaries(cfg: &AppConfig, dirs: &[PathBuf]) -> usize {
     let mut removed = 0;
     for dir in dirs {
-        for name in CANARY_FILE_NAMES {
+        for (index, name) in CANARY_FILE_NAMES.iter().enumerate() {
             let path = dir.join(name);
+            if cfg.is_skipped(dir) && check_canary(&path, index) != CanaryState::Intact {
+                continue;
+            }
             if let Ok(meta) = fs::symlink_metadata(&path) {
                 if meta.is_file() {
                     let _ = quarantine::set_readonly(&path, false);
@@ -311,6 +319,7 @@ impl CanaryManager {
     fn all_canaries(&self) -> Vec<(PathBuf, usize)> {
         self.dirs
             .iter()
+            .filter(|dir| !self.cfg.is_skipped(dir))
             .flat_map(|dir| {
                 CANARY_FILE_NAMES
                     .iter()
@@ -326,7 +335,7 @@ impl CanaryManager {
     }
 
     fn deploy_dir(&mut self, dir: &Path) -> usize {
-        if !is_real_dir(dir) {
+        if !is_real_dir(dir) || self.cfg.is_skipped(dir) {
             return 0;
         }
         let mut placed = 0;
@@ -360,12 +369,39 @@ impl CanaryManager {
         result
     }
 
+    /// Takes our own unchanged decoys out of folders that were put on the never-scan list.
+    fn leave_skipped_dirs(&mut self) {
+        let cfg = Arc::clone(&self.cfg);
+        let (skipped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.dirs)
+            .into_iter()
+            .partition(|dir| cfg.is_skipped(dir));
+        self.dirs = kept;
+        for dir in skipped.iter().filter(|dir| is_real_dir(dir)) {
+            self.self_write.store(now_millis(), Ordering::SeqCst);
+            for (index, name) in CANARY_FILE_NAMES.iter().enumerate() {
+                let path = dir.join(name);
+                self.deployed.remove(&platform::path_key(&path));
+                if check_canary(&path, index) == CanaryState::Intact {
+                    let _ = quarantine::set_readonly(&path, false);
+                    let _ = fs::remove_file(&path);
+                }
+            }
+            logger::info(format!(
+                "canaries removed from {}, which is never scanned",
+                dir.display()
+            ));
+        }
+    }
+
     pub fn set_dirs(&mut self, dirs: Vec<PathBuf>) {
+        self.leave_skipped_dirs();
         for dir in dedup_dirs(dirs) {
             let key = platform::path_key(&dir);
             if !self.dirs.iter().any(|d| platform::path_key(d) == key) {
                 self.dirs.push(dir.clone());
-                let placed = self.deploy_dir(&dir);
+                // Switching the engine on deploys to every folder.
+                let on = self.cfg.engine_enabled(Engine::Canary);
+                let placed = if on { self.deploy_dir(&dir) } else { 0 };
                 if placed > 0 {
                     logger::info(format!("canaries placed in new folder {}", dir.display()));
                 }
@@ -453,12 +489,15 @@ impl CanaryManager {
             ));
             return;
         };
+        let found = sys
+            .process(suspect.pid)
+            .map(|p| (p.start_time(), program_identity(p)));
         let action = if !may_terminate(suspect.exe.as_deref(), platform::is_trusted_binary) {
             "ALERT_ONLY: the busiest writer is a properly signed app, so it was not stopped"
                 .to_string()
         } else if self.cfg.is_dry_run() {
             "DRY_RUN: would terminate process".to_string()
-        } else if sys.process(suspect.pid).is_some_and(|p| p.kill()) {
+        } else if kill_if_still(&mut sys, suspect.pid, found) {
             "TERMINATED".to_string()
         } else {
             "TERMINATE_FAILED".to_string()
@@ -487,6 +526,23 @@ impl CanaryManager {
             ),
         );
     }
+}
+
+fn program_identity(process: &sysinfo::Process) -> Option<(u64, u64)> {
+    platform::program_file(process).and_then(|path| platform::file_identity(&path))
+}
+
+/// Ends a process only while it is still the one that was judged: checking a signature takes time,
+/// and its number may belong to another program by now. Renaming or deleting its own file does not
+/// save it.
+fn kill_if_still(sys: &mut System, pid: Pid, found: Option<(u64, Option<(u64, u64)>)>) -> bool {
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, hunt_refresh_kind());
+    sys.process(pid).is_some_and(|p| {
+        let now = program_identity(p);
+        found.is_some_and(|(started, before)| {
+            p.start_time() == started && (now.is_none() || before.is_none() || now == before)
+        }) && p.kill()
+    })
 }
 
 fn hunt_refresh_kind() -> ProcessRefreshKind {
@@ -568,6 +624,8 @@ pub fn run(
 ) {
     let enabled = cfg.engine_enabled(Engine::Canary);
     let mut manager = CanaryManager::new(Arc::clone(&cfg), dirs);
+    // A folder may have been listed while the service was stopped.
+    manager.leave_skipped_dirs();
     if enabled {
         let placed = manager.deploy_all();
         logger::info(format!(
@@ -675,7 +733,7 @@ mod tests {
         assert_eq!(check_canary(&first, index), CanaryState::Intact);
 
         assert_eq!(
-            remove_canaries(std::slice::from_ref(&dir)),
+            remove_canaries(&AppConfig::for_base_dir(&dir), std::slice::from_ref(&dir)),
             CANARY_FILE_NAMES.len()
         );
         let _ = fs::remove_dir_all(&dir);
@@ -739,6 +797,55 @@ mod tests {
     }
 
     #[test]
+    fn decoys_leave_a_folder_that_is_never_scanned_and_only_our_own_unchanged_ones() {
+        let root = crate::skiplist::tests::listable("canary");
+        let (desktop, documents) = (root.join("Desktop"), root.join("Documents"));
+        for dir in [&desktop, &documents] {
+            fs::create_dir(dir).unwrap();
+        }
+        let cfg = Arc::new(AppConfig::for_base_dir(&root.join("base")));
+        cfg.ensure_dirs().unwrap();
+        let dirs = vec![desktop.clone(), documents.clone()];
+        let mut m = CanaryManager::new(Arc::clone(&cfg), dirs.clone());
+        assert_eq!(m.deploy_all(), 2 * CANARY_FILE_NAMES.len());
+        let theirs = documents.join(CANARY_FILE_NAMES[1]);
+        let _ = quarantine::set_readonly(&theirs, false);
+        fs::write(&theirs, b"something of the owner's").unwrap();
+
+        assert!(crate::skiplist::add(&cfg, &documents, true).unwrap());
+        m.self_write.store(0, Ordering::SeqCst);
+        m.sweep(); // a decoy changed in a listed folder is not an alarm
+        m.handle_fs_event(&theirs);
+        m.set_dirs(vec![desktop.clone()]);
+        assert!(!documents.join(CANARY_FILE_NAMES[0]).exists());
+        assert_eq!(fs::read(&theirs).unwrap(), b"something of the owner's");
+        assert_eq!(m.dirs(), [desktop.clone()]);
+        assert_eq!(m.deployed_canaries().len(), CANARY_FILE_NAMES.len());
+        let alarms = quarantine::read_recent_events(&cfg.events_log, 1 << 20).unwrap();
+        assert!(alarms.iter().all(|e| e.threat_type != "RANSOMWARE_CANARY"));
+
+        // Uninstalling leaves it alone there too.
+        assert_eq!(remove_canaries(&cfg, std::slice::from_ref(&documents)), 0);
+        assert!(theirs.exists());
+
+        // Off the list again: the folder gets its decoys back, unless the engine is off.
+        fs::remove_file(&theirs).unwrap();
+        assert!(crate::skiplist::remove(&cfg, &documents).unwrap());
+        let mut toggles = cfg.toggles.snapshot();
+        toggles.set(Engine::Canary, false);
+        cfg.toggles.apply(toggles);
+        m.set_dirs(dirs.clone());
+        assert!(!theirs.exists(), "switched off");
+        m.dirs.retain(|d| *d != documents);
+        toggles.set(Engine::Canary, true);
+        cfg.toggles.apply(toggles);
+        m.set_dirs(dirs);
+        assert_eq!(m.deployed_canaries().len(), 2 * CANARY_FILE_NAMES.len());
+        assert!(theirs.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn rearm_restores_and_reports_every_slot() {
         let dir = temp_dir();
         let states = canary_states(std::slice::from_ref(&dir));
@@ -758,7 +865,7 @@ mod tests {
             .all(CanaryStatus::is_intact));
         assert!(canary_states(&[dir.join("missing-folder")]).is_empty());
 
-        remove_canaries(std::slice::from_ref(&dir));
+        remove_canaries(&AppConfig::for_base_dir(&dir), std::slice::from_ref(&dir));
         let _ = fs::remove_dir_all(&dir);
     }
 }

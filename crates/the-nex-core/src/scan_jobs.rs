@@ -15,7 +15,7 @@ use crate::config::AppConfig;
 use crate::engine::{self, QuickScanReport, ScanKind, SCAN_PROGRESS_FILE};
 use crate::logger;
 use crate::schedule;
-use crate::status::Telemetry;
+use crate::status::{Telemetry, FUTURE_SKEW_SECS};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -69,7 +69,10 @@ pub struct ScanProgress {
 impl ScanProgress {
     /// Running, and written recently enough that the service is still alive.
     pub fn is_live(&self) -> bool {
-        self.running && (Utc::now() - self.updated_at).num_seconds() <= PROGRESS_STALE_SECS
+        // From the future: the clock was set back, so it says nothing.
+        self.running
+            && (-FUTURE_SKEW_SECS..=PROGRESS_STALE_SECS)
+                .contains(&(Utc::now() - self.updated_at).num_seconds())
     }
 }
 
@@ -380,13 +383,12 @@ pub fn request_and_wait(
 ) -> Result<QuickScanReport, String> {
     let before = engine::read_scan_report(cfg, kind);
     request(cfg, kind)?;
-    let mut deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    let deadline = Instant::now() + timeout;
+    // A scan that is running has answered, however long it takes.
+    while Instant::now() < deadline
+        || read_progress(cfg).is_some_and(|p| p.is_live() && p.kind == kind && !p.scheduled)
+    {
         thread::sleep(POLL_STEP);
-        // Only the scan asked for: another one running says nothing about this request.
-        if read_progress(cfg).is_some_and(|p| p.is_live() && p.kind == kind && !p.scheduled) {
-            deadline = Instant::now() + timeout;
-        }
         match engine::read_scan_report(cfg, kind) {
             Some(report) if Some(&report) != before.as_ref() => return Ok(report),
             _ => {}
