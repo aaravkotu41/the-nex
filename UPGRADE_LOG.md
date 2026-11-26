@@ -43,6 +43,16 @@ Decisions worth knowing:
   `Invoke-Expression` no longer ends the process. The startup list still treats them as suspicious.
 - **1:** remembered through the event log, so until that rotates (50 MB).
 
+## Added: always open as administrator (Windows)
+
+Settings, "Running in the background": a switch that makes the app start itself again through the
+Windows approval prompt each time it opens, so Restore, Delete and Always allow do not ask again
+while it is open. Declining the prompt opens it as usual; an elevated copy never starts another.
+The choice is an empty file, `%APPDATA%\TheNex\open-as-administrator`. Dragging a file onto
+the window does not work while it runs as administrator (Windows blocks it). Checked in the real
+app: the switch saves and clears the choice. Not checked: the restart itself, which needs a
+person to approve the prompt.
+
 ## Merged with main
 
 `main` moved on while this branch was made (never-scan list, a new app layout, plain words of

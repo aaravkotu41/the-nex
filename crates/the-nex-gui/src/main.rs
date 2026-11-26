@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod admin;
 mod appearance;
 #[cfg(target_os = "macos")]
 mod camera;
@@ -1074,6 +1075,9 @@ async fn aegismesh(op: String, request: serde_json::Value) -> Result<serde_json:
 }
 
 fn main() {
+    if admin::relaunch_if_wanted() {
+        return;
+    }
     let builder = tauri::Builder::default().on_window_event(|_window, _event| {
         #[cfg(target_os = "macos")]
         menubar::on_window_event(_window, _event);
@@ -1123,7 +1127,9 @@ fn main() {
             summary::get_scan_schedule,
             summary::set_scan_schedule,
             summary::save_summary_report,
-            startup::check_startup
+            startup::check_startup,
+            admin::get_open_as_admin,
+            admin::set_open_as_admin
         ])
         .build(tauri::generate_context!())
         .expect("failed to start The Nex desktop app");

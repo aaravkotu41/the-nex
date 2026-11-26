@@ -679,6 +679,24 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<i32, String> {
     }
 }
 
+/// Starts `program` with administrator rights through the approval prompt, without waiting for
+/// it. False when it was not started (the prompt was declined, or it failed).
+pub fn start_elevated(program: &Path) -> bool {
+    let verb = to_wide(OsStr::new("runas"));
+    let file = to_wide(program.as_os_str());
+    // SAFETY: SHELLEXECUTEINFOW is plain data and every pointer in it outlives the call; no
+    // process handle is asked for, so none is left to close.
+    unsafe {
+        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+        info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_NOASYNC;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        info.nShow = windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        ShellExecuteExW(&mut info) != 0
+    }
+}
+
 pub fn tray_is_running() -> bool {
     let name = to_wide(OsStr::new(TRAY_MUTEX_NAME));
     // SAFETY: valid NUL-terminated name; the handle is closed immediately.
